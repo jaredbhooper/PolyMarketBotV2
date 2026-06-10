@@ -35,6 +35,25 @@ verdict:
   min_settled_for_pass: 20
   fail_loss_pct: 0.10
 
+# Polymarket fee schedule. Verified 2026-03 (sources in BUILD_NOTES.md).
+# Fee per share = `rate × p × (1 - p)` (quadratic, peaks at p=0.50).
+# Makers pay $0 + earn a 20-25% rebate of the counterparty's fee. We
+# default the maker side to 0 + no rebate to stay conservative.
+polymarket_fees:
+  default_taker_fallback: 0.0100
+  rates:
+    crypto:     0.0180
+    economics:  0.0150
+    mentions:   0.0156
+    culture:    0.0125
+    weather:    0.0125
+    finance:    0.0100
+    politics:   0.0100
+    tech:       0.0100
+    sports:     0.0075
+    geopolitics: 0.0000
+  maker_rebate_pct: 0.00     # set to 0.20 to credit the rebate
+
 paper:
   starting_bankroll: 500.00        # mirrors planned live bankroll
   max_position_usd: 15.00          # lowered from $50 to spread across many small positions

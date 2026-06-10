@@ -1,12 +1,15 @@
-# Daily grading job (sec 8). Settles yesterday's trades against the observed
-# station temperature and updates Brier + P&L per strategy.
-# Schedule: 10:00 UTC = mid-morning across all our cities' tz; comfortably
-# after every Polymarket weather mkt for "yesterday" has resolved.
+# V2 daily: scout + grade + master-report. Once per day.
+# Scout rebuilds the copy-trading roster (hysteresis-protected); grade
+# settles every strategy's resolved positions; master-report prints
+# the full V2 scoreboard + health banner + per-strategy sections.
 
-name: grade
+name: daily
 
 on:
   schedule:
+    # 10:00 UTC = mid-morning across our covered cities' timezones.
+    # Comfortably after every Polymarket weather market for "yesterday"
+    # has resolved.
     - cron: "0 10 * * *"
   workflow_dispatch: {}
 
@@ -14,13 +17,13 @@ permissions:
   contents: write
 
 concurrency:
-  # Shared with cycle.yml so the two workflows never race on `git push`.
   group: polymarketbot-state
   cancel-in-progress: false
 
 jobs:
-  grade:
+  daily:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,14 +39,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Grade
+      - name: Scout + grade + master report
         env:
           PYTHONUNBUFFERED: "1"
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          python main.py scout || true
           python main.py grade
-          python main.py report
+          python main.py master-report
 
       - name: Commit ledger
         run: |
@@ -54,6 +59,6 @@ jobs:
             echo "no db changes to commit"
             exit 0
           fi
-          git commit -m "grade $(date -u +%Y-%m-%d)"
+          git commit -m "daily $(date -u +%Y-%m-%d)"
           git pull --rebase origin main || true
           git push origin HEAD:main

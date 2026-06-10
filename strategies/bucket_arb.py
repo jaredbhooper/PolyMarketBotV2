@@ -160,12 +160,24 @@ class BucketSumArb(Strategy):
         self.stake_notional_usd = float(s.get("stake_notional_usd", 10.0))
         self.min_net_gap_pct = float(s.get("min_net_gap_pct", 0.01))    # 1%
         self.max_open_multi_sets = int(s.get("max_open_multi_sets", 20))
-        # Polymarket fee schedule. As of 2026-06 the Polymarket CLOB charges
-        # zero protocol fees on book trades; configurable so the math is
-        # always net of whatever fee is in force. Both maker_pct and
-        # taker_pct are applied to the cost of the trade (price * shares).
-        self.fee_maker_pct = float(s.get("fee_maker_pct", 0.0))
+        # Polymarket fee schedule. Verified 2026-03 update: quadratic taker
+        # fee `rate × p × (1 - p)` with per-category rates (weather 1.25%,
+        # politics/tech/finance 1.00%, sports 0.75%, ...). Sources +
+        # raw verified table in foundation/fees.py + BUILD_NOTES.md.
+        fee_cfg = cfg.get("polymarket_fees")
+        if fee_cfg is None:
+            # No fee block in cfg -> fees disabled (back-compat for tests).
+            self.fee_rates: dict[str, float] = {}
+            self.fee_default = 0.0
+        else:
+            self.fee_rates = dict(fee_cfg.get("rates") or {})
+            self.fee_default = float(fee_cfg.get("default_taker_fallback", 0.01))
+        # Legacy linear knob kept for tests / quick overrides: if set
+        # nonzero it acts as a flat scalar instead of the quadratic
+        # schedule. Default 0 -> quadratic schedule is the source of
+        # truth.
         self.fee_taker_pct = float(s.get("fee_taker_pct", 0.0))
+        self.fee_maker_pct = float(s.get("fee_maker_pct", 0.0))
 
     # --- per-market path is a no-op for this strategy ---------------------
     def relevant_markets(self, markets: list[Market]) -> list[Market]:
@@ -470,10 +482,22 @@ class BucketSumArb(Strategy):
     # All-or-nothing: if any single leg can't fill the implied share count
     # within its visible book, the whole set is logged status='unfillable_leg'
     # and NO position is opened.
-    def _fee_per_share(self, price: float) -> float:
-        """Polymarket per-share fee on a BUY at vwap `price`. Taker pct by
-        default (multi-arb always takes liquidity)."""
-        return self.fee_taker_pct * float(price)
+    def _fee_per_share(self, price: float,
+                        category: str | None = None) -> float:
+        """Polymarket per-share taker fee on a BUY at vwap `price`.
+
+        Quadratic schedule `rate × p × (1 - p)` with per-category rates.
+        The legacy `fee_taker_pct` (linear scalar) overrides when set
+        nonzero - useful for synthetic tests that want a flat fee."""
+        if self.fee_taker_pct > 0:
+            return self.fee_taker_pct * float(price)
+        if not self.fee_rates and self.fee_default == 0.0:
+            return 0.0
+        from foundation.fees import polymarket_taker_fee_per_share
+        return polymarket_taker_fee_per_share(
+            float(price), category=category,
+            rates=self.fee_rates or None,
+            fallback=self.fee_default)
 
     def detect_multi_side(self, event: ArbEvent, side: str
                             ) -> dict | None:
@@ -484,6 +508,11 @@ class BucketSumArb(Strategy):
         n = len(event.legs)
         if n < 2:
             return None
+        # Category lookup for fees (weather, sports, politics, ...).
+        ev_category = " ".join([
+            event.event_slug or "", event.event_title or "",
+            " ".join(event.extras.get("tags") or []),
+        ])
         # First estimate per-share cost using a probe walk for 100 shares.
         per_leg_vwap = []
         leg_books = []
@@ -496,7 +525,8 @@ class BucketSumArb(Strategy):
             leg_books.append(asks)
         # Estimate per-share cost (with slip + fee) to size the shares.
         sum_cost_probe = sum(
-            v + self.slippage_cents + self._fee_per_share(v) for v in per_leg_vwap)
+            v + self.slippage_cents + self._fee_per_share(v, ev_category)
+            for v in per_leg_vwap)
         if sum_cost_probe <= 0:
             return None
         shares_target = self.stake_notional_usd / sum_cost_probe
@@ -521,7 +551,7 @@ class BucketSumArb(Strategy):
                     "levels_consumed": levels,
                 })
                 continue
-            fee_ps = self._fee_per_share(vwap)
+            fee_ps = self._fee_per_share(vwap, ev_category)
             price_filled = min(0.99, vwap + self.slippage_cents)
             cost = (price_filled + fee_ps) * shares_target
             total_cost += cost

@@ -1,0 +1,70 @@
+# V2 fast cadence: copy follower + sharpline poll + lp_sim. Every 5 min.
+# Must be IDEMPOTENT and finish in under a minute - GitHub free-tier cron
+# is jittery and can be delayed or skipped, so the job has to absorb
+# either case. Detection delay is NOT a bug to hide: it's the primary
+# measurement (price_drift on copied_trades, adverse_selection on
+# sharpline_orders).
+
+name: fast
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: polymarketbot-state
+  cancel-in-progress: false
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fast strategies (copy follower + sharpline + lp_sim)
+        env:
+          PYTHONUNBUFFERED: "1"
+          # Read-only odds key, optional. Without it sharpline runs in
+          # OBSERVE MODE (logs spreads, posts nothing). Add to repo
+          # Settings -> Secrets and variables -> Actions to enable
+          # real fair-prob computation.
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # Each command is idempotent: cursor-tracked / TTL-cached /
+          # nothing-to-do if nothing changed. Any single failure does
+          # NOT block the others (`|| true` swallows non-zero exits).
+          python main.py follow || true
+          python main.py sharpline-fill-cycle || true
+          python main.py lp-sim || true
+
+      - name: Commit ledger
+        run: |
+          git config user.name "polymarketbot"
+          git config user.email "bot@users.noreply.github.com"
+          git add polymarketbot.db || true
+          if git diff --cached --quiet; then
+            echo "no db changes to commit"
+            exit 0
+          fi
+          git commit -m "fast $(date -u +%Y-%m-%dT%H:%MZ)"
+          git pull --rebase origin main || true
+          git push origin HEAD:main

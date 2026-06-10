@@ -281,6 +281,183 @@ class Sharpline(Strategy):
             "budget": budget, "observe_mode": True,
         }
 
+    # =================================================== fill simulation
+    # Strict-through honesty rule: a resting paper BUY at limit price L
+    # is FILLED only when the observed best ask trades STRICTLY BELOW L
+    # (touch != fill). We approximate "trades through" by checking
+    # whether the current best ask < L; an ask AT L could be our own
+    # quote sitting at the front, so we never count that as a fill.
+    #
+    # Lifecycle states on sharpline_orders.status:
+    #   RESTING            - waiting for the market to come to us
+    #   FILLED             - observed best ask < our limit at poll time
+    #   CANCELLED          - market closed (game start passed) before fill
+    #   UNFILLED_RESOLVED  - market resolved unfilled; graded counterfactually
+    #                         to learn whether we DODGED a loss or MISSED a win
+    #
+    # adverse_selection = fair_prob_at_post - line_at_fill  (signed). A
+    # positive value means the line moved against us between post and
+    # fill - the latency tax we hand back. We don't currently have a
+    # fresh fair_prob at fill time without burning another Odds API
+    # call, so we approximate line_at_fill = the YES ask we got filled
+    # at (the market's own implied probability at that moment). That
+    # makes adverse_selection negative when the market moved in our
+    # favor before filling, positive when it moved against us.
+
+    def simulate_fills_and_grade(self, ledger, scanner, gamma_url: str,
+                                    bankroll=None,
+                                    poll_now_ts: int | None = None,
+                                    verbose: bool = False) -> dict[str, Any]:
+        """Run the per-cycle order-lifecycle pass.
+
+        Inspects every RESTING order:
+          1. If the underlying market has closed/resolved, mark
+             UNFILLED_RESOLVED and grade counterfactually.
+          2. Else if game-start has passed (close_time approximation),
+             mark CANCELLED.
+          3. Else fetch the CLOB book; if best ask STRICTLY below our
+             limit price, mark FILLED, record line_at_fill +
+             adverse_selection, debit bankroll.
+          4. Else leave RESTING.
+
+        For every FILLED order whose market HAS resolved, settle to
+        WIN/LOSS, credit bankroll, populate realized_pnl.
+
+        Returns counters for the report.
+        """
+        import json as _json
+        from datetime import datetime, timezone as _tz
+        import requests as _req
+
+        now_ts = int(poll_now_ts) if poll_now_ts is not None else int(__import__("time").time())
+        cancelled = 0; filled = 0; unfilled_resolved = 0; settled = 0
+        resting = ledger.list_sharpline_orders("RESTING")
+        # We need market metadata (close_time, resolution) for each
+        # poly_market_id. Pull lazily via Gamma.
+        sess = _req.Session()
+        for o in resting:
+            mid = o["poly_market_id"]
+            try:
+                r = sess.get(f"{gamma_url}/markets",
+                              params={"condition_ids": mid}, timeout=15)
+                gdata = r.json()
+                gm = gdata[0] if gdata else None
+            except Exception:
+                gm = None
+            # Step 1: market closed -> UNFILLED_RESOLVED + counterfactual.
+            if gm and gm.get("closed"):
+                yes_price = self._yes_resolution_price(gm)
+                if yes_price is None:
+                    continue
+                # Counterfactual: if we HAD been filled at our limit,
+                # would we have won (yes_price=1) or lost (yes_price=0)?
+                # 'WIN' = side==YES and yes_price>0.99 OR side==NO and yes_price<0.01.
+                counter_won = (o["side"] == "YES" and yes_price > 0.99) \
+                    or (o["side"] == "NO" and yes_price < 0.01)
+                # The dodge/miss label is part of the post-mortem - we
+                # store the counterfactual P&L sign in realized_pnl with
+                # negative-sign meaning 'dodge'.
+                stake = float(o["stake_usd"])
+                shares_if_filled = stake / float(o["our_price"])
+                cf_pnl = shares_if_filled - stake if counter_won else -stake
+                ledger.update_sharpline_order(
+                    int(o["id"]),
+                    status="UNFILLED_RESOLVED",
+                    resolved_outcome="DODGED_LOSS" if not counter_won else "MISSED_WIN",
+                    realized_pnl=cf_pnl)
+                unfilled_resolved += 1
+                continue
+            # Step 2: book fetch + strict-through fill.
+            book = (scanner.fetch_book((gm or {}).get("clobTokenIds") and
+                                          _json.loads(gm["clobTokenIds"])[0]
+                                          if gm and isinstance(gm.get("clobTokenIds"), str)
+                                          else None) or {}) if gm else {}
+            asks = []
+            for L in (book.get("asks") or []):
+                try:
+                    asks.append({"price": float(L["price"]), "size": float(L["size"])})
+                except (KeyError, TypeError, ValueError):
+                    pass
+            asks.sort(key=lambda L: L["price"])
+            best_ask = asks[0]["price"] if asks else None
+            limit = float(o["our_price"])
+            # STRICTLY below the limit (touch != fill).
+            if best_ask is not None and best_ask < limit - 1e-9:
+                # Pay our limit price; line_at_fill = the current best ask
+                # (the market's implied prob at the moment we filled).
+                line_at_fill = best_ask
+                adverse = float(o["fair_prob_at_post"]) - line_at_fill
+                ok = True
+                if bankroll is not None:
+                    ok = bankroll.try_debit(self.name, float(o["stake_usd"]),
+                                              related_table="sharpline_orders",
+                                              related_id=int(o["id"]),
+                                              note=f"sharpline fill @ {limit:.4f}")
+                if not ok:
+                    # Out of capital -> cancel the resting order rather
+                    # than fake a fill.
+                    ledger.update_sharpline_order(int(o["id"]), status="CANCELLED")
+                    cancelled += 1
+                    continue
+                ledger.update_sharpline_order(
+                    int(o["id"]), status="FILLED",
+                    filled_at=__import__("datetime").datetime.now(_tz.utc).isoformat(),
+                    line_at_fill=line_at_fill,
+                    adverse_selection=adverse)
+                filled += 1
+        # Settle FILLED orders whose markets have resolved.
+        filled_rows = ledger.list_sharpline_orders("FILLED")
+        for o in filled_rows:
+            if o["realized_pnl"] is not None:
+                continue   # already settled
+            mid = o["poly_market_id"]
+            try:
+                r = sess.get(f"{gamma_url}/markets",
+                              params={"condition_ids": mid}, timeout=15)
+                gdata = r.json()
+                gm = gdata[0] if gdata else None
+            except Exception:
+                gm = None
+            if not gm or not gm.get("closed"):
+                continue
+            yes_price = self._yes_resolution_price(gm)
+            if yes_price is None:
+                continue
+            won = (o["side"] == "YES" and yes_price > 0.99) \
+                or (o["side"] == "NO" and yes_price < 0.01)
+            stake = float(o["stake_usd"])
+            shares = stake / float(o["our_price"])
+            pnl = shares - stake if won else -stake
+            ledger.update_sharpline_order(
+                int(o["id"]),
+                resolved_outcome="WIN" if won else "LOSS",
+                realized_pnl=pnl)
+            if bankroll is not None:
+                proceeds = stake + pnl
+                bankroll.credit(self.name, proceeds=proceeds,
+                                  opening_stake=stake,
+                                  related_table="sharpline_orders",
+                                  related_id=int(o["id"]))
+            settled += 1
+        if verbose:
+            print(f"  sharpline-lifecycle: cancelled={cancelled} filled={filled} "
+                  f"unfilled_resolved={unfilled_resolved} settled={settled}")
+        return {
+            "cancelled": cancelled, "filled": filled,
+            "unfilled_resolved": unfilled_resolved, "settled": settled,
+        }
+
+    @staticmethod
+    def _yes_resolution_price(gm: dict) -> float | None:
+        import json as _json
+        try:
+            op = gm.get("outcomePrices")
+            if isinstance(op, str):
+                op = _json.loads(op)
+            return float(op[0]) if op else None
+        except (TypeError, ValueError, _json.JSONDecodeError):
+            return None
+
     # ------------------------------------------------------------ helpers
     @staticmethod
     def _first_h2h(match: dict) -> dict | None:

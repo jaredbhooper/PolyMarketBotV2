@@ -423,6 +423,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("copy-backtest", help="copy-trading backtest table (ESTIMATEs)")
     sub.add_parser("master-report", help="full V2 master report (banner, scoreboard, all strategy sections)")
     sub.add_parser("bankroll", help="print bankroll snapshot + recent txn audit")
+    sub.add_parser("sharpline-post", help="post sharpline resting orders (fetches odds)")
+    sub.add_parser("sharpline-fill-cycle", help="run sharpline fill-and-grade lifecycle")
+    sub.add_parser("lp-sim", help="lp-sim quoting estimate pass")
+    sub.add_parser("logic-scan", help="logic-scan pair detection + violation check")
     args = p.parse_args(argv)
 
     if args.cmd == "cycle":
@@ -494,6 +498,56 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "master-report":
         from foundation.report import print_master_report
         print_master_report()
+        return 0
+    if args.cmd == "sharpline-post":
+        cfg = load_config()
+        ledger = Ledger(cfg["database"]["path"])
+        scanner = Scanner(cfg)
+        universe = scan_all(cfg, scanner, fetch_books=True)
+        from strategies.sharpline import Sharpline
+        s = Sharpline(cfg)
+        with HealthSession(ledger, s.name) as h:
+            res = s.run(ledger, universe, verbose=True)
+            h.markets_scanned = len(universe)
+            h.fills = res.get("posted", 0)
+        return 0
+    if args.cmd == "sharpline-fill-cycle":
+        cfg = load_config()
+        ledger = Ledger(cfg["database"]["path"])
+        scanner = Scanner(cfg)
+        br = Bankroll(cfg, ledger)
+        from strategies.sharpline import Sharpline
+        s = Sharpline(cfg)
+        gamma = (cfg.get("scanner") or {}).get(
+            "gamma_url", "https://gamma-api.polymarket.com").rstrip("/")
+        with HealthSession(ledger, s.name + "_fill") as h:
+            res = s.simulate_fills_and_grade(ledger, scanner, gamma,
+                                                bankroll=br, verbose=True)
+            h.fills = res.get("filled", 0) + res.get("settled", 0)
+        return 0
+    if args.cmd == "lp-sim":
+        cfg = load_config()
+        ledger = Ledger(cfg["database"]["path"])
+        scanner = Scanner(cfg)
+        universe = scan_all(cfg, scanner, fetch_books=True)
+        from strategies.lp_sim import LPSim
+        s = LPSim(cfg)
+        with HealthSession(ledger, s.name) as h:
+            r = s.run(ledger, universe, verbose=True)
+            h.markets_scanned = len(universe)
+            h.fills = r.get("rows_logged", 0)
+        return 0
+    if args.cmd == "logic-scan":
+        cfg = load_config()
+        ledger = Ledger(cfg["database"]["path"])
+        scanner = Scanner(cfg)
+        universe = scan_all(cfg, scanner, fetch_books=True)
+        from strategies.logic_scan import LogicScan
+        s = LogicScan(cfg)
+        with HealthSession(ledger, s.name) as h:
+            r = s.scan(ledger, universe, verbose=True)
+            h.markets_scanned = len(universe)
+            h.fills = r.get("traded", 0)
         return 0
     if args.cmd == "bankroll":
         cfg = load_config()

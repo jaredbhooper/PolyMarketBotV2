@@ -1,6 +1,9 @@
-# Run a scan-decide-paper-trade cycle every 30 minutes.
-# Section 8 of the build plan: GitHub Actions is the recommended scheduler.
-# Note: free tier cron triggers can drift 5-15 min - irrelevant at this timescale.
+# V2 cycle: scan-decide-paper-trade every 30 minutes. Runs every strategy
+# routed through main.py cycle (weather + bucket_arb + cross_venue_arb +
+# logic_scan + lp_sim). The fast-cadence strategies (copy follower,
+# sharpline) live in fast.yml so we don't burn a full cycle every 5 min.
+#
+# Free-tier cron drift is 5-15 min; irrelevant at this timescale.
 
 name: cycle
 
@@ -10,21 +13,22 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Optional tag_slug to restrict scan (defaults to highest-temperature)"
+        description: "Optional tag_slug to restrict scan"
         required: false
 
 permissions:
   contents: write
 
 concurrency:
-  # Shared with grade.yml so the two workflows never race on `git push`
-  # back to main. They both write the same `polymarketbot.db` file.
+  # Shared with fast.yml + daily.yml so the three workflows never race on
+  # git push back to main. They all write polymarketbot.db.
   group: polymarketbot-state
   cancel-in-progress: false
 
 jobs:
   cycle:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,16 +47,16 @@ jobs:
       - name: Run cycle
         env:
           PYTHONUNBUFFERED: "1"
-          # Optional alerting
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python main.py cycle
+          # logic_scan reuses the universe pulled by cycle. It runs at
+          # the same cadence to keep its pair detections fresh.
+          python main.py logic-scan || true
           python main.py status || true
 
       - name: Commit ledger
-        # Keeps polymarketbot.db versioned across runs.
-        # If you'd rather not commit the DB, swap this for actions/upload-artifact.
         run: |
           git config user.name "polymarketbot"
           git config user.email "bot@users.noreply.github.com"
@@ -62,6 +66,5 @@ jobs:
             exit 0
           fi
           git commit -m "cycle $(date -u +%Y-%m-%dT%H:%MZ)"
-          # Belt + suspenders: pull --rebase in case grade.yml just pushed.
           git pull --rebase origin main || true
           git push origin HEAD:main

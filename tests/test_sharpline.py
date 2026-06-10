@@ -140,6 +140,170 @@ def test_edge_above_threshold_posts_order(monkeypatch):
         pass
 
 
+# ---------------------------------------------------------- fill lifecycle
+class FakeGammaSession:
+    """Stand-in for requests.Session() used by simulate_fills_and_grade."""
+    def __init__(self, by_market_id: dict[str, dict]):
+        self.by_market_id = by_market_id
+
+    def get(self, url, params=None, timeout=15):
+        cid = (params or {}).get("condition_ids")
+        m = self.by_market_id.get(cid)
+        class R:
+            status_code = 200
+            def __init__(self_inner, m):
+                self_inner._m = m
+            def json(self_inner):
+                return [self_inner._m] if self_inner._m else []
+        return R(m)
+
+
+class FakeBookScanner:
+    def __init__(self, books_by_token: dict[str, dict]):
+        self.books_by_token = books_by_token
+
+    def fetch_book(self, token_id):
+        return self.books_by_token.get(token_id) or {"asks": [], "bids": []}
+
+
+def _seed_order(ledger, market_id, side="YES", our_price=0.50,
+                 fair_prob_at_post=0.55, stake=10.0):
+    match_id = ledger.record_sharpline_match({
+        "sport_key": "soccer_epl", "poly_market_id": market_id,
+        "poly_event_slug": "x", "bookmaker_event_id": "bm",
+        "home_team": "A", "away_team": "B",
+        "confidence": 1.0, "status": "MATCHED",
+    })
+    oid = ledger.record_sharpline_order({
+        "match_id": match_id, "poly_market_id": market_id,
+        "side": side, "outcome": "home", "our_price": our_price,
+        "fair_prob_at_post": fair_prob_at_post,
+        "edge_at_post": (fair_prob_at_post - our_price) / max(our_price, 1e-9),
+        "stake_usd": stake, "league": "soccer_epl", "status": "RESTING",
+    })
+    return oid
+
+
+def test_touch_does_not_fill(monkeypatch):
+    """Best ask AT our limit (touch) must NOT count as a fill."""
+    monkeypatch.setenv("ODDS_API_KEY", "")
+    import foundation.odds_api as oa
+    monkeypatch.setattr(oa, "load_dotenv", lambda path=".env": None)
+    ledger, path = _temp_ledger()
+    cfg = {"strategies": {"sharpline": {}}}
+    s = Sharpline(cfg)
+    oid = _seed_order(ledger, market_id="0xtouch", our_price=0.50)
+    # Open market with best ask EXACTLY at 0.50 (touch only).
+    gm = {"closed": False, "clobTokenIds": '["tok_touch","tok_no"]'}
+    scanner = FakeBookScanner({"tok_touch":
+                                  {"asks": [{"price": "0.50", "size": "100"}]}})
+    import requests
+    monkeypatch.setattr(requests, "Session",
+                          lambda: FakeGammaSession({"0xtouch": gm}))
+    res = s.simulate_fills_and_grade(ledger, scanner, "http://gamma",
+                                       bankroll=None, verbose=False)
+    assert res["filled"] == 0
+    rows = ledger.list_sharpline_orders("RESTING")
+    assert len(rows) == 1   # still RESTING
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def test_strict_through_fills_and_records_adverse_selection(monkeypatch):
+    """Best ask STRICTLY BELOW our limit -> FILLED + adverse_selection."""
+    monkeypatch.setenv("ODDS_API_KEY", "")
+    import foundation.odds_api as oa
+    monkeypatch.setattr(oa, "load_dotenv", lambda path=".env": None)
+    ledger, path = _temp_ledger()
+    cfg = {"strategies": {"sharpline": {}}}
+    s = Sharpline(cfg)
+    oid = _seed_order(ledger, market_id="0xfill", our_price=0.50,
+                       fair_prob_at_post=0.60)
+    gm = {"closed": False, "clobTokenIds": '["tok_fill","tok_no"]'}
+    # Best ask at 0.45 - strictly below our 0.50 limit. line_at_fill
+    # will be 0.45; adverse_selection = 0.60 - 0.45 = +0.15 (favorable -
+    # the line moved IN OUR direction since post, so positive adverse).
+    scanner = FakeBookScanner({"tok_fill":
+                                  {"asks": [{"price": "0.45", "size": "100"}]}})
+    import requests
+    monkeypatch.setattr(requests, "Session",
+                          lambda: FakeGammaSession({"0xfill": gm}))
+    res = s.simulate_fills_and_grade(ledger, scanner, "http://gamma",
+                                       bankroll=None, verbose=False)
+    assert res["filled"] == 1
+    filled = ledger.list_sharpline_orders("FILLED")
+    assert len(filled) == 1
+    r = filled[0]
+    assert r["line_at_fill"] == pytest.approx(0.45)
+    assert r["adverse_selection"] == pytest.approx(0.15, abs=1e-6)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def test_adverse_selection_sign_when_line_moves_against(monkeypatch):
+    """fair_prob_at_post 0.60 but market moves to ask 0.65 - adverse_selection
+    must be negative (line moved AGAINST our bid)."""
+    monkeypatch.setenv("ODDS_API_KEY", "")
+    import foundation.odds_api as oa
+    monkeypatch.setattr(oa, "load_dotenv", lambda path=".env": None)
+    ledger, path = _temp_ledger()
+    cfg = {"strategies": {"sharpline": {}}}
+    s = Sharpline(cfg)
+    # We posted at 0.70 thinking fair was 0.60. The best ask drops to
+    # 0.65 < 0.70 so we fill - but the market now thinks YES is more
+    # likely (0.65 > 0.60 fair), so adverse_selection should be NEGATIVE.
+    _seed_order(ledger, market_id="0xadv", our_price=0.70,
+                 fair_prob_at_post=0.60)
+    gm = {"closed": False, "clobTokenIds": '["tok_adv","tok_no"]'}
+    scanner = FakeBookScanner({"tok_adv":
+                                  {"asks": [{"price": "0.65", "size": "100"}]}})
+    import requests
+    monkeypatch.setattr(requests, "Session",
+                          lambda: FakeGammaSession({"0xadv": gm}))
+    s.simulate_fills_and_grade(ledger, scanner, "http://gamma", verbose=False)
+    r = ledger.list_sharpline_orders("FILLED")[0]
+    assert r["adverse_selection"] < 0   # 0.60 - 0.65 = -0.05
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def test_unfilled_at_resolution_counterfactual_grades(monkeypatch):
+    """Order never filled; market resolves YES. Side was YES -> counterfactual
+    MISSED_WIN. realized_pnl should be POSITIVE."""
+    monkeypatch.setenv("ODDS_API_KEY", "")
+    import foundation.odds_api as oa
+    monkeypatch.setattr(oa, "load_dotenv", lambda path=".env": None)
+    ledger, path = _temp_ledger()
+    cfg = {"strategies": {"sharpline": {}}}
+    s = Sharpline(cfg)
+    _seed_order(ledger, market_id="0xresolved", side="YES",
+                 our_price=0.50, fair_prob_at_post=0.60)
+    gm = {"closed": True, "outcomePrices": '["1.0","0.0"]',
+          "clobTokenIds": '["tok_r","tok_n"]'}
+    scanner = FakeBookScanner({})
+    import requests
+    monkeypatch.setattr(requests, "Session",
+                          lambda: FakeGammaSession({"0xresolved": gm}))
+    res = s.simulate_fills_and_grade(ledger, scanner, "http://gamma", verbose=False)
+    assert res["unfilled_resolved"] == 1
+    rows = ledger.list_sharpline_orders("UNFILLED_RESOLVED")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["resolved_outcome"] == "MISSED_WIN"
+    # 10 USD stake, would have bought 20 shares at 0.50 -> 20 - 10 = 10
+    assert r["realized_pnl"] == pytest.approx(10.0, abs=1e-6)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def test_request_budget_blocks_when_exhausted(monkeypatch):
     """Mock the API to never be called when the budget says 0 remaining."""
     monkeypatch.setenv("ODDS_API_KEY", "fake")

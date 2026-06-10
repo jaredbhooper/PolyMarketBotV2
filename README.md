@@ -942,17 +942,25 @@ repo. Every API call is read-only against a public endpoint.
 ### CLI inventory
 
 ```bash
-# Per-strategy single-shot runs.
+# 30-minute cadence (single-shot).
 python main.py scan               # weather scanner only (no DB writes)
 python main.py cycle              # weather + bucket_arb + cross_venue_arb in one pass
 python main.py arb                # bucket-sum arb (Strategy #2) only
 python main.py cv                 # cross-venue arb (Strategy #3) only
-python main.py scout              # copy-trading scout: build/update roster
+python main.py logic-scan         # logic-scan pair detection + violation check
+python main.py lp-sim             # lp-sim quoting estimate pass
+
+# 5-minute cadence.
 python main.py follow             # copy-trading follower cycle
+python main.py sharpline-post     # post sharpline resting orders (fetches odds)
+python main.py sharpline-fill-cycle  # full RESTING -> FILLED/CANCELLED/UNFILLED_RESOLVED lifecycle
+
+# Daily.
+python main.py scout              # copy-trading roster build / hysteresis update
+python main.py grade              # settles every strategy's resolved positions
 python main.py copy-backtest      # copy-trading 90d backtest (ESTIMATEs)
 
-# Grade + report.
-python main.py grade              # settles every strategy's resolved positions
+# Reports / introspection.
 python main.py report             # per-strategy detailed sections (V1 default)
 python main.py master-report      # **V2 master report**: banner + scoreboard + sections
 python main.py status             # quick per-strategy bankroll + open stake
@@ -960,6 +968,33 @@ python main.py bankroll           # bankroll snapshot + last 20 audit txns
 python main.py arb-stats          # arb gap distribution
 python main.py cv-stats           # cross-venue pair + gap distribution
 ```
+
+### Scheduled workflows (`.github/workflows/`)
+
+Workflow files are committed; they're scheduled by GitHub Actions
+**when you push the repo**. Concurrency group `polymarketbot-state`
+serializes their `git push` of `polymarketbot.db` back to main so
+they never race.
+
+| file        | cron           | runs |
+|-------------|----------------|------|
+| `cycle.yml` | `*/30 * * * *` | `cycle` + `logic-scan` + `status`. ~5-10 min. |
+| `fast.yml`  | `*/5  * * * *` | `follow` + `sharpline-fill-cycle` + `lp-sim`. Under 1 min. Reads `ODDS_API_KEY` from secrets; without it Sharpline runs OBSERVE MODE. |
+| `daily.yml` | `0 10 * * *`   | `scout` + `grade` + `master-report`. 10:00 UTC. |
+
+To activate: push to a private GitHub repo, then Settings → Actions
+→ General → **Workflow permissions: Read and write** (so the
+workflows can commit the DB back).
+
+### Polymarket fee schedule (verified 2026-03)
+
+Quadratic per-category taker fee `fee/share = rate × p × (1−p)`.
+Rates live in `config.yaml:polymarket_fees.rates`, full source list
+in `BUILD_NOTES.md`. Weather 1.25%, sports 0.75%, geopolitics 0%, etc.
+Bucket-arb / cross-venue-arb / sharpline / logic-scan all subtract
+the appropriate per-category fee when computing net P&L. A unit test
+in `tests/test_fees.py` fails loudly if the rate table drifts from
+the verified source.
 
 ### Where the data lives
 
