@@ -208,11 +208,144 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
                   f"${trade['stake']:.2f} -> {outcome} ({status}) PnL "
                   f"${pnl:+.2f} actual={actual}{extra}")
 
+    # Settle arb_positions whose end_date has passed.
+    arb_settled, arb_skipped = grade_arb_positions(cfg, ledger, today, verbose=verbose)
+
     # Recompute per-strategy daily report rows.
     update_reports(ledger, cfg, today.isoformat(), verbose=verbose)
 
     return {"settled": settled, "skipped": skipped,
+            "arb_settled": arb_settled, "arb_skipped": arb_skipped,
             "open_remaining": len(ledger.open_positions())}
+
+
+def grade_arb_positions(cfg: dict, ledger: Ledger, today, verbose: bool = True
+                          ) -> tuple[int, int]:
+    """Settle every OPEN arb_position whose event has resolved.
+
+    For each open position:
+      - For every leg, query Gamma for the leg's conditionId. If the leg's
+        `closed=True` and `outcomePrices[0]` (YES price) is 1.0, that leg
+        is the winner. Else, the leg lost (NO would have paid $1).
+      - In a MECE event, exactly one leg's YES resolves 1.0.
+      - YES-side position: payout = shares (only winning leg's YES pays).
+        NO-side position: payout = shares * (N - 1) (every losing leg's NO).
+      - Net pnl = total_payout - total_cost.
+
+    Requires the Gamma API to be reachable for each leg's conditionId. If
+    any leg can't be confirmed resolved, we leave the position OPEN.
+    """
+    import requests
+    settled = 0
+    skipped = 0
+    open_arbs = ledger.open_arb_positions()
+    if verbose:
+        print(f"Grader: {len(open_arbs)} open arb positions to evaluate.")
+    gamma = (cfg.get("scanner") or {}).get(
+        "gamma_url", "https://gamma-api.polymarket.com").rstrip("/")
+    session = requests.Session()
+
+    for pos in open_arbs:
+        end = pos["end_date_iso"]
+        if end:
+            try:
+                e_date = datetime.fromisoformat((end or "").replace("Z", "+00:00").split("T")[0]).date()
+                if e_date >= today:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        legs = ledger.arb_legs_for(int(pos["id"]))
+        if not legs:
+            continue
+        # Look up every leg's resolution status.
+        leg_outcomes = []
+        all_resolved = True
+        winner_idx = -1
+        for i, leg in enumerate(legs):
+            try:
+                r = session.get(
+                    f"{gamma}/markets",
+                    params={"condition_ids": leg["market_id"]},
+                    timeout=20,
+                )
+                data = r.json()
+                m = data[0] if data else None
+            except Exception:
+                m = None
+            if not m or not m.get("closed"):
+                all_resolved = False
+                leg_outcomes.append((leg, None, None))
+                continue
+            # Polymarket marks outcomePrices [YES, NO]; the winner is 1.
+            try:
+                op = m.get("outcomePrices")
+                if isinstance(op, str):
+                    op = json.loads(op)
+                yes_price = float(op[0]) if op and len(op) > 0 else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                yes_price = None
+            won = yes_price is not None and yes_price > 0.99
+            leg_outcomes.append((leg, "YES" if won else "NO", yes_price))
+            if won:
+                if winner_idx >= 0:
+                    # Two YES winners would mean Polymarket broke MECE -
+                    # extremely unlikely but worth a loud bail.
+                    if verbose:
+                        print(f"  !! arb pos {pos['id']}: TWO winners found "
+                              f"({legs[winner_idx]['leg_title']} and "
+                              f"{leg['leg_title']}). Marking VOID.")
+                    winner_idx = -2   # sentinel
+                else:
+                    winner_idx = i
+        if not all_resolved:
+            skipped += 1
+            continue
+        if winner_idx == -2:
+            # MECE violation - VOID and refund cost.
+            outcomes_for_close = []
+            for leg, _, _ in leg_outcomes:
+                outcomes_for_close.append({
+                    "leg_id": int(leg["id"]), "outcome": "VOID", "payout": 0.0})
+            ledger.close_arb_position(int(pos["id"]), "VOID",
+                                       -float(pos["total_cost"]),
+                                       outcomes_for_close)
+            settled += 1
+            continue
+        if winner_idx == -1:
+            # No winner found - probably means the event resolved with no
+            # YES winner (rare but possible with negRisk). Refund.
+            if verbose:
+                print(f"  ?? arb pos {pos['id']} ({pos['event_slug']}): "
+                      f"no winning leg detected; leaving OPEN")
+            skipped += 1
+            continue
+        # Compute payouts per leg.
+        outcomes_for_close = []
+        total_payout = 0.0
+        side = pos["side"]
+        for i, (leg, outcome, _) in enumerate(leg_outcomes):
+            if side == "YES":
+                # We bought YES on every leg. Only winner pays $1/share.
+                payout = float(leg["shares"]) if i == winner_idx else 0.0
+            else:
+                # We bought NO on every leg. Loser legs each pay $1/share.
+                payout = float(leg["shares"]) if i != winner_idx else 0.0
+            total_payout += payout
+            outcomes_for_close.append({
+                "leg_id": int(leg["id"]),
+                "outcome": outcome,
+                "payout": payout,
+            })
+        pnl = total_payout - float(pos["total_cost"])
+        status = "CLOSED"
+        ledger.close_arb_position(int(pos["id"]), status, pnl, outcomes_for_close)
+        settled += 1
+        if verbose:
+            print(f"  Settled arb pos {pos['id']} ({pos['strategy']}) "
+                  f"{side} {pos['event_slug']} shares={pos['shares']:.1f} "
+                  f"cost=${pos['total_cost']:.2f} payout=${total_payout:.2f} "
+                  f"PnL=${pnl:+.2f}")
+    return settled, skipped
 
 
 def update_reports(ledger: Ledger, cfg: dict, date_iso: str,
@@ -227,8 +360,21 @@ def update_reports(ledger: Ledger, cfg: dict, date_iso: str,
         n_trades = len(closed)
         n_wins = sum(1 for t in closed if t["status"] == "WIN")
         pnl = sum(float(t["pnl"] or 0) for t in closed)
+        # Roll in closed arb_positions for this strategy too.
+        with sqlite3.connect(ledger.db_path) as c:
+            c.row_factory = sqlite3.Row
+            arbs = list(c.execute(
+                """SELECT status, pnl FROM arb_positions
+                   WHERE strategy=? AND status IN ('CLOSED','VOID')""",
+                (sname,)).fetchall())
+        arb_n = len(arbs)
+        arb_wins = sum(1 for a in arbs if a["status"] == "CLOSED" and (a["pnl"] or 0) > 0)
+        arb_pnl = sum(float(a["pnl"] or 0) for a in arbs)
+        n_trades += arb_n
+        n_wins += arb_wins
+        pnl += arb_pnl
         brier = _brier(closed)
-        bankroll = ledger.bankroll(sname, starting)
+        bankroll = ledger.bankroll(sname, starting) + arb_pnl
         ledger.upsert_daily_report(date_iso, sname, n_trades, n_wins,
                                    pnl, brier, bankroll)
         # Surface disputed settlements that touch this strategy's open book.

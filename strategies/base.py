@@ -64,3 +64,40 @@ class Strategy(ABC):
         Default returns None; the grader falls back to its generic path.
         """
         return None
+
+
+# ---------------------------------------------------------------- arb types
+# These extend the Strategy contract to event-level (multi-outcome) work.
+# A strategy that overrides `scan_arb()` is routed by main.py through the
+# event-walking code path instead of the per-market estimate path.
+
+@dataclass
+class ArbLeg:
+    """One outcome in a multi-outcome (negRisk) Polymarket event."""
+    market_id: str                 # conditionId (per-leg)
+    leg_title: str                 # groupItemTitle (e.g. '14C', 'Trump')
+    yes_token_id: str | None
+    no_token_id: str | None
+    yes_asks: list[dict] = field(default_factory=list)   # ascending price
+    yes_bids: list[dict] = field(default_factory=list)   # descending price
+    no_asks: list[dict] = field(default_factory=list)
+    no_bids: list[dict] = field(default_factory=list)
+    gamma_yes_ask: float | None = None     # snapshot from Gamma (lagged)
+    gamma_yes_bid: float | None = None
+    end_date_iso: str | None = None
+    extras: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ArbEvent:
+    """A grouped multi-outcome event - one MECE set of legs."""
+    event_id: str
+    event_slug: str
+    event_title: str
+    end_date_iso: str | None
+    neg_risk: bool                          # Polymarket's MECE flag
+    legs: list[ArbLeg] = field(default_factory=list)
+    completeness_verified: bool = False
+    completeness_note: str = ""
+    books_fetched: bool = False             # True iff all leg books were walked
+    extras: dict[str, Any] = field(default_factory=dict)

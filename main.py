@@ -18,7 +18,7 @@ import yaml
 from foundation.executor import Executor, CycleDecision
 from foundation.ledger import Ledger
 from foundation.scanner import Scanner, render_scanner_table
-from strategies.base import Market, Strategy
+from strategies.base import ArbEvent, Market, Strategy
 
 
 # Scanner pulls everything tagged under these slugs - strategies filter further.
@@ -54,6 +54,135 @@ def scan_all(cfg: dict, scanner: Scanner, fetch_books: bool = True,
     return list(seen.values())
 
 
+def _is_arb_strategy(s: Strategy) -> bool:
+    """An arb strategy implements `scan_arb`; main.py routes it through
+    the event path instead of the per-market estimate path."""
+    return hasattr(s, "scan_arb") and callable(getattr(s, "scan_arb", None))
+
+
+def run_arb_cycle(strategy, scanner: Scanner, ledger: Ledger,
+                   verbose: bool = True) -> dict:
+    """Event-level cycle for bucket-sum arb (and any future arb strategies).
+
+    Pulls every open+active event from Gamma, groups into ArbEvents (MECE-
+    verified or flagged), runs the strategy's detector (which lazy-fetches
+    CLOB books only on events that pass the cheap pre-filter), logs every
+    gap to arb_gaps, and paper-commits any detection whose locked profit
+    clears the strategy's min_arb_profit threshold.
+    """
+    if verbose:
+        print(f"\n=== {strategy.name} (event-level) ===")
+        print("Fetching every open+active event on Gamma ...")
+    raw_events = scanner.fetch_all_events()
+    if verbose:
+        print(f"  pulled {len(raw_events)} events.")
+    arb_events: list[ArbEvent] = [
+        scanner.build_arb_event(e, fetch_books=False) for e in raw_events
+    ]
+    if verbose:
+        ok = sum(1 for e in arb_events if e.completeness_verified)
+        print(f"  MECE-verified: {ok} / {len(arb_events)}")
+
+    result = strategy.scan_arb(arb_events, scanner=scanner, verbose=verbose)
+    detections = result["detections"]
+    gamma_only_gaps = result["gamma_only_gaps"]
+    counters = result["counters"]
+
+    # ---- log every detection as a gap row (above threshold or not).
+    for det in detections:
+        ledger.record_arb_gap({
+            "strategy": strategy.name,
+            "event_id": det.event.event_id,
+            "event_slug": det.event.event_slug,
+            "event_title": det.event.event_title,
+            "n_legs": len(det.event.legs),
+            "completeness_verified": det.event.completeness_verified,
+            "completeness_note": det.event.completeness_note,
+            "side": det.side,
+            "walk_mode": det.walk_mode,
+            "target_shares": det.target_shares,
+            "executable_shares": det.executable_shares,
+            "sum_vwap_per_share": det.sum_vwap_per_share,
+            "slippage_per_share": det.slippage_per_share,
+            "safety_buffer": det.safety_buffer,
+            "payout_per_share": det.payout_per_share,
+            "locked_profit_per_share": det.locked_profit_per_share,
+            "locked_profit_usd": det.locked_profit_usd,
+            "end_date_iso": det.event.end_date_iso,
+            "legs": [
+                {"market_id": L["market_id"], "leg_title": L["leg_title"],
+                 "vwap": L["vwap"], "depth_usd": L["depth_usd"],
+                 "shares_fillable": L["shares_fillable"]}
+                for L in det.legs_detail
+            ],
+            "cleared_threshold": det.cleared_threshold,
+        })
+
+    # ---- log gamma-only (cheap-pass) gaps too, with walk_mode='gamma_only'
+    # so the distribution analysis still sees the no-arb majority.
+    for g in gamma_only_gaps:
+        ev = g["event"]
+        ledger.record_arb_gap({
+            "strategy": strategy.name,
+            "event_id": ev.event_id,
+            "event_slug": ev.event_slug,
+            "event_title": ev.event_title,
+            "n_legs": len(ev.legs),
+            "completeness_verified": ev.completeness_verified,
+            "completeness_note": ev.completeness_note,
+            "side": g["side"],
+            "walk_mode": "gamma_only",
+            "target_shares": None,
+            "executable_shares": None,
+            "sum_vwap_per_share": g["snap_sum"],
+            "slippage_per_share": None,
+            "safety_buffer": strategy.safety_buffer,
+            "payout_per_share": g["payout_ps"],
+            "locked_profit_per_share": g["profit_ps"],
+            "locked_profit_usd": None,
+            "end_date_iso": ev.end_date_iso,
+            "legs": [],
+            "cleared_threshold": False,
+        })
+
+    # ---- paper-execute every detection that cleared the threshold.
+    fired = 0
+    for det in detections:
+        if not det.cleared_threshold:
+            continue
+        side_enabled = (det.side == "YES" and strategy.execute_yes) \
+            or (det.side == "NO" and strategy.execute_no)
+        if not side_enabled:
+            continue
+        pid = strategy.commit_detection(det, ledger)
+        if pid is not None:
+            fired += 1
+            if verbose:
+                print(f"  [ARB FILL] pos #{pid} {det.side} {det.event.event_slug} "
+                      f"shares={det.executable_shares:.1f} "
+                      f"profit_per_share={det.locked_profit_per_share:.4f} "
+                      f"total=${det.locked_profit_usd:.2f}")
+
+    if verbose:
+        print(
+            f"  detector: scanned={counters['scanned']} "
+            f"complete={counters['complete']} "
+            f"incomplete={counters['incomplete']} "
+            f"walked={counters['walked']} "
+            f"gamma_only={counters['gamma_only_recorded']} "
+            f"skipped_time={counters['skipped_time']} "
+            f"skipped_cap={counters['skipped_cap']}"
+        )
+        print(f"  full-walk detections: {len(detections)} | fired: {fired}")
+    return {
+        "strategy": strategy.name,
+        "detections": detections,
+        "counters": counters,
+        "gamma_only_gaps": gamma_only_gaps,
+        "fired": fired,
+    }
+
+
 def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
           tag: str | None = None) -> dict:
     cfg = load_config(cfg_path)
@@ -67,7 +196,27 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
 
     if verbose:
         print(f"Active strategies: {[s.name for s in strategies]}")
-        print("Scanning Polymarket ...")
+
+    # Route arb (event-level) strategies separately - they don't go through
+    # the per-market scan_all / Estimate path.
+    arb_results = []
+    per_market_strategies: list[Strategy] = []
+    for s in strategies:
+        if _is_arb_strategy(s):
+            arb_results.append(run_arb_cycle(s, scanner, ledger, verbose=verbose))
+        else:
+            per_market_strategies.append(s)
+    strategies = per_market_strategies
+
+    if not strategies:
+        # Pure arb cycle, no per-market work.
+        return {
+            "decisions": [], "scanned": 0, "filled": 0,
+            "arb": arb_results,
+        }
+
+    if verbose:
+        print("\nScanning Polymarket (per-market) ...")
     universe = scan_all(cfg, scanner, fetch_books=True,
                         tags=[tag] if tag else None)
     if verbose:
@@ -150,6 +299,7 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
         "scanned": len(universe),
         "filled": len(fills),
         "qualified": len(pending),
+        "arb": arb_results,
     }
 
 
@@ -173,6 +323,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("grade", help="settle resolved markets and update reports")
     sub.add_parser("report", help="print latest daily report")
     sub.add_parser("status", help="print open positions and bankrolls")
+    sub.add_parser("arb", help="run the bucket-sum arb detector only (no weather)")
+    sub.add_parser("arb-stats", help="print gap-distribution diagnostics for arb")
     args = p.parse_args(argv)
 
     if args.cmd == "cycle":
@@ -193,7 +345,95 @@ def main(argv: list[str] | None = None) -> int:
         from foundation.report import print_status
         print_status()
         return 0
+    if args.cmd == "arb":
+        # Run just the bucket-sum arb strategy. The rest of cycle() routes
+        # everything else through the per-market path; here we want just
+        # the event-level pass.
+        cfg = load_config()
+        ledger = Ledger(cfg["database"]["path"])
+        scanner = Scanner(cfg)
+        strategies = load_strategies(cfg)
+        ran = False
+        for s in strategies:
+            if _is_arb_strategy(s):
+                run_arb_cycle(s, scanner, ledger, verbose=True)
+                ran = True
+        if not ran:
+            print("No arb-style strategies active in config.yaml.")
+        # Print summary stats after running.
+        print_arb_stats(cfg, ledger)
+        return 0
+    if args.cmd == "arb-stats":
+        cfg = load_config()
+        ledger = Ledger(cfg["database"]["path"])
+        print_arb_stats(cfg, ledger)
+        return 0
     return 2
+
+
+def print_arb_stats(cfg: dict, ledger: Ledger) -> None:
+    """Pretty-print the arb_gaps distribution + executed positions per strategy."""
+    import sqlite3
+    strategies = load_strategies(cfg)
+    arb_names = [s.name for s in strategies if _is_arb_strategy(s)]
+    if not arb_names:
+        return
+    print()
+    print("======================================================")
+    print(" Bucket-sum arb diagnostics")
+    print("======================================================")
+    for sname in arb_names:
+        stats = ledger.arb_gap_stats(sname)
+        with sqlite3.connect(ledger.db_path) as c:
+            c.row_factory = sqlite3.Row
+            full = list(c.execute(
+                """SELECT side, locked_profit_per_share, locked_profit_usd,
+                          executable_shares, event_slug, cleared_threshold
+                     FROM arb_gaps
+                    WHERE strategy=? AND walk_mode='full_book'
+                    ORDER BY ts DESC LIMIT 50""", (sname,)).fetchall())
+            positions = list(c.execute(
+                """SELECT id, event_slug, side, shares, total_cost,
+                          expected_payout, locked_profit, status, pnl
+                     FROM arb_positions WHERE strategy=?
+                    ORDER BY ts DESC""", (sname,)).fetchall())
+        print(f"\n[{sname}] total gap rows logged: {stats['total']} "
+              f"(verified MECE: {stats['verified']})")
+        print(f"  by walk_mode: {stats['by_mode']}")
+        print(f"  by side: {stats['by_side']}")
+        print(f"  cleared threshold: {stats['cleared']}")
+        # Distribution of per-share locked profit, split full_book vs gamma_only.
+        labels = [
+            ("< -10c", -0.10), ("[-10c,-5c)", -0.05), ("[-5c,-2c)", -0.02),
+            ("[-2c,-1c)", -0.01), ("[-1c,0)", 0.0), ("[0,0.5c)", 0.005),
+            ("[0.5c,1c)", 0.01), ("[1c,2c)", 0.02), ("[2c,5c)", 0.05),
+            ("[5c,10c)", 0.10), (">=10c", 1.0),
+        ]
+        fb = stats["profit_buckets"].get("full_book", {})
+        go = stats["profit_buckets"].get("gamma_only", {})
+        print("  profit-per-share distribution:")
+        print(f"    {'bucket':14s} {'full_book':>10s} {'gamma_only':>11s}")
+        for label, hi in labels:
+            print(f"    {label:14s} {fb.get(hi,0):>10d} {go.get(hi,0):>11d}")
+        print(f"  recent full-walk gaps (top 10):")
+        for r in full[:10]:
+            mark = "* TRADE" if r["cleared_threshold"] else "  "
+            pps = r["locked_profit_per_share"]
+            usd = r["locked_profit_usd"]
+            pps_s = f"{pps:+.4f}" if pps is not None else "  n/a "
+            usd_s = f"${usd:+.2f}" if usd is not None else "  n/a"
+            sh = r["executable_shares"]
+            sh_s = f"{sh:>6.1f}" if sh is not None else "   n/a"
+            print(f"    {mark:7s} {r['side']:3s} pps={pps_s} usd={usd_s:>9s} "
+                  f"shares={sh_s} {r['event_slug'][:60]}")
+        if positions:
+            print(f"  paper positions: {len(positions)}")
+            for p in positions[:10]:
+                pnl_s = f"{p['pnl']:+.2f}" if p["pnl"] is not None else "open"
+                print(f"    #{p['id']} {p['side']:3s} {p['event_slug'][:55]:55s} "
+                      f"shares={p['shares']:.1f} cost=${p['total_cost']:.2f} "
+                      f"locked=${p['locked_profit']:.2f} status={p['status']} "
+                      f"pnl={pnl_s}")
 
 
 if __name__ == "__main__":

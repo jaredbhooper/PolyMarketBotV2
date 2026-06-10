@@ -85,9 +85,78 @@ CREATE TABLE IF NOT EXISTS daily_report (
   PRIMARY KEY (date, strategy)
 );
 
+-- Bucket-sum arbitrage detector tables (strategy #2).
+-- arb_gaps logs EVERY detected gap (even sub-threshold) so we can measure
+-- how often real, fillable complete sets actually exist in the wild.
+CREATE TABLE IF NOT EXISTS arb_gaps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  event_slug TEXT,
+  event_title TEXT,
+  n_legs INTEGER NOT NULL,
+  completeness_verified INTEGER NOT NULL,    -- 1 if MECE confirmed
+  completeness_note TEXT,
+  side TEXT NOT NULL,                        -- YES or NO
+  walk_mode TEXT NOT NULL,                   -- 'gamma_only' or 'full_book'
+  target_shares REAL,
+  executable_shares REAL,                    -- min fillable across legs
+  sum_vwap_per_share REAL,                   -- sum of leg VWAPs
+  slippage_per_share REAL,                   -- N * slippage_cents
+  safety_buffer REAL,
+  payout_per_share REAL,                     -- 1.0 (YES) or N-1 (NO)
+  locked_profit_per_share REAL,              -- payout - sum_vwap - slippage - buffer
+  locked_profit_usd REAL,                    -- profit_per_share * executable_shares
+  end_date_iso TEXT,
+  legs_json TEXT,                            -- per-leg vwap, depth, levels
+  cleared_threshold INTEGER NOT NULL DEFAULT 0
+);
+
+-- An arb_positions row is one paper-traded complete-set arb. Each row links
+-- to N arb_legs (one per outcome). All N legs settle together when the
+-- event resolves.
+CREATE TABLE IF NOT EXISTS arb_positions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  event_slug TEXT,
+  event_title TEXT,
+  side TEXT NOT NULL,                        -- YES or NO (which side we bought on every leg)
+  n_legs INTEGER NOT NULL,
+  shares REAL NOT NULL,                      -- common share count across legs
+  total_cost REAL NOT NULL,                  -- sum(leg cost)
+  expected_payout REAL NOT NULL,             -- shares * payout_per_share
+  locked_profit REAL NOT NULL,               -- expected_payout - total_cost
+  status TEXT NOT NULL DEFAULT 'OPEN',       -- OPEN, CLOSED, VOID
+  pnl REAL,
+  end_date_iso TEXT
+);
+
+CREATE TABLE IF NOT EXISTS arb_legs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  position_id INTEGER NOT NULL,
+  market_id TEXT NOT NULL,                   -- conditionId
+  leg_title TEXT,
+  token_id TEXT,
+  side TEXT NOT NULL,                        -- matches parent for now
+  vwap REAL NOT NULL,
+  price_filled REAL NOT NULL,                -- vwap + slippage_cents
+  shares REAL NOT NULL,
+  cost REAL NOT NULL,                        -- shares * price_filled
+  levels_consumed_json TEXT,
+  outcome TEXT,                              -- YES/NO/VOID once graded
+  payout REAL,                               -- realized payout
+  FOREIGN KEY(position_id) REFERENCES arb_positions(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_snapshots_market ON snapshots(market_id, ts);
 CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market_id, strategy, ts);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status, strategy);
+CREATE INDEX IF NOT EXISTS idx_arb_gaps_event ON arb_gaps(event_id, ts);
+CREATE INDEX IF NOT EXISTS idx_arb_positions_status ON arb_positions(status, strategy);
+CREATE INDEX IF NOT EXISTS idx_arb_legs_position ON arb_legs(position_id);
 """
 
 
@@ -307,3 +376,146 @@ class Ledger:
                 (strategy,),
             ).fetchone()
             return float(row["s"])
+
+    # --- arb gaps + arb positions (strategy #2) ----------------------------
+    def record_arb_gap(self, gap: dict[str, Any]) -> int:
+        """Insert one gap log row. Callers should always populate the
+        per-share fields; legs_json carries the per-leg breakdown."""
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO arb_gaps (
+                    ts, strategy, event_id, event_slug, event_title, n_legs,
+                    completeness_verified, completeness_note,
+                    side, walk_mode, target_shares, executable_shares,
+                    sum_vwap_per_share, slippage_per_share, safety_buffer,
+                    payout_per_share, locked_profit_per_share,
+                    locked_profit_usd, end_date_iso, legs_json,
+                    cleared_threshold)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    utcnow_iso(), gap["strategy"], gap["event_id"],
+                    gap.get("event_slug"), gap.get("event_title"),
+                    int(gap["n_legs"]),
+                    1 if gap.get("completeness_verified") else 0,
+                    gap.get("completeness_note"),
+                    gap["side"], gap["walk_mode"],
+                    gap.get("target_shares"), gap.get("executable_shares"),
+                    gap.get("sum_vwap_per_share"),
+                    gap.get("slippage_per_share"),
+                    gap.get("safety_buffer"),
+                    gap.get("payout_per_share"),
+                    gap.get("locked_profit_per_share"),
+                    gap.get("locked_profit_usd"),
+                    gap.get("end_date_iso"),
+                    json.dumps(gap.get("legs") or []),
+                    1 if gap.get("cleared_threshold") else 0,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def record_arb_position(self, pos: dict[str, Any],
+                             legs: list[dict[str, Any]]) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO arb_positions (
+                    strategy, ts, event_id, event_slug, event_title, side,
+                    n_legs, shares, total_cost, expected_payout,
+                    locked_profit, status, end_date_iso)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)""",
+                (
+                    pos["strategy"], utcnow_iso(), pos["event_id"],
+                    pos.get("event_slug"), pos.get("event_title"),
+                    pos["side"], int(pos["n_legs"]),
+                    float(pos["shares"]), float(pos["total_cost"]),
+                    float(pos["expected_payout"]),
+                    float(pos["locked_profit"]),
+                    pos.get("end_date_iso"),
+                ),
+            )
+            pid = int(cur.lastrowid)
+            for leg in legs:
+                c.execute(
+                    """INSERT INTO arb_legs (
+                        position_id, market_id, leg_title, token_id, side,
+                        vwap, price_filled, shares, cost, levels_consumed_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        pid, leg["market_id"], leg.get("leg_title"),
+                        leg.get("token_id"), leg["side"],
+                        float(leg["vwap"]), float(leg["price_filled"]),
+                        float(leg["shares"]), float(leg["cost"]),
+                        json.dumps(leg.get("levels_consumed") or []),
+                    ),
+                )
+            return pid
+
+    def open_arb_positions(self, strategy: str | None = None) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            if strategy:
+                return list(c.execute(
+                    "SELECT * FROM arb_positions WHERE status='OPEN' AND strategy=?",
+                    (strategy,)).fetchall())
+            return list(c.execute(
+                "SELECT * FROM arb_positions WHERE status='OPEN'").fetchall())
+
+    def arb_legs_for(self, position_id: int) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT * FROM arb_legs WHERE position_id=? ORDER BY id",
+                (position_id,)).fetchall())
+
+    def close_arb_position(self, position_id: int, status: str, pnl: float,
+                            leg_outcomes: list[dict[str, Any]]) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE arb_positions SET status=?, pnl=? WHERE id=?",
+                (status, pnl, position_id),
+            )
+            for lo in leg_outcomes:
+                c.execute(
+                    "UPDATE arb_legs SET outcome=?, payout=? WHERE id=?",
+                    (lo["outcome"], float(lo["payout"]), int(lo["leg_id"])),
+                )
+
+    def already_arb_today(self, event_id: str, strategy: str, side: str,
+                           day_iso: str) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT 1 FROM arb_positions
+                   WHERE event_id=? AND strategy=? AND side=?
+                     AND substr(ts,1,10)=?""",
+                (event_id, strategy, side, day_iso)).fetchone()
+            return row is not None
+
+    def arb_gap_stats(self, strategy: str) -> dict[str, Any]:
+        """Aggregate distribution of detected gaps for the diagnostics print.
+
+        profit_buckets is split by walk_mode so full_book (true fillable
+        profit) and gamma_only (snapshot estimate) read separately.
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT walk_mode, side, completeness_verified,
+                          locked_profit_per_share, cleared_threshold
+                     FROM arb_gaps WHERE strategy=?""",
+                (strategy,)).fetchall()
+        stats = {
+            "total": len(rows),
+            "verified": sum(1 for r in rows if r["completeness_verified"]),
+            "by_mode": {},
+            "by_side": {},
+            "profit_buckets": {"full_book": {}, "gamma_only": {}},
+            "cleared": sum(1 for r in rows if r["cleared_threshold"]),
+        }
+        for r in rows:
+            stats["by_mode"][r["walk_mode"]] = stats["by_mode"].get(r["walk_mode"], 0) + 1
+            stats["by_side"][r["side"]] = stats["by_side"].get(r["side"], 0) + 1
+            lp = r["locked_profit_per_share"]
+            if lp is None:
+                continue
+            buckets = stats["profit_buckets"].setdefault(r["walk_mode"], {})
+            for hi in (-0.10, -0.05, -0.02, -0.01, 0.0, 0.005, 0.01, 0.02, 0.05, 0.10, 1.0):
+                if lp < hi:
+                    buckets[hi] = buckets.get(hi, 0) + 1
+                    break
+        return stats

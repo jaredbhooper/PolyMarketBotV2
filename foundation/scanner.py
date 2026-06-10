@@ -15,7 +15,7 @@ from typing import Iterable
 
 import requests
 
-from strategies.base import Market
+from strategies.base import ArbEvent, ArbLeg, Market
 
 
 GAMMA_DEFAULT = "https://gamma-api.polymarket.com"
@@ -305,6 +305,128 @@ class Scanner:
                 if market:
                     out.append(market)
         return events, out
+
+
+    # ============================================================== events
+    # Event-level (multi-outcome) scanning for bucket-sum arb. Returns one
+    # ArbEvent per Polymarket event, MECE-flag (negRisk) and per-leg books
+    # included only when needed.
+    #
+    # Two-stage to keep CLOB cost bounded:
+    #   1. Cheap pass: pull every Gamma event, compute sum(bestAsk) and
+    #      sum(1-bestBid). Mark each event as 'gamma_only' if neither sum
+    #      is within `walk_band` of crossing the arb threshold.
+    #   2. Expensive pass: for events where the cheap pass says we might
+    #      cross, walk every leg's YES + NO order book on the CLOB.
+    #
+    # The caller decides which stage to run via `fetch_books`.
+
+    def fetch_all_events(self) -> list[dict]:
+        """Paginate every open+active event on Gamma. Returns the raw
+        event dicts; caller filters / groups."""
+        out: list[dict] = []
+        seen: set = set()
+        offset = 0
+        page = 100   # gamma caps at 100 even when you ask for more
+        while True:
+            batch = self._get(f"{self.gamma}/events", params={
+                "closed": "false",
+                "active": "true",
+                "limit": page,
+                "offset": offset,
+            })
+            if not isinstance(batch, list) or not batch:
+                break
+            new = [e for e in batch if e.get("id") not in seen]
+            if not new:
+                break
+            for e in new:
+                seen.add(e["id"])
+            out.extend(new)
+            if len(batch) < page:
+                break
+            offset += len(batch)
+            if offset > 50000:
+                break
+        return out
+
+    @staticmethod
+    def _verify_completeness(event: dict) -> tuple[bool, str]:
+        """A market set is MECE iff Polymarket flagged the event negRisk=True
+        and every leg is deployed (clobTokenIds present), active, open.
+        Polymarket's negRisk flag is the gold-standard MECE assertion -
+        without it we cannot confirm completeness from the API alone."""
+        if not event.get("negRisk"):
+            return False, "event.negRisk != True (not a MECE set)"
+        markets = event.get("markets") or []
+        if len(markets) < 2:
+            return False, f"only {len(markets)} legs"
+        deployed = 0
+        for m in markets:
+            if not m.get("clobTokenIds"):
+                return False, f"leg {m.get('groupItemTitle') or m.get('id')} not deployed"
+            if m.get("closed") or not m.get("active"):
+                return False, f"leg {m.get('groupItemTitle')} closed/inactive"
+            deployed += 1
+        return True, f"negRisk + {deployed} deployed legs"
+
+    def build_arb_event(self, event: dict, fetch_books: bool = False) -> ArbEvent:
+        """Group event into ArbEvent. If fetch_books, pulls per-leg YES+NO
+        CLOB books; otherwise only the Gamma snapshot bestAsk/Bid populates
+        each leg (no book walk possible)."""
+        ok, note = self._verify_completeness(event)
+        legs: list[ArbLeg] = []
+        for m in event.get("markets") or []:
+            tokens = _parse_outcomes(m.get("clobTokenIds"))
+            yes_tok = str(tokens[0]) if len(tokens) > 0 else None
+            no_tok = str(tokens[1]) if len(tokens) > 1 else None
+            try:
+                g_yes_ask = float(m["bestAsk"]) if m.get("bestAsk") is not None else None
+            except (TypeError, ValueError):
+                g_yes_ask = None
+            try:
+                g_yes_bid = float(m["bestBid"]) if m.get("bestBid") is not None else None
+            except (TypeError, ValueError):
+                g_yes_bid = None
+            leg = ArbLeg(
+                market_id=m.get("conditionId") or "",
+                leg_title=m.get("groupItemTitle") or m.get("question") or "",
+                yes_token_id=yes_tok,
+                no_token_id=no_tok,
+                gamma_yes_ask=g_yes_ask,
+                gamma_yes_bid=g_yes_bid,
+                end_date_iso=m.get("endDate") or m.get("endDateIso"),
+                extras={
+                    "slug": m.get("slug"),
+                    "question": m.get("question"),
+                    "liquidity": m.get("liquidity"),
+                    "volume_24h": m.get("volume24hr"),
+                },
+            )
+            if fetch_books and yes_tok:
+                yb = self.fetch_book(yes_tok) or {}
+                leg.yes_asks = self._normalize_levels(yb.get("asks"), ascending=True)
+                leg.yes_bids = self._normalize_levels(yb.get("bids"), ascending=False)
+            if fetch_books and no_tok:
+                nb = self.fetch_book(no_tok) or {}
+                leg.no_asks = self._normalize_levels(nb.get("asks"), ascending=True)
+                leg.no_bids = self._normalize_levels(nb.get("bids"), ascending=False)
+            legs.append(leg)
+        return ArbEvent(
+            event_id=str(event.get("id") or ""),
+            event_slug=event.get("slug") or "",
+            event_title=event.get("title") or "",
+            end_date_iso=event.get("endDate"),
+            neg_risk=bool(event.get("negRisk")),
+            legs=legs,
+            completeness_verified=ok,
+            completeness_note=note,
+            books_fetched=fetch_books,
+            extras={
+                "tags": [t.get("slug") for t in (event.get("tags") or []) if isinstance(t, dict)],
+                "ticker": event.get("ticker"),
+            },
+        )
 
 
 def render_scanner_table(markets: Iterable[Market], max_rows: int = 50) -> str:

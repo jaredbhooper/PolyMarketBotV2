@@ -3,7 +3,11 @@
 Paper-trading rig for Polymarket. A strategy-agnostic foundation (scanner →
 edge engine → paper executor → SQLite ledger → grader → reporter) wraps a
 pluggable strategy interface. Strategy #1 is a weather/temperature ensemble
-model (Open-Meteo GFS + ECMWF → P(threshold hit)).
+model (Open-Meteo GFS + ECMWF → P(threshold hit)). Strategy #2 is a
+bucket-sum arbitrage detector (sec "Strategy #2" below) — it scans every
+multi-outcome (negRisk) Polymarket event and logs every detected
+complete-set arb gap, paper-trading the ones that clear a configurable
+locked-profit threshold.
 
 Built per `polymarketbotv1-build-plan_1.md`. Zero spend in paper mode — every
 API used (Polymarket Gamma, Polymarket CLOB, Open-Meteo) is free and
@@ -23,9 +27,10 @@ PolyMarketBotV1/
 │   ├── grader.py          #   settles markets; computes Brier + P&L per strategy
 │   └── report.py          #   console summary; optional Telegram hook
 └── strategies/            # swappable plug-ins
-    ├── base.py            #   Strategy ABC + Estimate dataclass
+    ├── base.py            #   Strategy ABC + Estimate + ArbEvent / ArbLeg
     ├── dummy.py           #   bench strategy for testing the foundation
-    └── weather.py         #   Strategy #1: ensemble temperature model
+    ├── weather.py         #   Strategy #1: ensemble temperature model
+    └── bucket_arb.py      #   Strategy #2: bucket-sum arbitrage detector
 ```
 
 ## Setup
@@ -52,6 +57,10 @@ python main.py grade
 # Print latest report and per-strategy bankroll.
 python main.py report
 python main.py status
+
+# Strategy #2: bucket-sum arb only (no weather scan).
+python main.py arb            # full event-level cycle + diagnostics
+python main.py arb-stats      # print gap-distribution diagnostics without rescanning
 ```
 
 A `cycle` does, per strategy:
@@ -367,6 +376,174 @@ I had to make a handful of judgment calls. Override any of these in
   useful when you want to debug a fill against the historical snapshot.
 - `daily_report` has `(date, strategy)` as the PK — one row per strategy
   per day.
+
+## Strategy #2: Bucket-sum arbitrage detector
+
+A multi-outcome (Polymarket negRisk) event has exactly one outcome that
+resolves YES and pays $1 per share. Two free-money arbs follow directly:
+
+- **YES-side**: if `Σ(YES ask_i) < $1.00`, buying one share of YES on every
+  leg locks `$1 - Σ` per share. Whichever leg wins pays the $1; the rest
+  are losing $0 lottery tickets that cost ~nothing because their ask was
+  tiny.
+- **NO-side (mirror)**: if `Σ(NO ask_i) < $(N-1)`, buying one share of NO
+  on every leg locks `$(N-1) - Σ` per share. In a MECE set of N outcomes
+  exactly N-1 NOs resolve true and each pays $1.
+
+`strategies/bucket_arb.py` implements both. Built and trusted in two
+layers:
+
+1. **DETECTOR** (always logs, regardless of profit size).
+   For every Polymarket event:
+   - **Step 1 — Verify completeness.** A market set is MECE iff
+     `event.negRisk == True` AND every leg has a deployed CLOB token
+     (`clobTokenIds` populated) AND every leg is `active=True, closed=False`.
+     This is Polymarket's own assertion of mutual exclusion + collective
+     exhaustion — without that flag we *cannot* confirm the set is
+     complete and we **skip with a `completeness_note`** rather than risk
+     a fake arb signal.
+   - **Step 2 — Cheap pre-filter.** Sum the Gamma snapshot `bestAsk`
+     across legs (and implied NO ask = `1 - bestBid`). If neither sum is
+     within `walk_band` (default 10c) of the arb threshold, log a
+     `walk_mode='gamma_only'` row and move on. This is the cost-control
+     gate — there are ~30k legs to walk at full depth and most are
+     nowhere near arb.
+   - **Step 3 — Book-walk every leg** for `target_shares` (default 100
+     per leg). Cap the executable share count at `min(per-leg fill)` so
+     the implied position is actually fillable across the whole set.
+   - **Step 4 — Compute true locked profit** = `payout - Σ(VWAP_i) -
+     N × slippage - safety_buffer`. Log every row to `arb_gaps` with
+     the per-leg VWAPs, depth, and consumed levels.
+
+2. **PAPER EXECUTOR** (only fires above `min_arb_profit`).
+   For each detection whose `locked_profit_usd ≥ min_arb_profit`, open
+   one `arb_positions` row covering all legs and N `arb_legs` rows
+   (one per outcome). All legs settle together when the event resolves.
+
+### Why the negRisk gate is non-negotiable
+
+A non-negRisk multi-market event (e.g. "X happens by Aug 31", "Y happens
+by Aug 31") can have multiple YES winners (or none). If we summed those
+asks and saw $0.80, we'd buy YES on every leg, then watch one leg pay
+$0 while three pay $1 — or all four pay $0 — without any guaranteed
+$1 payout. The detector **must** refuse to trade those, and the
+`completeness_verified` column on `arb_gaps` records every refusal.
+
+### Resolution-source caveat
+
+Even with negRisk-verified completeness, the *grader* needs every leg's
+on-chain settlement to compute P&L. If Polymarket VOIDs a leg or pauses
+resolution, the position stays OPEN. The grader checks each leg via
+`/markets?condition_ids=` and only closes once all N legs have a final
+`outcomePrices` set. Two-winners (MECE violation) → VOID + refund cost.
+
+### Fees, slippage, and safety buffer
+
+The locked-profit math is **strictly pessimistic**:
+
+- Walk the actual order book level-by-level (never midpoint).
+- Add `slippage_cents` (default 1c) per leg on top of VWAP — that's
+  `N × 1c` for an N-leg event. Weather events (N=11) lose 11c per share
+  to slippage alone, so even cheap-looking gaps usually evaporate.
+- Subtract `safety_buffer` (default 0.5c) per share as a final cushion
+  for Polymarket's per-trade fee + spread risk between scan and fill.
+- `min_arb_profit` ($1.00 default) is the *USD* threshold to fire —
+  a 1c-per-share gap on a 100-share fill is exactly $1, which is the
+  break-even point for the paper executor.
+
+Any of these can be overridden in `config.yaml` under `strategies.bucket_arb`.
+
+### Schema additions
+
+Three new SQLite tables (zero impact on `paper_trades` / weather):
+
+- `arb_gaps` — one row per detected gap. **Every** gap is logged,
+  including the gamma-only no-arb majority, with `walk_mode` distinguishing
+  cheap snapshots from full-book walks. Columns include the per-leg
+  VWAPs, executable share count, locked profit per share + USD, side
+  (YES/NO), completeness verification flag, and a `cleared_threshold`
+  bit.
+- `arb_positions` — one row per paper-traded complete-set arb. Carries
+  event metadata, side, common share count, total cost, expected payout,
+  locked profit at entry, and status (`OPEN`/`CLOSED`/`VOID`).
+- `arb_legs` — N rows per `arb_position`, each with the per-leg fill
+  details (VWAP, slipped price, shares, cost, consumed levels, eventual
+  outcome + realized payout).
+
+### Config knobs
+
+```yaml
+strategies:
+  bucket_arb:
+    safety_buffer: 0.005           # USD per share, on top of slippage
+    min_arb_profit: 1.00           # USD - paper-fire threshold
+    target_shares: 100.0           # per-leg share target (capped by depth)
+    walk_band: 0.10                # pre-filter: walk if gamma sum within this of arb
+    slippage_cents: 0.01           # per-leg adverse slippage on VWAP
+    detect_yes: true               # scan YES-side gaps
+    detect_no: true                # scan NO-side gaps
+    execute_yes: true              # paper-fire above threshold
+    execute_no: true
+    min_hours_to_resolve: 1.0      # skip events resolving in less than this
+    min_executable_shares: 5.0     # require this many fillable shares to log full-walk
+    max_walks_per_cycle: 2000      # hard cap on expensive CLOB book-walks
+```
+
+### Live scan result (2026-06-10 14:46Z)
+
+One full pass against Polymarket's live event universe:
+
+| metric                                              | value |
+|-----------------------------------------------------|------:|
+| events scanned (Gamma open+active universe)         | 8,767 |
+| MECE-verified complete sets (negRisk + all deployed)|  1,173 |
+| events failed completeness (skipped — flagged)      |  7,594 |
+| events full-book walked (passed pre-filter)         |    352 |
+| events recorded gamma-only summary (no arb possible)|    648 |
+| events skipped (resolving in < 1h)                  |    173 |
+| events skipped due to walk cap                      |      0 |
+| total gap rows logged (`arb_gaps`)                  |  1,664 |
+| full-book detections (real per-share profit)        |    543 |
+| gaps that cleared `min_arb_profit = $1.00`          |  **0** |
+| paper arb positions opened                          |      0 |
+
+Per-share locked-profit distribution (full-book walks only):
+
+| bucket          | count |
+|-----------------|------:|
+| `< -10c`        |  274 |
+| `[-10c, -5c)`   |  189 |
+| `[-5c, -2c)`    |   80 |
+| `[-2c,  0)`     |    0 |
+| `[0, +5c)`      |    0 |
+| `≥ +5c`         |    0 |
+
+**Read of the result.** The bucket-sum arb shows up *visually* — 7 of
+2,128 fully-deployed negRisk events had `Σ(YES bestAsk) < $1.00` on the
+Gamma snapshot (cheap-pass survey). But once you walk the actual book
+for a tradeable share count, every leg's thin top-of-book gets eaten
+fast and the realized VWAP climbs above the snapshot price. The
+remaining `N × 1c` slippage + 0.5c buffer then pushes the per-share
+profit firmly negative on every single complete set that exists right
+now. Worst gap: -14c per share on a Brazilian soccer halftime market
+(thin books, 30+ legs amplifying slippage). The detector worked
+correctly — the universe simply isn't offering free money today.
+
+This is exactly the result we wanted to measure: **how often a
+fillable, profitable complete set actually appears at our scan
+cadence.** The honest answer this hour is *zero out of 1,173*. Re-run
+the scan periodically and watch the distribution shift — if it ever
+sneaks above 0, the paper executor fires automatically.
+
+### Manual run
+
+```bash
+python main.py arb            # one full scan: detect, log every gap, paper-execute clears
+python main.py arb-stats      # diagnostics without rescanning (cheap)
+```
+
+The `arb` command runs *only* the bucket-sum detector; `python main.py
+cycle` runs both weather and arb in the same pass.
 
 ## Honest expectations
 

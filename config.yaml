@@ -36,11 +36,31 @@ scanner:
 active_strategies:
   # - module: dummy   # used to bench-test the foundation before weather exists
   - module: weather
+  - module: bucket_arb
 
 strategies:
   dummy:
     fixed_p: 0.65
     fixed_confidence: 1.0
+
+  # Strategy #2: bucket-sum arbitrage detector. Operates at event level on
+  # every Polymarket negRisk (MECE) event - scans the complete outcome set
+  # for cases where SUM(YES asks) < $1 (YES arb) or SUM(NO asks) < $(N-1)
+  # (NO arb). Logs every gap to arb_gaps; paper-trades only when locked
+  # profit >= min_arb_profit USD.
+  bucket_arb:
+    safety_buffer: 0.005          # subtract from locked profit (slippage cushion)
+    min_arb_profit: 1.00          # USD threshold to fire a paper trade
+    target_shares: 100.0          # per-leg share target (capped by depth)
+    walk_band: 0.10               # only walk books if gamma-snapshot sum is within this of arb threshold
+    slippage_cents: 0.01          # per-leg adverse slippage on VWAP
+    detect_yes: true              # scan YES-side gaps
+    detect_no: true               # scan NO-side gaps
+    execute_yes: true             # paper-fire above threshold YES
+    execute_no: true
+    min_hours_to_resolve: 1.0     # skip events resolving in less than this
+    min_executable_shares: 5.0    # require at least this many fillable shares to log a full-walk gap
+    max_walks_per_cycle: 2000     # hard cap on expensive full-book walks per cycle
 
   weather:
     edge_threshold: 0.08            # override default
