@@ -15,7 +15,9 @@ from typing import Iterable
 
 import yaml
 
+from foundation.bankroll import Bankroll
 from foundation.executor import Executor, CycleDecision
+from foundation.health import HealthSession, banner as health_banner
 from foundation.ledger import Ledger
 from foundation.scanner import Scanner, render_scanner_table
 from strategies.base import ArbEvent, Market, Strategy
@@ -257,6 +259,7 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
     ledger = Ledger(cfg["database"]["path"])
     scanner = Scanner(cfg)
     executor = Executor(cfg, ledger)
+    bankroll = Bankroll(cfg, ledger)
     strategies = load_strategies(cfg)
     if not strategies:
         print("No active strategies in config.yaml. Nothing to do.")
@@ -266,15 +269,26 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
         print(f"Active strategies: {[s.name for s in strategies]}")
 
     # Route arb (event-level) and cross-venue strategies separately - they
-    # don't go through the per-market scan_all / Estimate path.
+    # don't go through the per-market scan_all / Estimate path. Each is
+    # wrapped in a HealthSession so an exception in one strategy never
+    # blocks the others.
     arb_results = []
     cv_results = []
     per_market_strategies: list[Strategy] = []
     for s in strategies:
         if _is_arb_strategy(s):
-            arb_results.append(run_arb_cycle(s, scanner, ledger, verbose=verbose))
+            with HealthSession(ledger, s.name) as h:
+                r = run_arb_cycle(s, scanner, ledger, verbose=verbose)
+                arb_results.append(r)
+                h.markets_scanned = (r.get("counters") or {}).get("scanned", 0)
+                h.fills = r.get("fired", 0)
         elif _is_cv_strategy(s):
-            cv_results.append(run_cv_cycle(s, scanner, ledger, cfg, verbose=verbose))
+            with HealthSession(ledger, s.name) as h:
+                r = run_cv_cycle(s, scanner, ledger, cfg, verbose=verbose)
+                cv_results.append(r)
+                h.markets_scanned = ((r.get("counters") or {}).get("polymarket_markets", 0)
+                                       + (r.get("counters") or {}).get("kalshi_markets", 0))
+                h.fills = (r.get("counters") or {}).get("fired", 0)
         else:
             per_market_strategies.append(s)
     strategies = per_market_strategies
@@ -298,34 +312,38 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
 
     # --- Phase 1: evaluate every relevant market for every strategy.
     # Log snapshots + signals as we go. Do NOT commit fills yet.
+    # Each strategy runs inside a HealthSession so that an exception in
+    # one strategy does NOT abort the cycle for the others.
     pending: list[CycleDecision] = []
     for strat in strategies:
-        relevant = strat.relevant_markets(universe)
-        if verbose:
-            print(f"\n[{strat.name}] {len(relevant)} relevant markets")
-        for m in relevant:
-            mid = ledger.upsert_market({
-                "condition_id": m.market_id,
-                "slug": m.slug,
-                "question": m.question,
-                "category": m.category,
-                "threshold": m.extras.get("parsed_threshold"),
-                "unit": m.extras.get("parsed_unit"),
-                "resolve_date": m.resolve_date,
-                "resolution_source": m.extras.get("station_url"),
-                "rules_text": m.rules_text,
-            })
-            ledger.record_snapshot(mid, m.yes_ask, m.yes_bid, m.no_ask, m.no_bid,
-                                   m.book_depth_usd)
-            est = strat.estimate(m)
-            if est is None:
-                continue
-            ledger.record_signal(mid, strat.name, est.p_final, est.confidence,
-                                 est.metadata)
-            d = executor.evaluate(m, est, strat, strategies_cfg)
-            decisions.append(d)
-            if d.decision == "PENDING_FILL":
-                pending.append(d)
+        with HealthSession(ledger, strat.name) as h:
+            relevant = strat.relevant_markets(universe)
+            h.markets_scanned = len(relevant)
+            if verbose:
+                print(f"\n[{strat.name}] {len(relevant)} relevant markets")
+            for m in relevant:
+                mid = ledger.upsert_market({
+                    "condition_id": m.market_id,
+                    "slug": m.slug,
+                    "question": m.question,
+                    "category": m.category,
+                    "threshold": m.extras.get("parsed_threshold"),
+                    "unit": m.extras.get("parsed_unit"),
+                    "resolve_date": m.resolve_date,
+                    "resolution_source": m.extras.get("station_url"),
+                    "rules_text": m.rules_text,
+                })
+                ledger.record_snapshot(mid, m.yes_ask, m.yes_bid, m.no_ask, m.no_bid,
+                                       m.book_depth_usd)
+                est = strat.estimate(m)
+                if est is None:
+                    continue
+                ledger.record_signal(mid, strat.name, est.p_final, est.confidence,
+                                     est.metadata)
+                d = executor.evaluate(m, est, strat, strategies_cfg)
+                decisions.append(d)
+                if d.decision == "PENDING_FILL":
+                    pending.append(d)
 
     # --- Phase 2: rank PENDING_FILL by post-fill edge desc, commit until cap.
     pending.sort(key=lambda d: (d.edge or 0.0), reverse=True)
@@ -342,8 +360,9 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
             d.reason = (f"cap reached after {len(committed)} commits "
                         f"(cap {cap}, was open {open_at_start})")
             continue
-        executor.commit(d)
-        committed.append(d)
+        executor.commit(d, bankroll=bankroll)
+        if d.decision == "FILLED":
+            committed.append(d)
 
     if verbose:
         # Print per-decision lines now that final outcomes are known.
@@ -402,6 +421,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("scout", help="run the copy-trading scout: build/update roster")
     sub.add_parser("follow", help="run the copy-trading follower cycle once")
     sub.add_parser("copy-backtest", help="copy-trading backtest table (ESTIMATEs)")
+    sub.add_parser("master-report", help="full V2 master report (banner, scoreboard, all strategy sections)")
+    sub.add_parser("bankroll", help="print bankroll snapshot + recent txn audit")
     args = p.parse_args(argv)
 
     if args.cmd == "cycle":
@@ -470,6 +491,30 @@ def main(argv: list[str] | None = None) -> int:
         return _run_follow()
     if args.cmd == "copy-backtest":
         return _run_copy_backtest()
+    if args.cmd == "master-report":
+        from foundation.report import print_master_report
+        print_master_report()
+        return 0
+    if args.cmd == "bankroll":
+        cfg = load_config()
+        ledger = Ledger(cfg["database"]["path"])
+        br = Bankroll(cfg, ledger)
+        snap = br.snapshot()
+        print("strategy           pct   start     cash   exposure  available")
+        for r in snap:
+            print(f"  {r['strategy']:18s} {float(r['pct'])*100:>4.1f}% "
+                  f"${float(r['starting_alloc_usd']):>7.2f} ${float(r['current_cash_usd']):>7.2f} "
+                  f"${float(r['open_exposure_usd']):>8.2f} ${float(r['available_usd']):>8.2f}")
+        txns = ledger.list_bankroll_txns()[-20:]
+        if txns:
+            print("\nRecent txns (last 20):")
+            for t in txns:
+                print(f"  {t['ts']} {t['strategy']:14s} {t['kind']:18s} "
+                      f"${float(t['amount_usd']):>+8.2f} "
+                      f"cash=${float(t['cash_after_usd']):>8.2f} "
+                      f"exposure=${float(t['exposure_after_usd']):>8.2f} "
+                      f"{(t['note'] or '')[:40]}")
+        return 0
     return 2
 
 

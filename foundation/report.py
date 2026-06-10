@@ -83,6 +83,137 @@ def print_report(cfg_path: str = "config.yaml") -> None:
             print()
 
 
+def print_master_report(cfg_path: str = "config.yaml") -> None:
+    """V2 master report (Prompt B). Top section: health banner + per-strategy
+    scoreboard. Below: each strategy's detailed section."""
+    from foundation.bankroll import Bankroll
+    from foundation.health import banner as health_banner
+    cfg = _cfg(cfg_path)
+    ledger = Ledger(cfg["database"]["path"])
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    print(f"=== PolyMarketBotV1 master report ({datetime.now(timezone.utc).isoformat(timespec='seconds')}) ===")
+    # ---- Health banner --------------------------------------------------
+    stale_cfg = (cfg.get("health") or {}).get("stale_after_hours") or {}
+    print(health_banner(ledger, stale_after_hours=stale_cfg))
+
+    # ---- Per-strategy scoreboard ---------------------------------------
+    snapshot = Bankroll(cfg, ledger).snapshot()
+    total_starting = sum(float(r["starting_alloc_usd"]) for r in snapshot) or 0.0
+    total_cash = sum(float(r["current_cash_usd"]) for r in snapshot) or 0.0
+    total_exposure = sum(float(r["open_exposure_usd"]) for r in snapshot) or 0.0
+    total_value = total_cash + 0.0   # marked at cost; positions still in exposure
+    print()
+    print(f"Total bankroll start=${total_starting:.2f} cash=${total_cash:.2f} "
+          f"open_exposure=${total_exposure:.2f}")
+
+    verdict_cfg = cfg.get("verdict") or {}
+    min_settled = int(verdict_cfg.get("min_settled_for_pass", 20))
+    fail_pct = float(verdict_cfg.get("fail_loss_pct", 0.10))
+
+    print()
+    print(f"{'strategy':18s} {'pct':>5s} {'alloc':>8s} {'cash':>8s} "
+          f"{'open':>8s} {'settled':>7s} {'realized':>10s} {'verdict':>10s}")
+    print("-" * 86)
+    settled_map = _settled_per_strategy(ledger)
+    for r in snapshot:
+        s = r["strategy"]
+        sd = settled_map.get(s, {"n": 0, "wins": 0, "pnl": 0.0, "deployed": 0.0})
+        pct = float(r["pct"])
+        cash = float(r["current_cash_usd"])
+        exp = float(r["open_exposure_usd"])
+        verdict = _verdict(sd, min_settled, fail_pct,
+                            starting_alloc=float(r["starting_alloc_usd"]))
+        print(f"  {s:16s} {pct*100:>4.1f}% ${float(r['starting_alloc_usd']):>7.2f} "
+              f"${cash:>7.2f} ${exp:>7.2f} {sd['n']:>7d} ${sd['pnl']:>+9.2f} "
+              f"{verdict:>10s}")
+
+    # ---- Strategy detail sections --------------------------------------
+    print()
+    print_report(cfg_path)
+
+    # ---- Today equity snapshot (if not already there) ------------------
+    for r in snapshot:
+        s = r["strategy"]
+        sd = settled_map.get(s, {"pnl": 0.0})
+        ledger.record_equity_point(
+            today, s, float(r["current_cash_usd"]),
+            float(r["open_exposure_usd"]),
+            float(sd["pnl"]),
+        )
+
+
+def _settled_per_strategy(ledger: Ledger) -> dict[str, dict]:
+    """Aggregate realized P&L across paper_trades + arb_positions + arb_multi
+    + cv_positions + copied_trades for the scoreboard."""
+    import sqlite3
+    out: dict[str, dict] = {}
+
+    def _bump(s: str, n: int = 0, wins: int = 0, pnl: float = 0.0, deployed: float = 0.0):
+        d = out.setdefault(s, {"n": 0, "wins": 0, "pnl": 0.0, "deployed": 0.0})
+        d["n"] += n; d["wins"] += wins
+        d["pnl"] += pnl; d["deployed"] += deployed
+
+    with sqlite3.connect(ledger.db_path) as c:
+        c.row_factory = sqlite3.Row
+        for row in c.execute(
+            """SELECT strategy, status, COUNT(*) n, COALESCE(SUM(pnl),0) p,
+                      COALESCE(SUM(stake),0) d FROM paper_trades
+               WHERE status IN ('WIN','LOSS','VOID') GROUP BY strategy, status"""
+        ).fetchall():
+            _bump(row["strategy"], n=int(row["n"]),
+                   wins=int(row["n"]) if row["status"] == "WIN" else 0,
+                   pnl=float(row["p"]), deployed=float(row["d"]))
+        for row in c.execute(
+            """SELECT strategy, status, COUNT(*) n, COALESCE(SUM(pnl),0) p,
+                      COALESCE(SUM(total_cost),0) d FROM arb_positions
+               WHERE status IN ('CLOSED','VOID') GROUP BY strategy, status"""
+        ).fetchall():
+            _bump(row["strategy"], n=int(row["n"]),
+                   wins=int(row["n"]) if row["status"] == "CLOSED" and float(row["p"]) > 0 else 0,
+                   pnl=float(row["p"]), deployed=float(row["d"]))
+        for row in c.execute(
+            """SELECT 'bucket_arb' AS strategy, status, COUNT(*) n,
+                      COALESCE(SUM(realized_pnl),0) p,
+                      COALESCE(SUM(total_cost),0) d FROM arb_multi
+               WHERE status IN ('CLOSED','VOID') GROUP BY status"""
+        ).fetchall():
+            _bump("bucket_arb", n=int(row["n"]),
+                   wins=int(row["n"]) if row["status"] == "CLOSED" and float(row["p"]) > 0 else 0,
+                   pnl=float(row["p"]), deployed=float(row["d"]))
+        for row in c.execute(
+            """SELECT strategy, status, COUNT(*) n, COALESCE(SUM(pnl),0) p,
+                      COALESCE(SUM(total_cost),0) d FROM cv_positions
+               WHERE status IN ('CLOSED','VOID','DIVERGED') GROUP BY strategy, status"""
+        ).fetchall():
+            _bump(row["strategy"], n=int(row["n"]),
+                   wins=int(row["n"]) if row["status"] == "CLOSED" and float(row["p"]) > 0 else 0,
+                   pnl=float(row["p"]), deployed=float(row["d"]))
+        for row in c.execute(
+            """SELECT 'copy_trading' AS strategy, COUNT(*) n,
+                      COALESCE(SUM(our_pnl),0) p,
+                      COALESCE(SUM(stake),0) d FROM copied_trades
+               WHERE status='settled'"""
+        ).fetchall():
+            wins = c.execute(
+                "SELECT COUNT(*) n FROM copied_trades WHERE status='settled' AND our_pnl > 0"
+            ).fetchone()
+            _bump("copy_trading", n=int(row["n"]), wins=int(wins["n"]),
+                   pnl=float(row["p"]), deployed=float(row["d"]))
+    return out
+
+
+def _verdict(sd: dict, min_settled: int, fail_pct: float,
+              starting_alloc: float) -> str:
+    if sd["n"] < min_settled:
+        return "TOO EARLY"
+    if sd["pnl"] > 0:
+        return "AHEAD"
+    if abs(sd["pnl"]) > fail_pct * starting_alloc:
+        return "BEHIND"
+    return "FLAT"
+
+
 def print_status(cfg_path: str = "config.yaml") -> None:
     cfg = _cfg(cfg_path)
     ledger = Ledger(cfg["database"]["path"])

@@ -356,14 +356,28 @@ class Executor:
             pre_fill_edge=pre_edge,
         )
 
-    def commit(self, decision: CycleDecision) -> CycleDecision:
+    def commit(self, decision: CycleDecision,
+                 bankroll=None) -> CycleDecision:
         """Write a PENDING_FILL decision's trade to the ledger. Idempotent
         in spirit: caller should only invoke for decisions whose status is
-        PENDING_FILL."""
+        PENDING_FILL.
+
+        If `bankroll` is given, debit the strategy's bankroll BEFORE
+        recording the trade. If the strategy is out of capital the
+        decision is flipped to SKIP_NO_CAPITAL."""
         if decision.decision != "PENDING_FILL" or decision.fill is None \
                 or decision.market_row_id is None:
             return decision
         fill = decision.fill
+        if bankroll is not None:
+            ok = bankroll.try_debit(decision.strategy, fill.stake,
+                                      related_table="paper_trades",
+                                      note=f"open {fill.side} @ {fill.price_filled:.4f}")
+            if not ok:
+                decision.decision = "SKIP_NO_CAPITAL"
+                decision.reason = (f"strategy {decision.strategy} has no "
+                                    f"capital for ${fill.stake:.2f}")
+                return decision
         trade_id = self.ledger.record_trade(
             market_id=decision.market_row_id,
             strategy=decision.strategy,

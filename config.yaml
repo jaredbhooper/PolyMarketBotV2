@@ -2,6 +2,39 @@
 # Active strategies + their per-strategy settings.
 # Adding a strategy = drop a file in strategies/ and add a row to `active_strategies`.
 
+# Virtual bankroll (Prompt B). Single $1,000 default split per-strategy.
+# Each strategy's commit path checks try_debit() before opening; settlement
+# calls credit(). Every txn goes to bankroll_transactions for audit.
+bankroll:
+  starting_bankroll: 1000.00
+  allocations:
+    weather:          0.25
+    bucket_arb:       0.30      # houses both single-leg arb + multi-mode
+    cross_venue_arb:  0.15
+    copy_trading:     0.20
+    # 10% reserved for future strategies (sharpline, lp-sim, logic-scan)
+    sharpline:        0.05
+    lp_sim:           0.03
+    logic_scan:       0.02
+
+# Health-monitor stale thresholds. The master report's HEALTH banner
+# warns when a strategy hasn't had a successful run within this many
+# hours.
+health:
+  stale_after_hours:
+    weather:          24
+    bucket_arb:       6
+    cross_venue_arb:  6
+    copy_trading:     1
+    sharpline:        1
+    lp_sim:           1
+    logic_scan:       1
+
+# Verdict thresholds for the master report's per-strategy verdict column.
+verdict:
+  min_settled_for_pass: 20
+  fail_loss_pct: 0.10
+
 paper:
   starting_bankroll: 500.00        # mirrors planned live bankroll
   max_position_usd: 15.00          # lowered from $50 to spread across many small positions

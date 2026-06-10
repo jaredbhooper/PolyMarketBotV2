@@ -241,6 +241,54 @@ CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_gaps_event ON arb_gaps(event_id, ts);
 CREATE INDEX IF NOT EXISTS idx_arb_positions_status ON arb_positions(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_legs_position ON arb_legs(position_id);
+-- Virtual bankroll + master report + health monitor (Prompt B).
+-- bankroll_allocations holds the latest snapshot per strategy; the full
+-- audit trail of every debit / credit lives in bankroll_transactions so
+-- any bankroll number on the master report can be reconstructed from
+-- the txn log.
+CREATE TABLE IF NOT EXISTS bankroll_allocations (
+  strategy TEXT PRIMARY KEY,
+  pct REAL NOT NULL,
+  starting_alloc_usd REAL NOT NULL,
+  current_cash_usd REAL NOT NULL,
+  open_exposure_usd REAL NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bankroll_transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  kind TEXT NOT NULL,                  -- 'debit' (open) | 'credit' (close) | 'init' | 'skipped_no_capital'
+  amount_usd REAL NOT NULL,
+  related_table TEXT,                  -- paper_trades | arb_positions | arb_multi | cv_positions | copied_trades
+  related_id INTEGER,
+  cash_after_usd REAL NOT NULL,
+  exposure_after_usd REAL NOT NULL,
+  note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS equity_history (
+  date TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  cash_usd REAL NOT NULL,
+  open_exposure_usd REAL NOT NULL,
+  realized_pnl_today REAL NOT NULL,
+  PRIMARY KEY(date, strategy)
+);
+
+CREATE TABLE IF NOT EXISTS health_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  ok INTEGER NOT NULL,
+  duration_s REAL,
+  markets_scanned INTEGER,
+  fills INTEGER,
+  error_text TEXT,
+  extras_json TEXT
+);
+
 -- Multi-outcome arb extension (Prompt A): arb_multi table.
 -- Distinct from arb_positions: arb_multi uses a fixed $10 notional stake
 -- per full set, tracks net_gap_pct AFTER fees, and uses 'unfillable_leg'
@@ -357,6 +405,8 @@ CREATE INDEX IF NOT EXISTS idx_wallet_trades_wallet ON wallet_trades(wallet, ts)
 CREATE INDEX IF NOT EXISTS idx_copied_trades_leader ON copied_trades(leader_wallet, status);
 CREATE INDEX IF NOT EXISTS idx_copied_trades_status ON copied_trades(status);
 CREATE INDEX IF NOT EXISTS idx_arb_multi_status ON arb_multi(status, event_id);
+CREATE INDEX IF NOT EXISTS idx_bankroll_txn_strategy ON bankroll_transactions(strategy, ts);
+CREATE INDEX IF NOT EXISTS idx_health_strategy_ts ON health_log(strategy, ts);
 """
 
 
@@ -1075,6 +1125,113 @@ class Ledger:
             "settled": len(settled),
             "per_leader": per_leader,
         }
+
+    # --- bankroll (Prompt B) -----------------------------------------------
+    def get_bankroll_row(self, strategy: str) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                "SELECT * FROM bankroll_allocations WHERE strategy=?",
+                (strategy,)).fetchone()
+
+    def upsert_bankroll_row(self, strategy: str, pct: float, starting: float,
+                              cash: float, exposure: float) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO bankroll_allocations (
+                    strategy, pct, starting_alloc_usd,
+                    current_cash_usd, open_exposure_usd, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(strategy) DO UPDATE SET
+                    pct=excluded.pct,
+                    starting_alloc_usd=excluded.starting_alloc_usd,
+                    current_cash_usd=excluded.current_cash_usd,
+                    open_exposure_usd=excluded.open_exposure_usd,
+                    updated_at=excluded.updated_at""",
+                (strategy, float(pct), float(starting), float(cash),
+                 float(exposure), utcnow_iso()))
+
+    def list_bankroll_rows(self) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT * FROM bankroll_allocations ORDER BY strategy"
+            ).fetchall())
+
+    def record_bankroll_txn(self, strategy: str, kind: str, amount: float,
+                              related_table: str | None,
+                              related_id: int | None,
+                              cash_after: float, exposure_after: float,
+                              note: str | None = None) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO bankroll_transactions (
+                    ts, strategy, kind, amount_usd, related_table,
+                    related_id, cash_after_usd, exposure_after_usd, note)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (utcnow_iso(), strategy, kind, float(amount),
+                 related_table, related_id, float(cash_after),
+                 float(exposure_after), note))
+            return int(cur.lastrowid)
+
+    def list_bankroll_txns(self, strategy: str | None = None
+                             ) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            if strategy:
+                return list(c.execute(
+                    "SELECT * FROM bankroll_transactions WHERE strategy=? ORDER BY id",
+                    (strategy,)).fetchall())
+            return list(c.execute(
+                "SELECT * FROM bankroll_transactions ORDER BY id"
+            ).fetchall())
+
+    def record_equity_point(self, date_iso: str, strategy: str,
+                              cash: float, exposure: float,
+                              realized_pnl_today: float) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO equity_history (
+                    date, strategy, cash_usd, open_exposure_usd, realized_pnl_today)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(date, strategy) DO UPDATE SET
+                    cash_usd=excluded.cash_usd,
+                    open_exposure_usd=excluded.open_exposure_usd,
+                    realized_pnl_today=excluded.realized_pnl_today""",
+                (date_iso, strategy, float(cash), float(exposure),
+                 float(realized_pnl_today)))
+
+    def equity_history(self, strategy: str | None = None) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            if strategy:
+                return list(c.execute(
+                    "SELECT * FROM equity_history WHERE strategy=? ORDER BY date",
+                    (strategy,)).fetchall())
+            return list(c.execute(
+                "SELECT * FROM equity_history ORDER BY date, strategy"
+            ).fetchall())
+
+    # --- health -----------------------------------------------------------
+    def record_health(self, strategy: str, ok: bool, duration_s: float,
+                        markets_scanned: int, fills: int,
+                        error_text: str | None, extras: dict) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO health_log (
+                    ts, strategy, ok, duration_s, markets_scanned, fills,
+                    error_text, extras_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (utcnow_iso(), strategy, 1 if ok else 0,
+                 float(duration_s), int(markets_scanned), int(fills),
+                 error_text, json.dumps(extras or {})))
+            return int(cur.lastrowid)
+
+    def latest_health_per_strategy(self) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                """SELECT strategy, ts, ok, duration_s, markets_scanned,
+                          fills, error_text
+                   FROM health_log h1
+                   WHERE id = (SELECT MAX(id) FROM health_log h2
+                                WHERE h2.strategy = h1.strategy)"""
+            ).fetchall())
 
     def cv_pair_traded_today(self, pair_id: int, strategy: str,
                               direction: str, day_iso: str) -> bool:

@@ -868,6 +868,106 @@ seconds** - between cycles the leader's price has often moved. We
 measure that bleed honestly so future infrastructure decisions
 (faster cron, websockets, etc.) can be cost-justified or killed.
 
+## V2 Operations runbook
+
+PolyMarketBotV1 ships **paper-only**. There are no wallet credentials,
+no signing libraries, and no order placement code anywhere in the
+repo. Every API call is read-only against a public endpoint.
+
+### CLI inventory
+
+```bash
+# Per-strategy single-shot runs.
+python main.py scan               # weather scanner only (no DB writes)
+python main.py cycle              # weather + bucket_arb + cross_venue_arb in one pass
+python main.py arb                # bucket-sum arb (Strategy #2) only
+python main.py cv                 # cross-venue arb (Strategy #3) only
+python main.py scout              # copy-trading scout: build/update roster
+python main.py follow             # copy-trading follower cycle
+python main.py copy-backtest      # copy-trading 90d backtest (ESTIMATEs)
+
+# Grade + report.
+python main.py grade              # settles every strategy's resolved positions
+python main.py report             # per-strategy detailed sections (V1 default)
+python main.py master-report      # **V2 master report**: banner + scoreboard + sections
+python main.py status             # quick per-strategy bankroll + open stake
+python main.py bankroll           # bankroll snapshot + last 20 audit txns
+python main.py arb-stats          # arb gap distribution
+python main.py cv-stats           # cross-venue pair + gap distribution
+```
+
+### Where the data lives
+
+- `polymarketbot.db` — single SQLite file. Schemas in
+  `foundation/ledger.py`. Three families:
+  - V1 weather: `markets`, `snapshots`, `signals`, `paper_trades`,
+    `settlements`, `daily_report`.
+  - Arb strategies: `arb_gaps`, `arb_positions`, `arb_legs`,
+    `arb_multi`, `cv_pairs`, `cv_gaps`, `cv_positions`, `cv_legs`.
+  - Copy-trading: `wallets`, `wallet_trades`, `wallet_cursors`,
+    `roster`, `scout_snapshots`, `copied_trades`.
+  - V2 ops layer: `bankroll_allocations`, `bankroll_transactions`,
+    `equity_history`, `health_log`.
+
+### How to read the master report
+
+`python main.py master-report` produces a fixed-width, mobile-readable
+report with three top-of-screen blocks:
+
+1. **HEALTH banner** — one line. `HEALTH: OK` when every strategy's
+   most recent run succeeded within its `stale_after_hours` threshold;
+   otherwise a `|`-separated list of warnings ("weather: no
+   successful run in 27h", "copy_trading: last run errored ...").
+2. **Scoreboard** — one row per strategy with allocation %,
+   starting alloc USD, current cash, open exposure, settled count,
+   realized P&L, and a verdict column (`AHEAD | BEHIND | FLAT |
+   TOO EARLY` per the configured `min_settled_for_pass` /
+   `fail_loss_pct` thresholds).
+3. **Per-strategy detailed sections** — same content as the V1 report.
+
+The master report also **persists today's equity point** for every
+strategy to `equity_history` so multi-day curves are queryable.
+
+### Bankroll mechanics
+
+- One total bankroll (`$1,000` default), split by percent allocation
+  across strategies in `config.yaml`'s `bankroll.allocations`. The
+  percentages are auto-renormalized to 100%, so weights can be
+  changed without re-balancing them by hand.
+- Every paper position goes through `Bankroll.try_debit(strategy,
+  stake)` before being recorded. If the strategy is out of cash the
+  position is skipped with a `kind='skipped_no_capital'` row in
+  `bankroll_transactions` — visible in `python main.py bankroll`.
+- At settlement the grader calls `Bankroll.credit(strategy, proceeds,
+  opening_stake)`. Net P&L = `proceeds - stake`.
+- The audit trail is complete: every `bankroll_allocations` value
+  for any strategy can be reconstructed from the
+  `bankroll_transactions` log.
+
+### Health & resilience
+
+Every strategy's run is wrapped in a `HealthSession` context manager
+(`foundation/health.py`). An unhandled exception inside one strategy
+is recorded to `health_log` and swallowed; **other strategies still
+run their cycle.** The banner surfaces failures on the next
+`master-report`.
+
+Configurable per-strategy stale thresholds live under `health:` in
+`config.yaml`.
+
+### Reminder: PAPER ONLY
+
+There are no credentials anywhere in this repo. `python main.py *`
+never sends an order, never signs a transaction, never reads a
+private key. The only network calls are GETs to:
+
+- `gamma-api.polymarket.com` — markets + events
+- `clob.polymarket.com` — order books
+- `data-api.polymarket.com` — wallet trade history (copy-trading)
+- `api.elections.kalshi.com` — markets + orderbook (cross-venue)
+- `open-meteo.com` — weather forecast (Strategy #1)
+- `api.weather.com` — Wunderground history (Strategy #1 grader)
+
 ## Honest expectations
 
 Read sec 11 of the build plan. Week 1 is a systems test, not a verdict.
