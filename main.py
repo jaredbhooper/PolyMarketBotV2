@@ -60,6 +60,37 @@ def _is_arb_strategy(s: Strategy) -> bool:
     return hasattr(s, "scan_arb") and callable(getattr(s, "scan_arb", None))
 
 
+def _is_cv_strategy(s: Strategy) -> bool:
+    """A cross-venue strategy implements `scan_cv` and operates on two
+    venues (Polymarket + Kalshi) instead of a single per-market universe."""
+    return hasattr(s, "scan_cv") and callable(getattr(s, "scan_cv", None))
+
+
+def run_cv_cycle(strategy, scanner: Scanner, ledger: Ledger, cfg: dict,
+                  verbose: bool = True) -> dict:
+    """Cross-venue cycle: pair Polymarket markets with Kalshi markets via
+    the rules-equivalence engine, log every cv_gap, paper-fire only
+    CERTIFIED-IDENTICAL pairs above min_arb_profit."""
+    from foundation.venues.kalshi import KalshiVenue
+    from foundation.venues.polymarket import PolymarketVenue
+    weather_cfg = (cfg.get("strategies") or {}).get("weather") or {}
+    cities = weather_cfg.get("cities") or []
+    poly_venue = PolymarketVenue(scanner=scanner, weather_cities_cfg=cities)
+    kal_venue = KalshiVenue()
+    result = strategy.scan_cv(poly_venue, kal_venue, ledger, verbose=verbose)
+    counters = result["counters"]
+    if verbose:
+        print(
+            f"  scan: poly={counters['polymarket_markets']} "
+            f"kalshi={counters['kalshi_markets']} "
+            f"shared_keys={counters['shared_keys']} "
+            f"certified={counters['certified']} fuzzy={counters['fuzzy']} "
+            f"nonmatch={counters['nonmatch']}"
+        )
+        print(f"  cv_gaps logged: {counters['logged_gaps']} | fired: {counters['fired']}")
+    return result
+
+
 def run_arb_cycle(strategy, scanner: Scanner, ledger: Ledger,
                    verbose: bool = True) -> dict:
     """Event-level cycle for bucket-sum arb (and any future arb strategies).
@@ -197,22 +228,25 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
     if verbose:
         print(f"Active strategies: {[s.name for s in strategies]}")
 
-    # Route arb (event-level) strategies separately - they don't go through
-    # the per-market scan_all / Estimate path.
+    # Route arb (event-level) and cross-venue strategies separately - they
+    # don't go through the per-market scan_all / Estimate path.
     arb_results = []
+    cv_results = []
     per_market_strategies: list[Strategy] = []
     for s in strategies:
         if _is_arb_strategy(s):
             arb_results.append(run_arb_cycle(s, scanner, ledger, verbose=verbose))
+        elif _is_cv_strategy(s):
+            cv_results.append(run_cv_cycle(s, scanner, ledger, cfg, verbose=verbose))
         else:
             per_market_strategies.append(s)
     strategies = per_market_strategies
 
     if not strategies:
-        # Pure arb cycle, no per-market work.
+        # Pure arb / cross-venue cycle, no per-market work.
         return {
             "decisions": [], "scanned": 0, "filled": 0,
-            "arb": arb_results,
+            "arb": arb_results, "cv": cv_results,
         }
 
     if verbose:
@@ -300,6 +334,7 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
         "filled": len(fills),
         "qualified": len(pending),
         "arb": arb_results,
+        "cv": cv_results,
     }
 
 
@@ -325,6 +360,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="print open positions and bankrolls")
     sub.add_parser("arb", help="run the bucket-sum arb detector only (no weather)")
     sub.add_parser("arb-stats", help="print gap-distribution diagnostics for arb")
+    sub.add_parser("cv", help="run the cross-venue arb (Polymarket x Kalshi) only")
+    sub.add_parser("cv-stats", help="print cross-venue pair + gap diagnostics")
     args = p.parse_args(argv)
 
     if args.cmd == "cycle":
@@ -368,7 +405,111 @@ def main(argv: list[str] | None = None) -> int:
         ledger = Ledger(cfg["database"]["path"])
         print_arb_stats(cfg, ledger)
         return 0
+    if args.cmd == "cv":
+        cfg = load_config()
+        ledger = Ledger(cfg["database"]["path"])
+        scanner = Scanner(cfg)
+        strategies = load_strategies(cfg)
+        ran = False
+        for s in strategies:
+            if _is_cv_strategy(s):
+                run_cv_cycle(s, scanner, ledger, cfg, verbose=True)
+                ran = True
+        if not ran:
+            print("No cross-venue strategies active in config.yaml.")
+        print_cv_stats(cfg, ledger)
+        return 0
+    if args.cmd == "cv-stats":
+        cfg = load_config()
+        ledger = Ledger(cfg["database"]["path"])
+        print_cv_stats(cfg, ledger)
+        return 0
     return 2
+
+
+def print_cv_stats(cfg: dict, ledger: Ledger) -> None:
+    """Pretty-print cross-venue pair + gap diagnostics."""
+    import sqlite3
+    strategies = load_strategies(cfg)
+    cv_names = [s.name for s in strategies if _is_cv_strategy(s)]
+    if not cv_names:
+        return
+    pair_stats = ledger.cv_pair_stats()
+    print()
+    print("======================================================")
+    print(" Cross-venue (Polymarket x Kalshi) diagnostics")
+    print("======================================================")
+    print(f"pair classifications: {pair_stats}")
+    for sname in cv_names:
+        gap_stats = ledger.cv_gap_stats(sname)
+        with sqlite3.connect(ledger.db_path) as c:
+            c.row_factory = sqlite3.Row
+            top = list(c.execute(
+                """SELECT g.classification, g.direction,
+                          g.locked_profit_per_share, g.locked_profit_usd,
+                          g.executable_shares, g.cleared_threshold,
+                          g.divergence_risk_note, p.city, p.date,
+                          p.poly_leg, p.kalshi_leg
+                     FROM cv_gaps g JOIN cv_pairs p ON p.id = g.pair_id
+                    WHERE g.strategy=? ORDER BY g.locked_profit_per_share DESC
+                    LIMIT 10""", (sname,)).fetchall())
+            certs = list(c.execute(
+                """SELECT id, city, date, poly_leg, kalshi_leg, poly_source,
+                          kalshi_source, divergence_risk_note
+                     FROM cv_pairs WHERE classification='CERTIFIED-IDENTICAL'
+                    LIMIT 10""").fetchall())
+            fuzzies = list(c.execute(
+                """SELECT id, city, date, poly_leg, kalshi_leg, reason,
+                          divergence_risk_note
+                     FROM cv_pairs WHERE classification='FUZZY' LIMIT 10""").fetchall())
+            positions = list(c.execute(
+                """SELECT id, direction, shares, total_cost, expected_payout,
+                          locked_profit, divergence_risk_note, status, pnl
+                     FROM cv_positions WHERE strategy=?
+                    ORDER BY ts DESC""", (sname,)).fetchall())
+        print(f"\n[{sname}] cv_gaps logged: {gap_stats['total']}")
+        print(f"  by classification: {gap_stats['by_classification']}")
+        print(f"  by direction: {gap_stats['by_direction']}")
+        print(f"  cleared threshold: {gap_stats['cleared']}")
+        print(f"  with divergence risk note: {gap_stats['with_divergence']}")
+        labels = [
+            ("< -10c", -0.10), ("[-10c,-5c)", -0.05), ("[-5c,-2c)", -0.02),
+            ("[-2c,-1c)", -0.01), ("[-1c,0)", 0.0), ("[0,0.5c)", 0.005),
+            ("[0.5c,1c)", 0.01), ("[1c,2c)", 0.02), ("[2c,5c)", 0.05),
+            ("[5c,10c)", 0.10), (">=10c", 1.0),
+        ]
+        print("  locked-profit-per-share distribution:")
+        for label, hi in labels:
+            print(f"    {label:14s} {gap_stats['profit_buckets'].get(hi,0)}")
+        if certs:
+            print("  sample CERTIFIED pairs:")
+            for r in certs:
+                div = "  [DIV-RISK]" if r["divergence_risk_note"] else ""
+                print(f"    #{r['id']} {r['city']:14s} {r['date']} "
+                      f"poly='{r['poly_leg'][:18]}' kal='{r['kalshi_leg'][:18]}'{div}")
+        if fuzzies:
+            print("  sample FUZZY pairs (NEVER auto-traded):")
+            for r in fuzzies:
+                div = "  [DIV-RISK]" if r["divergence_risk_note"] else ""
+                print(f"    #{r['id']} {r['city']:14s} {r['date']} "
+                      f"reason={r['reason'][:50]}{div}")
+        print("  top 10 gaps by locked profit per share:")
+        for r in top:
+            mark = "*" if r["cleared_threshold"] else " "
+            pps = r["locked_profit_per_share"]
+            usd = r["locked_profit_usd"]
+            div = "  [DIV-RISK]" if r["divergence_risk_note"] else ""
+            print(f"    {mark} {r['classification']:18s} {r['direction']:18s} "
+                  f"pps={pps:+.4f} usd=${usd:+.2f} sh={r['executable_shares']:.1f} "
+                  f"{r['city'] or '-'}/{r['date'] or '-'}{div}")
+        if positions:
+            print(f"  paper cv positions: {len(positions)}")
+            for p in positions[:10]:
+                pnl_s = f"{p['pnl']:+.2f}" if p["pnl"] is not None else "open"
+                div = "  [DIV-RISK]" if p["divergence_risk_note"] else ""
+                print(f"    #{p['id']} {p['direction']:18s} shares={p['shares']:.1f} "
+                      f"cost=${p['total_cost']:.2f} locked=${p['locked_profit']:.2f} "
+                      f"status={p['status']} pnl={pnl_s}{div}")
 
 
 def print_arb_stats(cfg: dict, ledger: Ledger) -> None:

@@ -211,12 +211,124 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
     # Settle arb_positions whose end_date has passed.
     arb_settled, arb_skipped = grade_arb_positions(cfg, ledger, today, verbose=verbose)
 
+    # Settle cross-venue positions.
+    cv_settled, cv_skipped = grade_cv_positions(cfg, ledger, today, verbose=verbose)
+
     # Recompute per-strategy daily report rows.
     update_reports(ledger, cfg, today.isoformat(), verbose=verbose)
 
     return {"settled": settled, "skipped": skipped,
             "arb_settled": arb_settled, "arb_skipped": arb_skipped,
+            "cv_settled": cv_settled, "cv_skipped": cv_skipped,
             "open_remaining": len(ledger.open_positions())}
+
+
+def grade_cv_positions(cfg: dict, ledger: Ledger, today, verbose: bool = True
+                         ) -> tuple[int, int]:
+    """Settle every OPEN cv_position whose legs have all resolved.
+
+    For each leg, query the leg's own venue for resolution:
+      - Polymarket leg: Gamma /markets?condition_ids=... -> outcomePrices.
+      - Kalshi leg: /markets/{ticker} -> result + status='settled'.
+
+    A cross-venue arb pays $1 if our chosen side won on its venue, $0 if
+    it lost. Net P&L = sum(payouts) - sum(costs). If the two venues
+    SETTLE the same event differently (source divergence) - e.g.
+    Polymarket says YES, Kalshi says NO for the same date - we may be
+    on the unlucky side of both legs. The position is marked DIVERGED
+    if both legs lose (the divergence risk materialized) and pnl =
+    -total_cost.
+    """
+    import requests
+    settled = 0
+    skipped = 0
+    open_cvs = ledger.open_cv_positions()
+    if verbose:
+        print(f"Grader: {len(open_cvs)} open cross-venue positions to evaluate.")
+    gamma = (cfg.get("scanner") or {}).get(
+        "gamma_url", "https://gamma-api.polymarket.com").rstrip("/")
+    kalshi_base = "https://api.elections.kalshi.com/trade-api/v2"
+    sess = requests.Session()
+
+    for pos in open_cvs:
+        legs = ledger.cv_legs_for(int(pos["id"]))
+        if not legs:
+            continue
+        leg_outcomes = []
+        all_resolved = True
+        for leg in legs:
+            payout = None
+            outcome = None
+            if leg["venue"] == "polymarket":
+                try:
+                    r = sess.get(f"{gamma}/markets",
+                                  params={"condition_ids": leg["venue_market_id"]},
+                                  timeout=20)
+                    data = r.json()
+                    m = data[0] if data else None
+                except Exception:
+                    m = None
+                if not m or not m.get("closed"):
+                    all_resolved = False
+                else:
+                    try:
+                        op = m.get("outcomePrices")
+                        if isinstance(op, str):
+                            op = json.loads(op)
+                        yes_price = float(op[0]) if op else None
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        yes_price = None
+                    if yes_price is None:
+                        all_resolved = False
+                    else:
+                        won = yes_price > 0.99
+                        outcome = "YES" if won else "NO"
+                        # Did the side we bought win?
+                        side_won = (leg["side"] == outcome)
+                        payout = float(leg["shares"]) if side_won else 0.0
+            elif leg["venue"] == "kalshi":
+                try:
+                    r = sess.get(f"{kalshi_base}/markets/{leg['venue_market_id']}",
+                                  timeout=20)
+                    data = r.json()
+                    m = data.get("market") if isinstance(data, dict) else None
+                except Exception:
+                    m = None
+                if not m or m.get("status") != "settled":
+                    all_resolved = False
+                else:
+                    # Kalshi result: 'yes' / 'no'
+                    res_str = (m.get("result") or "").lower()
+                    if res_str not in ("yes", "no"):
+                        all_resolved = False
+                    else:
+                        outcome = res_str.upper()
+                        side_won = (leg["side"] == outcome)
+                        payout = float(leg["shares"]) if side_won else 0.0
+            if payout is not None and outcome is not None:
+                leg_outcomes.append({
+                    "leg_id": int(leg["id"]),
+                    "outcome": outcome,
+                    "payout": payout,
+                })
+        if not all_resolved:
+            skipped += 1
+            continue
+        total_payout = sum(L["payout"] for L in leg_outcomes)
+        total_cost = float(pos["total_cost"])
+        pnl = total_payout - total_cost
+        # If both legs lost, the source-divergence risk materialized.
+        all_lost = all(L["payout"] == 0.0 for L in leg_outcomes)
+        status = "DIVERGED" if all_lost else "CLOSED"
+        ledger.close_cv_position(int(pos["id"]), status, pnl, leg_outcomes)
+        settled += 1
+        if verbose:
+            div_note = " (DIVERGED)" if status == "DIVERGED" else ""
+            print(f"  Settled cv pos {pos['id']} ({pos['strategy']}) "
+                  f"{pos['direction']} shares={pos['shares']:.1f} "
+                  f"cost=${total_cost:.2f} payout=${total_payout:.2f} "
+                  f"PnL=${pnl:+.2f}{div_note}")
+    return settled, skipped
 
 
 def grade_arb_positions(cfg: dict, ledger: Ledger, today, verbose: bool = True
@@ -367,14 +479,21 @@ def update_reports(ledger: Ledger, cfg: dict, date_iso: str,
                 """SELECT status, pnl FROM arb_positions
                    WHERE strategy=? AND status IN ('CLOSED','VOID')""",
                 (sname,)).fetchall())
+            cvs = list(c.execute(
+                """SELECT status, pnl FROM cv_positions
+                   WHERE strategy=? AND status IN ('CLOSED','VOID','DIVERGED')""",
+                (sname,)).fetchall())
         arb_n = len(arbs)
         arb_wins = sum(1 for a in arbs if a["status"] == "CLOSED" and (a["pnl"] or 0) > 0)
         arb_pnl = sum(float(a["pnl"] or 0) for a in arbs)
-        n_trades += arb_n
-        n_wins += arb_wins
-        pnl += arb_pnl
+        cv_n = len(cvs)
+        cv_wins = sum(1 for a in cvs if a["status"] == "CLOSED" and (a["pnl"] or 0) > 0)
+        cv_pnl = sum(float(a["pnl"] or 0) for a in cvs)
+        n_trades += arb_n + cv_n
+        n_wins += arb_wins + cv_wins
+        pnl += arb_pnl + cv_pnl
         brier = _brier(closed)
-        bankroll = ledger.bankroll(sname, starting) + arb_pnl
+        bankroll = ledger.bankroll(sname, starting) + arb_pnl + cv_pnl
         ledger.upsert_daily_report(date_iso, sname, n_trades, n_wins,
                                    pnl, brier, bankroll)
         # Surface disputed settlements that touch this strategy's open book.

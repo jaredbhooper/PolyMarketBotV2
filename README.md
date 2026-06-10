@@ -26,11 +26,18 @@ PolyMarketBotV1/
 │   ├── ledger.py          #   SQLite (markets, snapshots, signals, paper_trades, settlements, daily_report)
 │   ├── grader.py          #   settles markets; computes Brier + P&L per strategy
 │   └── report.py          #   console summary; optional Telegram hook
+├── foundation/
+│   ├── equivalence.py    #   cross-venue rules-equivalence engine (strategy #3)
+│   └── venues/           #   venue adapters
+│       ├── base.py       #     VenueMarket dataclass + Venue ABC
+│       ├── polymarket.py #     wraps the existing Scanner
+│       └── kalshi.py     #     Kalshi public market-data API
 └── strategies/            # swappable plug-ins
     ├── base.py            #   Strategy ABC + Estimate + ArbEvent / ArbLeg
     ├── dummy.py           #   bench strategy for testing the foundation
     ├── weather.py         #   Strategy #1: ensemble temperature model
-    └── bucket_arb.py      #   Strategy #2: bucket-sum arbitrage detector
+    ├── bucket_arb.py      #   Strategy #2: bucket-sum arbitrage detector
+    └── cross_venue_arb.py #   Strategy #3: cross-venue arb (Polymarket x Kalshi)
 ```
 
 ## Setup
@@ -61,6 +68,10 @@ python main.py status
 # Strategy #2: bucket-sum arb only (no weather scan).
 python main.py arb            # full event-level cycle + diagnostics
 python main.py arb-stats      # print gap-distribution diagnostics without rescanning
+
+# Strategy #3: cross-venue (Polymarket x Kalshi) arb only.
+python main.py cv             # match + classify pairs, log gaps, paper-fire CERTIFIED
+python main.py cv-stats       # print pair + gap diagnostics without rescanning
 ```
 
 A `cycle` does, per strategy:
@@ -544,6 +555,163 @@ python main.py arb-stats      # diagnostics without rescanning (cheap)
 
 The `arb` command runs *only* the bucket-sum detector; `python main.py
 cycle` runs both weather and arb in the same pass.
+
+## Strategy #3: Cross-venue arbitrage (Polymarket x Kalshi)
+
+The same real-world event can be listed on both Polymarket and Kalshi at
+different prices. If you can buy YES-equivalent cheaply on one venue
+AND NO-equivalent cheaply on the other such that total cost (after both
+platforms' fees, slippage, and a safety buffer) is under $1.00, **one
+side must pay $1** at resolution. That's the cross-venue arb.
+
+The strategy's main risk isn't price - it's **the legs not being
+equivalent**. Polymarket and Kalshi use different resolution sources
+for the same nominal event (Polymarket weather = Wunderground / METAR;
+Kalshi weather = NWS Climatological Report), different cutoff times,
+sometimes different bucket widths. The rules-equivalence engine is
+therefore the centerpiece of this build, not an afterthought.
+
+### Rules-equivalence engine (`foundation/equivalence.py`)
+
+For each candidate cross-venue market pair, the engine compares four
+criteria:
+
+| Criterion | What's checked | Failure modes seen in the wild |
+|-----------|---------------|--------------------------------|
+| Event identity (city + date + max/min) | Same real-world observation | Two different cities; different dates; high vs low temp |
+| Cutoff time | `close_time` within 24h | Polymarket closes at the WU page's roll-over; Kalshi at NWS midnight local |
+| Settlement condition | Identical bucket interval, canonicalized to Fahrenheit | Polymarket "14°C" bucket = [56.3F, 58.1F) vs Kalshi "57F" = [56.5F, 57.5F) — different widths |
+| Resolution source | Same normalized source code (e.g. both `wunderground`) | Wunderground (Polymarket) vs NWS Climatological (Kalshi) — different instruments |
+
+Each pair is classified:
+
+- **CERTIFIED-IDENTICAL** — all four criteria match. Only these are
+  ever auto-traded. The detector still book-walks every detected gap
+  on every cycle.
+- **FUZZY** — event identity matches but at least one of (cutoff,
+  condition, source) differs. Persisted to `cv_pairs` for human review
+  with a per-criterion verdict in `criteria_json`. **Never
+  auto-traded.** This is the dominant outcome for weather pairs given
+  the Wunderground/NWS source split.
+- **NON-MATCH** — different real-world events; not logged.
+
+### Divergence flagging (every certified gap carries the risk)
+
+Even on a CERTIFIED-IDENTICAL pair, if the two venues' canonical source
+codes match (e.g. both report `nws_climatological`) but the underlying
+URLs differ (e.g. NWS Chicago Midway vs NWS Chicago O'Hare), the
+engine attaches a `divergence_risk_note` to the pair. The note travels
+all the way through to every `cv_gap` and every paper `cv_position`.
+
+For weather pairs whose sources are *fundamentally different*
+(Wunderground/METAR vs NWS Climatological), the pair classifies as
+FUZZY and a more emphatic note is attached:
+
+> Resolution sources differ: poly=Wunderground KORD vs kalshi=NWS
+> Climatological Report Chicago. Both legs can lose simultaneously if
+> the two sources disagree on the same day (Wunderground/METAR airport
+> observation vs NWS Climatological Report can diverge by 1F on
+> warm-front days).
+
+Each `cv_position` table has a `status='DIVERGED'` outcome path: when
+both legs lose at resolution, the grader marks it `DIVERGED` (the
+risk materialized) and we book the full `-total_cost` as P&L. That's
+the failure mode we're explicitly underwriting.
+
+### Fees, slippage, and the locked-profit math
+
+Per-share cost on each leg = `VWAP + slippage + fee_per_share`.
+
+- **Polymarket fees**: 0 (paper). The current Polymarket protocol
+  charges no maker/taker fees on the CLOB; the fee model is left as a
+  config knob for when that changes.
+- **Kalshi fees**: standard quadratic schedule, `fee_per_contract =
+  ceil(fee_multiplier × 7c × price × (1 - price))`, rounded up to the
+  next cent. Pulled from each series' metadata
+  (`/series/{ticker}.fee_multiplier`).
+- **Slippage**: 1c per leg by default, same as the rest of the
+  foundation.
+- **Safety buffer**: 0.5c per share on top.
+
+Total locked profit per share = `1.00 - poly_cost - kalshi_cost - 0.5c`.
+The paper executor fires only when **total** locked profit ≥
+`min_arb_profit` ($0.50 default) AND the pair is `CERTIFIED-IDENTICAL`.
+
+### Schema additions
+
+Four new SQLite tables:
+
+- `cv_pairs` — persistent classification of each cross-venue market
+  pair: criteria verdicts, reason, divergence_risk_note, classification.
+- `cv_gaps` — every detected gap, every cycle, with both legs'
+  book-walked VWAP, fees, executable shares, locked profit, divergence
+  risk note, and a `cleared_threshold` bit.
+- `cv_positions` — paper-traded paired position (one row per fire),
+  carrying the divergence_risk_note. Status: `OPEN | CLOSED | VOID |
+  DIVERGED`.
+- `cv_legs` — exactly two rows per `cv_position`, one for each venue's
+  leg, with full fill details and eventual outcome + payout.
+
+### Config knobs
+
+```yaml
+strategies:
+  cross_venue_arb:
+    safety_buffer: 0.005           # USD per share, on top of slippage + fees
+    min_arb_profit: 0.50           # USD - paper-fire threshold
+    target_shares: 50.0            # per-leg share target (capped by depth)
+    poly_slippage_cents: 0.01      # per-share adverse slippage on Polymarket VWAP
+    kalshi_slippage_cents: 0.01
+    min_executable_shares: 5.0
+    min_hours_to_resolve: 1.0
+    execute_fuzzy: false           # NEVER auto-trade FUZZY pairs
+    kalshi_categories:
+      - Climate and Weather
+```
+
+### Live scan result (2026-06-10)
+
+Cross-venue weather pass against Polymarket + Kalshi:
+
+| metric                                                    | value |
+|-----------------------------------------------------------|------:|
+| Polymarket weather markets fetched                        | 1,266 |
+| Kalshi daily-weather markets fetched                      |   482 |
+| shared (city, date, kind) buckets (overlap universe)      |    14 |
+| candidate pairs classified (after bucket-overlap prune)   | 18,359 |
+| **CERTIFIED-IDENTICAL pairs**                             |   **0** |
+| FUZZY pairs (logged for human review, never auto-traded)  | 18,359 |
+| FUZZY pairs carrying source-divergence risk notes         | 18,359 |
+| paper cv_positions fired                                  |     0 |
+
+**Read of the result.** Every cross-venue weather pair classifies as
+FUZZY because **Polymarket weather settles on Wunderground / METAR
+station observations and Kalshi weather settles on the NWS
+Climatological Report**. The two sources nominally measure the same
+thing but use different instruments, different recording cadences, and
+can disagree by 1°F on warm-front days. The equivalence engine
+correctly refuses to certify any of these pairs as identical, and the
+paper executor correctly fires zero trades.
+
+That is the strategy's whole point as a safety rail: **a cross-venue
+arb you can't certify is not free money — it's a coin flip with extra
+steps.** The 18,359 FUZZY rows are persisted in `cv_pairs` with the
+exact per-criterion diff (`criteria_json`) for a human reviewer to
+override case-by-case. Expanding `kalshi_categories` to non-weather
+markets (politics, sports, financials) is the natural next sweep,
+since those sometimes share a published reference (e.g. CFPB rate
+decisions cite the same FOMC press release on both venues).
+
+### Manual run
+
+```bash
+python main.py cv             # one full scan: pair, classify, walk, log every gap, fire CERTIFIED
+python main.py cv-stats       # diagnostics: pair counts by classification + gap distribution
+```
+
+The `cv` command runs only the cross-venue detector; `python main.py
+cycle` runs all active strategies in one pass (weather + bucket_arb +
+cross_venue_arb).
 
 ## Honest expectations
 

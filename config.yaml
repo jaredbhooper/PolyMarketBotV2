@@ -37,6 +37,7 @@ active_strategies:
   # - module: dummy   # used to bench-test the foundation before weather exists
   - module: weather
   - module: bucket_arb
+  - module: cross_venue_arb
 
 strategies:
   dummy:
@@ -61,6 +62,24 @@ strategies:
     min_hours_to_resolve: 1.0     # skip events resolving in less than this
     min_executable_shares: 5.0    # require at least this many fillable shares to log a full-walk gap
     max_walks_per_cycle: 2000     # hard cap on expensive full-book walks per cycle
+
+  # Strategy #3: cross-venue arbitrage (Polymarket vs Kalshi). For each
+  # candidate matched pair the rules-equivalence engine classifies into
+  # CERTIFIED-IDENTICAL / FUZZY / NON-MATCH. Only CERTIFIED pairs are
+  # auto-traded; FUZZY pairs are persisted for human review. Every
+  # detected gap (even untradeable ones) is logged to cv_gaps so we can
+  # measure the real cross-venue opportunity rate.
+  cross_venue_arb:
+    safety_buffer: 0.005          # USD per share, on top of slippage + fees
+    min_arb_profit: 0.50          # USD - paper-fire threshold
+    target_shares: 50.0           # per-leg share target (capped by depth)
+    poly_slippage_cents: 0.01     # per-share adverse slippage on Polymarket VWAP
+    kalshi_slippage_cents: 0.01   # per-share adverse slippage on Kalshi VWAP
+    min_executable_shares: 5.0    # require this many fillable shares to log a gap
+    min_hours_to_resolve: 1.0     # skip pairs resolving in less than this
+    execute_fuzzy: false          # NEVER auto-trade FUZZY (source/cutoff/cond mismatch)
+    kalshi_categories:            # Kalshi categories to scan (daily weather only by default)
+      - Climate and Weather
 
   weather:
     edge_threshold: 0.08            # override default
