@@ -1,0 +1,5 @@
+requests>=2.31
+PyYAML>=6.0
+numpy>=1.24
+scipy>=1.10
+tzdata>=2024.1     # Windows: ZoneInfo needs this; harmless on Linux/macOS

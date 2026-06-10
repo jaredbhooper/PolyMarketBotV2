@@ -1,0 +1,450 @@
+# PolyMarketBotV1 config
+# Active strategies + their per-strategy settings.
+# Adding a strategy = drop a file in strategies/ and add a row to `active_strategies`.
+
+paper:
+  starting_bankroll: 500.00        # mirrors planned live bankroll
+  max_position_usd: 15.00          # lowered from $50 to spread across many small positions
+  max_open_positions: 15           # bumped from 6
+  default_edge_threshold: 0.08     # 8% baseline (NO-side and non-longshot YES-side)
+  default_kelly_fraction: 0.15     # 15% fractional Kelly  (unchanged)
+  slippage_cents: 0.01             # 1c adverse on VWAP
+  min_book_depth_usd: 50.00        # require cum ask depth within 5c >= $50
+  max_spread_cents: 0.06           # skip spreads > 6c
+  min_hours_to_resolve: 2.0        # skip if market closes in < 2h
+  # Asymmetric YES-side longshot protection. When YES sells under
+  # `longshot_yes_ask_cap` the relative impact of small model miscalibration
+  # is large (a 2c P error at 5c is a 40% relative error). Require a steeper
+  # edge on those bets; NO-side and YES-side at >= 0.15 ask use the default.
+  # Applied in both pre-fill and post-fill edge checks.
+  longshot_yes_ask_cap: 0.15
+  longshot_yes_edge_threshold: 0.15
+
+database:
+  path: polymarketbot.db
+
+scanner:
+  gamma_url: https://gamma-api.polymarket.com
+  clob_url: https://clob.polymarket.com
+  page_limit: 500
+  request_timeout: 30
+  # Tags the scanner pulls. Strategies filter further via relevant_markets().
+  tag_slugs:
+    - highest-temperature
+    - lowest-temperature
+
+active_strategies:
+  # - module: dummy   # used to bench-test the foundation before weather exists
+  - module: weather
+
+strategies:
+  dummy:
+    fixed_p: 0.65
+    fixed_confidence: 1.0
+
+  weather:
+    edge_threshold: 0.08            # override default
+    kelly_fraction: 0.15
+    blend_raw_weight: 0.5           # 0.5 * raw_fraction + 0.5 * gaussian_p
+    # Multi-family ensemble disagreement gate. Now generalized: any pair
+    # of model families differing by > this in P triggers confidence drop.
+    # Pre-bundle (GFS+IFS only) this was simply |P_gfs - P_ecmwf|.
+    disagreement_threshold: 0.25
+    low_confidence: 0.5
+    # Family must have >= this many members to count toward the disagreement
+    # gate. AIFS at 1 member always pools into the main estimate but does
+    # not itself trigger the gate (single-member P is binary/uninformative).
+    min_family_members_for_gate: 10
+    clamp_min: 0.02
+    clamp_max: 0.98
+    forecast_days: 3
+    dispute_threshold_degrees: 1.0  # WU vs OM diff this big -> DISPUTED
+    # Open-Meteo ensemble models pulled per cycle. Hard-coded in
+    # strategies/weather.py:DEFAULT_MODELS to keep the request stable; this
+    # comment block documents the bundle and is for humans only.
+    #   gfs_seamless      -> 31 GEFS members      (NCEP dynamical)
+    #   ecmwf_ifs025      -> 51 IFS members       (ECMWF dynamical)
+    #   ecmwf_aifs025     -> 51 AIFS members      (ECMWF AI ensemble)
+    #   icon_seamless     -> 40 ICON EPS members  (DWD)
+    # Total: 173 series (was 82 with GFS+IFS only).
+    # Stations audited 2026-06-10 against live Gamma event descriptions for
+    # both `highest-temperature` and `lowest-temperature` tags. See
+    # tools/audit_stations.py - re-run when Polymarket adds a new city.
+    # Every coord comes from foundation/station_db.py (no city-name guesses).
+    cities:
+      - slug_hints: [amsterdam, eham]
+        city: amsterdam
+        station_name: Amsterdam Schiphol (EHAM)
+        lat: 52.3105
+        lon: 4.7683
+        timezone: Europe/Amsterdam
+        resolution_source: https://www.wunderground.com/history/daily/nl/schiphol/EHAM
+        market_kinds: [max]
+      - slug_hints: [ankara, ltac]
+        city: ankara
+        station_name: Ankara Esenboga (LTAC)
+        lat: 40.1281
+        lon: 32.9951
+        timezone: Europe/Istanbul
+        resolution_source: https://www.wunderground.com/history/daily/tr/%C3%A7ubuk/LTAC
+        market_kinds: [max]
+      - slug_hints: [atlanta, katl]
+        city: atlanta
+        station_name: Atlanta Hartsfield-Jackson (KATL)
+        lat: 33.6407
+        lon: -84.4277
+        timezone: America/New_York
+        resolution_source: https://www.wunderground.com/history/daily/us/ga/atlanta/KATL
+        market_kinds: [max]
+      - slug_hints: [austin, kaus]
+        city: austin
+        station_name: Austin-Bergstrom (KAUS)
+        lat: 30.1945
+        lon: -97.6699
+        timezone: America/Chicago
+        resolution_source: https://www.wunderground.com/history/daily/us/tx/austin/KAUS
+        market_kinds: [max]
+      - slug_hints: [beijing, zbaa]
+        city: beijing
+        station_name: Beijing Capital (ZBAA)
+        lat: 40.0801
+        lon: 116.5846
+        timezone: Asia/Shanghai
+        resolution_source: https://www.wunderground.com/history/daily/cn/beijing/ZBAA
+        market_kinds: [max]
+      - slug_hints: [buenos-aires, saez]
+        city: buenos-aires
+        station_name: Buenos Aires Ezeiza (SAEZ)
+        lat: -34.8222
+        lon: -58.5358
+        timezone: America/Argentina/Buenos_Aires
+        resolution_source: https://www.wunderground.com/history/daily/ar/ezeiza/SAEZ
+        market_kinds: [max]
+      - slug_hints: [busan, rkpk]
+        city: busan
+        station_name: Busan Gimhae (RKPK)
+        lat: 35.1795
+        lon: 128.9382
+        timezone: Asia/Seoul
+        resolution_source: https://www.wunderground.com/history/daily/kr/busan/RKPK
+        market_kinds: [max]
+      - slug_hints: [cape-town, fact]
+        city: cape-town
+        station_name: Cape Town Intl (FACT)
+        lat: -33.9648
+        lon: 18.6017
+        timezone: Africa/Johannesburg
+        resolution_source: https://www.wunderground.com/history/daily/za/matroosfontein/FACT
+        market_kinds: [max]
+      - slug_hints: [chengdu, zuuu]
+        city: chengdu
+        station_name: Chengdu Shuangliu (ZUUU)
+        lat: 30.5784
+        lon: 103.9471
+        timezone: Asia/Shanghai
+        resolution_source: https://www.wunderground.com/history/daily/cn/chengdu/ZUUU
+        market_kinds: [max]
+      - slug_hints: [chicago, kord]
+        city: chicago
+        station_name: Chicago O'Hare (KORD)
+        lat: 41.9786
+        lon: -87.9048
+        timezone: America/Chicago
+        resolution_source: https://www.wunderground.com/history/daily/us/il/chicago/KORD
+        market_kinds: [max]
+      - slug_hints: [chongqing, zuck]
+        city: chongqing
+        station_name: Chongqing Jiangbei (ZUCK)
+        lat: 29.7194
+        lon: 106.6417
+        timezone: Asia/Shanghai
+        resolution_source: https://www.wunderground.com/history/daily/cn/chongqing/ZUCK
+        market_kinds: [max]
+      - slug_hints: [dallas, kdal]
+        city: dallas
+        station_name: Dallas Love Field (KDAL)
+        lat: 32.8471
+        lon: -96.8518
+        timezone: America/Chicago
+        resolution_source: https://www.wunderground.com/history/daily/us/tx/dallas/KDAL
+        market_kinds: [max]
+      - slug_hints: [denver, kbkf]
+        city: denver
+        station_name: Buckley SFB (Denver) (KBKF)
+        lat: 39.7017
+        lon: -104.7517
+        timezone: America/Denver
+        resolution_source: https://www.wunderground.com/history/daily/us/co/aurora/KBKF
+        market_kinds: [max]
+      - slug_hints: [guangzhou, zggg]
+        city: guangzhou
+        station_name: Guangzhou Baiyun (ZGGG)
+        lat: 23.3924
+        lon: 113.2988
+        timezone: Asia/Shanghai
+        resolution_source: https://www.wunderground.com/history/daily/cn/guangzhou/ZGGG
+        market_kinds: [max]
+      - slug_hints: [efhk, helsinki]
+        city: helsinki
+        station_name: Helsinki Vantaa (EFHK)
+        lat: 60.3172
+        lon: 24.9633
+        timezone: Europe/Helsinki
+        resolution_source: https://www.wunderground.com/history/daily/fi/vantaa/EFHK
+        market_kinds: [max]
+      - slug_hints: [houston, khou]
+        city: houston
+        station_name: Houston Hobby (KHOU)
+        lat: 29.6454
+        lon: -95.2789
+        timezone: America/Chicago
+        resolution_source: https://www.wunderground.com/history/daily/us/tx/houston/KHOU
+        market_kinds: [max]
+      - slug_hints: [jeddah, oejn]
+        city: jeddah
+        station_name: Jeddah King Abdulaziz (OEJN)
+        lat: 21.6796
+        lon: 39.1565
+        timezone: Asia/Riyadh
+        resolution_source: https://www.wunderground.com/history/daily/sa/jeddah/OEJN
+        market_kinds: [max]
+      - slug_hints: [jinan, zsjn]
+        city: jinan
+        station_name: Jinan Yaoqiang (ZSJN)
+        lat: 36.8572
+        lon: 117.2161
+        timezone: Asia/Shanghai
+        resolution_source: https://www.wunderground.com/history/daily/cn/jinan/ZSJN
+        market_kinds: [max]
+      - slug_hints: [karachi, opkc]
+        city: karachi
+        station_name: Karachi Jinnah (OPKC)
+        lat: 24.9065
+        lon: 67.1608
+        timezone: Asia/Karachi
+        resolution_source: https://www.wunderground.com/history/daily/pk/karachi/OPKC
+        market_kinds: [max]
+      - slug_hints: [kuala-lumpur, wmkk]
+        city: kuala-lumpur
+        station_name: Kuala Lumpur Intl (WMKK)
+        lat: 2.7456
+        lon: 101.7099
+        timezone: Asia/Kuala_Lumpur
+        resolution_source: https://www.wunderground.com/history/daily/my/sepang-district/WMKK
+        market_kinds: [max]
+      - slug_hints: [eglc, london]
+        city: london
+        station_name: London City Airport (EGLC)
+        lat: 51.5053
+        lon: 0.0553
+        timezone: Europe/London
+        resolution_source: https://www.wunderground.com/history/daily/gb/london/EGLC
+        market_kinds: [max, min]
+      - slug_hints: [klax, los-angeles]
+        city: los-angeles
+        station_name: Los Angeles Intl (KLAX)
+        lat: 33.9425
+        lon: -118.4081
+        timezone: America/Los_Angeles
+        resolution_source: https://www.wunderground.com/history/daily/us/ca/los-angeles/KLAX
+        market_kinds: [max]
+      - slug_hints: [lucknow, vilk]
+        city: lucknow
+        station_name: Lucknow Chaudhary Charan Singh (VILK)
+        lat: 26.7606
+        lon: 80.8893
+        timezone: Asia/Kolkata
+        resolution_source: https://www.wunderground.com/history/daily/in/lucknow/VILK
+        market_kinds: [max]
+      - slug_hints: [lemd, madrid]
+        city: madrid
+        station_name: Madrid Barajas (LEMD)
+        lat: 40.4719
+        lon: -3.5626
+        timezone: Europe/Madrid
+        resolution_source: https://www.wunderground.com/history/daily/es/madrid/LEMD
+        market_kinds: [max]
+      - slug_hints: [manila, rpll]
+        city: manila
+        station_name: Manila Ninoy Aquino (RPLL)
+        lat: 14.5086
+        lon: 121.0194
+        timezone: Asia/Manila
+        resolution_source: https://www.wunderground.com/history/daily/ph/manila/RPLL
+        market_kinds: [max]
+      - slug_hints: [mexico-city, mmmx]
+        city: mexico-city
+        station_name: Mexico City Benito Juarez (MMMX)
+        lat: 19.4361
+        lon: -99.0719
+        timezone: America/Mexico_City
+        resolution_source: https://www.wunderground.com/history/daily/mx/mexico-city/MMMX
+        market_kinds: [max]
+      - slug_hints: [kmia, miami]
+        city: miami
+        station_name: Miami Intl (KMIA)
+        lat: 25.7959
+        lon: -80.287
+        timezone: America/New_York
+        resolution_source: https://www.wunderground.com/history/daily/us/fl/miami/KMIA
+        market_kinds: [max, min]
+      - slug_hints: [limc, milan]
+        city: milan
+        station_name: Milan Malpensa (LIMC)
+        lat: 45.6306
+        lon: 8.7281
+        timezone: Europe/Rome
+        resolution_source: https://www.wunderground.com/history/daily/it/milan/LIMC
+        market_kinds: [max]
+      - slug_hints: [eddm, munich]
+        city: munich
+        station_name: Munich Franz Josef Strauss (EDDM)
+        lat: 48.3538
+        lon: 11.7861
+        timezone: Europe/Berlin
+        resolution_source: https://www.wunderground.com/history/daily/de/munich/EDDM
+        market_kinds: [max]
+      - slug_hints: [klga, nyc]
+        city: nyc
+        station_name: LaGuardia (KLGA)
+        lat: 40.7769
+        lon: -73.874
+        timezone: America/New_York
+        resolution_source: https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA
+        market_kinds: [max, min]
+      - slug_hints: [mpmg, panama-city]
+        city: panama-city
+        station_name: Panama City Albrook (MPMG)
+        lat: 8.9733
+        lon: -79.5556
+        timezone: America/Panama
+        resolution_source: https://www.wunderground.com/history/daily/pa/panama-city/MPMG
+        market_kinds: [max]
+      - slug_hints: [lfpb, paris]
+        city: paris
+        station_name: Paris-Le Bourget (LFPB)
+        lat: 48.9694
+        lon: 2.4414
+        timezone: Europe/Paris
+        resolution_source: https://www.wunderground.com/history/daily/fr/bonneuil-en-france/LFPB
+        market_kinds: [max, min]
+      - slug_hints: [qingdao, zsqd]
+        city: qingdao
+        station_name: Qingdao Jiaodong (ZSQD)
+        lat: 36.3617
+        lon: 120.0925
+        timezone: Asia/Shanghai
+        resolution_source: https://www.wunderground.com/history/daily/cn/qingdao/ZSQD
+        market_kinds: [max]
+      - slug_hints: [ksfo, san-francisco]
+        city: san-francisco
+        station_name: San Francisco Intl (KSFO)
+        lat: 37.6213
+        lon: -122.379
+        timezone: America/Los_Angeles
+        resolution_source: https://www.wunderground.com/history/daily/us/ca/san-francisco/KSFO
+        market_kinds: [max]
+      - slug_hints: [sao-paulo, sbgr]
+        city: sao-paulo
+        station_name: Sao Paulo Guarulhos (SBGR)
+        lat: -23.4356
+        lon: -46.4731
+        timezone: America/Sao_Paulo
+        resolution_source: https://www.wunderground.com/history/daily/br/guarulhos/SBGR
+        market_kinds: [max]
+      - slug_hints: [ksea, seattle]
+        city: seattle
+        station_name: Seattle-Tacoma (KSEA)
+        lat: 47.4502
+        lon: -122.3088
+        timezone: America/Los_Angeles
+        resolution_source: https://www.wunderground.com/history/daily/us/wa/seatac/KSEA
+        market_kinds: [max]
+      - slug_hints: [rksi, seoul]
+        city: seoul
+        station_name: Seoul Incheon (RKSI)
+        lat: 37.4602
+        lon: 126.4407
+        timezone: Asia/Seoul
+        resolution_source: https://www.wunderground.com/history/daily/kr/incheon/RKSI
+        market_kinds: [max, min]
+      - slug_hints: [shanghai, zspd]
+        city: shanghai
+        station_name: Shanghai Pudong (ZSPD)
+        lat: 31.1443
+        lon: 121.8083
+        timezone: Asia/Shanghai
+        resolution_source: https://www.wunderground.com/history/daily/cn/shanghai/ZSPD
+        market_kinds: [max, min]
+      - slug_hints: [shenzhen, zgsz]
+        city: shenzhen
+        station_name: Shenzhen Bao'an (ZGSZ)
+        lat: 22.6393
+        lon: 113.8108
+        timezone: Asia/Shanghai
+        resolution_source: https://www.wunderground.com/history/daily/cn/shenzhen/ZGSZ
+        market_kinds: [max]
+      - slug_hints: [singapore, wsss]
+        city: singapore
+        station_name: Singapore Changi (WSSS)
+        lat: 1.3644
+        lon: 103.9915
+        timezone: Asia/Singapore
+        resolution_source: https://www.wunderground.com/history/daily/sg/singapore/WSSS
+        market_kinds: [max]
+      - slug_hints: [rcss, taipei]
+        city: taipei
+        station_name: Taipei Songshan (RCSS)
+        lat: 25.0697
+        lon: 121.5519
+        timezone: Asia/Taipei
+        resolution_source: https://www.wunderground.com/history/daily/tw/taipei/RCSS
+        market_kinds: [max]
+      - slug_hints: [rjtt, tokyo]
+        city: tokyo
+        station_name: Tokyo Haneda (RJTT)
+        lat: 35.5494
+        lon: 139.7798
+        timezone: Asia/Tokyo
+        resolution_source: https://www.wunderground.com/history/daily/jp/tokyo/RJTT
+        market_kinds: [max, min]
+      - slug_hints: [cyyz, toronto]
+        city: toronto
+        station_name: Toronto Pearson (CYYZ)
+        lat: 43.6777
+        lon: -79.6248
+        timezone: America/Toronto
+        resolution_source: https://www.wunderground.com/history/daily/ca/mississauga/CYYZ
+        market_kinds: [max]
+      - slug_hints: [epwa, warsaw]
+        city: warsaw
+        station_name: Warsaw Chopin (EPWA)
+        lat: 52.1657
+        lon: 20.9671
+        timezone: Europe/Warsaw
+        resolution_source: https://www.wunderground.com/history/daily/pl/warsaw/EPWA
+        market_kinds: [max]
+      - slug_hints: [nzwn, wellington]
+        city: wellington
+        station_name: Wellington Intl (NZWN)
+        lat: -41.3272
+        lon: 174.8053
+        timezone: Pacific/Auckland
+        resolution_source: https://www.wunderground.com/history/daily/nz/wellington/NZWN
+        market_kinds: [max]
+      - slug_hints: [wuhan, zhhh]
+        city: wuhan
+        station_name: Wuhan Tianhe (ZHHH)
+        lat: 30.7838
+        lon: 114.2081
+        timezone: Asia/Shanghai
+        resolution_source: https://www.wunderground.com/history/daily/cn/wuhan/ZHHH
+        market_kinds: [max]
+      - slug_hints: [zhcc, zhengzhou]
+        city: zhengzhou
+        station_name: Zhengzhou Xinzheng (ZHCC)
+        lat: 34.5197
+        lon: 113.8408
+        timezone: Asia/Shanghai
+        resolution_source: https://www.wunderground.com/history/daily/cn/zhengzhou/ZHCC
+        market_kinds: [max]

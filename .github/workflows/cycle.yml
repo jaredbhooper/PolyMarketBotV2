@@ -1,0 +1,67 @@
+# Run a scan-decide-paper-trade cycle every 30 minutes.
+# Section 8 of the build plan: GitHub Actions is the recommended scheduler.
+# Note: free tier cron triggers can drift 5-15 min - irrelevant at this timescale.
+
+name: cycle
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional tag_slug to restrict scan (defaults to highest-temperature)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  # Shared with grade.yml so the two workflows never race on `git push`
+  # back to main. They both write the same `polymarketbot.db` file.
+  group: polymarketbot-state
+  cancel-in-progress: false
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run cycle
+        env:
+          PYTHONUNBUFFERED: "1"
+          # Optional alerting
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python main.py cycle
+          python main.py status || true
+
+      - name: Commit ledger
+        # Keeps polymarketbot.db versioned across runs.
+        # If you'd rather not commit the DB, swap this for actions/upload-artifact.
+        run: |
+          git config user.name "polymarketbot"
+          git config user.email "bot@users.noreply.github.com"
+          git add polymarketbot.db || true
+          if git diff --cached --quiet; then
+            echo "no db changes to commit"
+            exit 0
+          fi
+          git commit -m "cycle $(date -u +%Y-%m-%dT%H:%MZ)"
+          # Belt + suspenders: pull --rebase in case grade.yml just pushed.
+          git pull --rebase origin main || true
+          git push origin HEAD:main
