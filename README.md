@@ -556,6 +556,47 @@ python main.py arb-stats      # diagnostics without rescanning (cheap)
 The `arb` command runs *only* the bucket-sum detector; `python main.py
 cycle` runs both weather and arb in the same pass.
 
+### Multi-outcome arb extension (Prompt A — `arb_multi` table)
+
+Built on top of strategy #2's detector. Reuses the same scanner, book
+walk, completeness gate, and the events that pass `walk_band`
+pre-filter. Differences vs the original bucket_arb path:
+
+| aspect          | strategy #2 (`arb_positions`)              | extension (`arb_multi`)                 |
+|-----------------|--------------------------------------------|-----------------------------------------|
+| stake           | per-leg target share count (default 100)   | **fixed USD notional per set** ($10)    |
+| threshold unit  | locked profit in USD (`min_arb_profit`)    | **net gap %** after fees (`min_net_gap_pct`, default 1%) |
+| fees            | not modeled                                | **per-share fee** = `fee_taker_pct × vwap` |
+| sub-threshold   | not logged (only full-walk detections)     | logged as `status='observed_below_threshold'` |
+| depth shortfall | row not written                            | logged as `status='unfillable_leg'`     |
+| exposure cap    | shared with single-leg paper book          | dedicated cap (`max_open_multi_sets`, default 20) |
+
+The extension writes its rows to the new `arb_multi` table so the
+daily report's MULTI-ARB section reads off a single source: every
+walked event produces a row each cycle, and the distribution of
+`net_gap_pct` across `observed_below_threshold` rows is the answer to
+"how often do real gaps appear, even if too small to trade?" - the
+research question motivating the build.
+
+#### Polymarket fee schedule
+
+Both `fee_maker_pct` and `fee_taker_pct` are config knobs. As of
+2026-06 Polymarket's CLOB charges **zero protocol fees** on book
+trades; the strategy ships with both at 0.0 to match. If the fee
+schedule changes, set the new pct in config and the locked-profit
+math stays net-of-fees automatically. The strategy applies
+`fee_taker_pct × vwap` per share on a BUY (multi-arb always takes
+liquidity to grab the full set in one shot).
+
+#### Tests (4 new, on top of bucket_arb's 5)
+
+- 3-outcome set summing to 0.97 → detected as arb (net_gap ≈ 3%)
+- Thin book on one leg → `status='unfillable_leg'`, no position
+- Sum 0.995 with 1% threshold → logged `observed_below_threshold`
+- Fee math: 2% taker on each leg flips a marginally-positive gap
+  negative (and the `fees` column is populated)
+- Exposure cap of 1 blocks the second open
+
 ## Strategy #3: Cross-venue arbitrage (Polymarket x Kalshi)
 
 The same real-world event can be listed on both Polymarket and Kalshi at

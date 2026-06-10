@@ -151,6 +151,21 @@ class BucketSumArb(Strategy):
         self.min_executable_shares = float(s.get("min_executable_shares", 5.0))
         # Hard cap on how many full-book events we walk per cycle (safety).
         self.max_walks_per_cycle = int(s.get("max_walks_per_cycle", 250))
+        # ---------- Multi-outcome extension (Prompt A) -------------------
+        # Distinct path that writes to arb_multi using a fixed-USD stake
+        # notional, applies the explicit Polymarket fee schedule, and
+        # logs sub-threshold gaps as observed_below_threshold (without
+        # trading) so we get the full distribution of opportunities seen.
+        self.multi_mode_enabled = bool(s.get("multi_mode_enabled", True))
+        self.stake_notional_usd = float(s.get("stake_notional_usd", 10.0))
+        self.min_net_gap_pct = float(s.get("min_net_gap_pct", 0.01))    # 1%
+        self.max_open_multi_sets = int(s.get("max_open_multi_sets", 20))
+        # Polymarket fee schedule. As of 2026-06 the Polymarket CLOB charges
+        # zero protocol fees on book trades; configurable so the math is
+        # always net of whatever fee is in force. Both maker_pct and
+        # taker_pct are applied to the cost of the trade (price * shares).
+        self.fee_maker_pct = float(s.get("fee_maker_pct", 0.0))
+        self.fee_taker_pct = float(s.get("fee_taker_pct", 0.0))
 
     # --- per-market path is a no-op for this strategy ---------------------
     def relevant_markets(self, markets: list[Market]) -> list[Market]:
@@ -373,9 +388,18 @@ class BucketSumArb(Strategy):
                 if det is not None:
                     out_detections.append(det)
 
+        # Collect events that were book-walked so the caller can also
+        # run the multi-arb detector (which writes to arb_multi) without
+        # re-fetching books. Walked events are exactly the ones that
+        # appear at least once in out_detections.
+        walked_events_map: dict[str, ArbEvent] = {}
+        for det in out_detections:
+            walked_events_map[det.event.event_id] = det.event
+
         return {
             "detections": out_detections,
             "gamma_only_gaps": gamma_only_gaps,
+            "walked_events": list(walked_events_map.values()),
             "counters": {
                 "scanned": scanned,
                 "complete": complete,
@@ -431,6 +455,143 @@ class BucketSumArb(Strategy):
             },
             legs,
         )
+
+
+    # ============================================================ multi-arb
+    # Fixed-USD-stake variant per Prompt A.
+    #
+    # For a $stake_notional set on the YES side:
+    #   target shares per leg = stake_notional / sum(per-share cost across legs)
+    #   per-leg cost = vwap_i + slippage + maker_fee_pct * vwap_i  (taker on BUY)
+    #   guaranteed payout = shares * $1 (exactly one leg pays $1)
+    #   net_gap_pct = (payout - cost) / cost
+    # On NO side: target shares per leg same formula but payout = (N-1) * shares.
+    #
+    # All-or-nothing: if any single leg can't fill the implied share count
+    # within its visible book, the whole set is logged status='unfillable_leg'
+    # and NO position is opened.
+    def _fee_per_share(self, price: float) -> float:
+        """Polymarket per-share fee on a BUY at vwap `price`. Taker pct by
+        default (multi-arb always takes liquidity)."""
+        return self.fee_taker_pct * float(price)
+
+    def detect_multi_side(self, event: ArbEvent, side: str
+                            ) -> dict | None:
+        """Walk every leg's book for the implied shares-per-leg sized to
+        consume `stake_notional_usd` total. Returns a dict with
+        per-leg fill detail, total cost, payout, fees, net_gap_pct, and
+        a status hint. Returns None on pathological input only."""
+        n = len(event.legs)
+        if n < 2:
+            return None
+        # First estimate per-share cost using a probe walk for 100 shares.
+        per_leg_vwap = []
+        leg_books = []
+        for leg in event.legs:
+            asks = leg.yes_asks if side == "YES" else leg.no_asks
+            vwap, filled, _ = walk_book_for_shares(asks, 100.0)
+            if math.isnan(vwap) or filled <= 0:
+                return None
+            per_leg_vwap.append(vwap)
+            leg_books.append(asks)
+        # Estimate per-share cost (with slip + fee) to size the shares.
+        sum_cost_probe = sum(
+            v + self.slippage_cents + self._fee_per_share(v) for v in per_leg_vwap)
+        if sum_cost_probe <= 0:
+            return None
+        shares_target = self.stake_notional_usd / sum_cost_probe
+        # Now walk for that share count and compute real vwap.
+        legs_detail = []
+        total_cost = 0.0
+        total_fees = 0.0
+        unfillable = False
+        for leg, asks in zip(event.legs, leg_books):
+            vwap, filled, levels = walk_book_for_shares(asks, shares_target)
+            if math.isnan(vwap) or filled < shares_target - 1e-6:
+                unfillable = True
+                legs_detail.append({
+                    "market_id": leg.market_id,
+                    "leg_title": leg.leg_title,
+                    "vwap": None if math.isnan(vwap) else vwap,
+                    "shares_requested": shares_target,
+                    "shares_filled": filled,
+                    "price_filled": None,
+                    "fee_per_share": None,
+                    "cost": None,
+                    "levels_consumed": levels,
+                })
+                continue
+            fee_ps = self._fee_per_share(vwap)
+            price_filled = min(0.99, vwap + self.slippage_cents)
+            cost = (price_filled + fee_ps) * shares_target
+            total_cost += cost
+            total_fees += fee_ps * shares_target
+            legs_detail.append({
+                "market_id": leg.market_id,
+                "leg_title": leg.leg_title,
+                "vwap": vwap,
+                "shares_requested": shares_target,
+                "shares_filled": filled,
+                "price_filled": price_filled,
+                "fee_per_share": fee_ps,
+                "cost": cost,
+                "levels_consumed": levels,
+            })
+        # Guaranteed payout: on YES one leg pays $1 per share; on NO N-1 pay $1.
+        payout_per_share = 1.0 if side == "YES" else float(n - 1)
+        guaranteed_payout = payout_per_share * shares_target
+        if unfillable:
+            status_hint = "unfillable_leg"
+            net_gap_pct = 0.0
+        else:
+            net_gap_pct = (guaranteed_payout - total_cost) / total_cost if total_cost > 0 else 0.0
+            status_hint = "fillable"
+        return {
+            "side": side,
+            "shares": shares_target,
+            "total_cost": total_cost,
+            "guaranteed_payout": guaranteed_payout,
+            "fees": total_fees,
+            "net_gap_pct": net_gap_pct,
+            "legs_detail": legs_detail,
+            "status_hint": status_hint,
+            "outcome_count": n,
+        }
+
+    def commit_multi(self, event: ArbEvent, det: dict, ledger,
+                       day_iso: str | None = None) -> int | None:
+        """Record an arb_multi row. Decides status based on net_gap_pct +
+        threshold + open-cap. Returns the row id."""
+        if det["status_hint"] == "unfillable_leg":
+            status = "unfillable_leg"
+        elif det["net_gap_pct"] < self.min_net_gap_pct:
+            status = "observed_below_threshold"
+        else:
+            # Check duplicate today + open cap.
+            if day_iso is None:
+                day_iso = datetime.now(timezone.utc).date().isoformat()
+            if ledger.already_arb_multi_today(event.event_id, det["side"], day_iso):
+                status = "observed_below_threshold"   # already taken today
+            elif ledger.count_open_arb_multis() >= self.max_open_multi_sets:
+                status = "observed_below_threshold"
+            else:
+                status = "OPEN"
+        return ledger.record_arb_multi({
+            "event_id": event.event_id,
+            "event_slug": event.event_slug,
+            "event_title": event.event_title,
+            "outcome_count": det["outcome_count"],
+            "side": det["side"],
+            "stake_notional": self.stake_notional_usd,
+            "shares": det["shares"] if det["status_hint"] != "unfillable_leg" else None,
+            "leg_fills": det["legs_detail"],
+            "total_cost": det["total_cost"],
+            "guaranteed_payout": det["guaranteed_payout"],
+            "fees": det["fees"],
+            "net_gap_pct": det["net_gap_pct"],
+            "status": status,
+            "end_date_iso": event.end_date_iso,
+        })
 
 
 def build(cfg: dict) -> Strategy:

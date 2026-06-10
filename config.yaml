@@ -63,6 +63,17 @@ strategies:
     min_hours_to_resolve: 1.0     # skip events resolving in less than this
     min_executable_shares: 5.0    # require at least this many fillable shares to log a full-walk gap
     max_walks_per_cycle: 2000     # hard cap on expensive full-book walks per cycle
+    # Multi-outcome extension (Prompt A). Writes arb_multi rows alongside
+    # the existing arb_gaps. Fixed USD-notional stake per set.
+    multi_mode_enabled: true
+    stake_notional_usd: 10.00
+    min_net_gap_pct: 0.01         # 1% AFTER fees; below this -> observed_below_threshold
+    max_open_multi_sets: 20
+    # Polymarket fee schedule. CLOB exchange currently charges 0 protocol
+    # fees; configurable so the math is always net of whatever fee is in
+    # force when we run. Both pct apply on top of slippage.
+    fee_maker_pct: 0.0
+    fee_taker_pct: 0.0
 
   # Strategy #3: cross-venue arbitrage (Polymarket vs Kalshi). For each
   # candidate matched pair the rules-equivalence engine classifies into

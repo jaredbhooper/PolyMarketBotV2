@@ -211,6 +211,9 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
     # Settle arb_positions whose end_date has passed.
     arb_settled, arb_skipped = grade_arb_positions(cfg, ledger, today, verbose=verbose)
 
+    # Settle arb_multi rows.
+    multi_settled, multi_skipped = grade_arb_multi(cfg, ledger, today, verbose=verbose)
+
     # Settle cross-venue positions.
     cv_settled, cv_skipped = grade_cv_positions(cfg, ledger, today, verbose=verbose)
 
@@ -221,6 +224,87 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
             "arb_settled": arb_settled, "arb_skipped": arb_skipped,
             "cv_settled": cv_settled, "cv_skipped": cv_skipped,
             "open_remaining": len(ledger.open_positions())}
+
+
+def grade_arb_multi(cfg: dict, ledger: Ledger, today, verbose: bool = True
+                       ) -> tuple[int, int]:
+    """Settle every OPEN arb_multi row whose event has resolved.
+
+    arb_multi rows store leg_fills_json with each market_id; we look up
+    each leg via Gamma /markets?condition_ids=... For YES side: one leg
+    pays $1 per share; rest pay $0. For NO side: N-1 pay $1 per share.
+    """
+    import requests
+    settled = 0
+    skipped = 0
+    open_rows = ledger.open_arb_multis()
+    if verbose:
+        print(f"Grader: {len(open_rows)} open arb_multi rows to evaluate.")
+    gamma = (cfg.get("scanner") or {}).get(
+        "gamma_url", "https://gamma-api.polymarket.com").rstrip("/")
+    sess = requests.Session()
+    for row in open_rows:
+        end = row["end_date_iso"]
+        if end:
+            try:
+                e_date = datetime.fromisoformat((end or "").replace("Z", "+00:00").split("T")[0]).date()
+                if e_date >= today:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        try:
+            legs = json.loads(row["leg_fills_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            legs = []
+        if not legs:
+            continue
+        winners = 0
+        all_resolved = True
+        for leg in legs:
+            mid = leg.get("market_id")
+            if not mid:
+                all_resolved = False
+                continue
+            try:
+                r = sess.get(f"{gamma}/markets",
+                              params={"condition_ids": mid}, timeout=20)
+                data = r.json()
+                m = data[0] if data else None
+            except Exception:
+                m = None
+            if not m or not m.get("closed"):
+                all_resolved = False
+                continue
+            try:
+                op = m.get("outcomePrices")
+                if isinstance(op, str):
+                    op = json.loads(op)
+                yes_price = float(op[0]) if op else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                yes_price = None
+            if yes_price is None:
+                all_resolved = False
+                continue
+            if yes_price > 0.99:
+                winners += 1
+        if not all_resolved:
+            skipped += 1
+            continue
+        side = row["side"]
+        shares = float(row["shares"] or 0.0)
+        total_cost = float(row["total_cost"])
+        if side == "YES":
+            payout = shares * 1.0 if winners >= 1 else 0.0
+        else:
+            payout = shares * (int(row["outcome_count"]) - winners)
+        pnl = payout - total_cost
+        status = "CLOSED"
+        ledger.settle_arb_multi(int(row["id"]), status, pnl)
+        settled += 1
+        if verbose:
+            print(f"  Settled arb_multi {row['id']} {side} {row['event_slug']} "
+                  f"cost=${total_cost:.2f} payout=${payout:.2f} pnl=${pnl:+.2f}")
+    return settled, skipped
 
 
 def grade_cv_positions(cfg: dict, ledger: Ledger, today, verbose: bool = True

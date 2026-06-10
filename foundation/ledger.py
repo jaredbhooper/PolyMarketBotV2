@@ -241,6 +241,33 @@ CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_gaps_event ON arb_gaps(event_id, ts);
 CREATE INDEX IF NOT EXISTS idx_arb_positions_status ON arb_positions(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_legs_position ON arb_legs(position_id);
+-- Multi-outcome arb extension (Prompt A): arb_multi table.
+-- Distinct from arb_positions: arb_multi uses a fixed $10 notional stake
+-- per full set, tracks net_gap_pct AFTER fees, and uses 'unfillable_leg'
+-- as a first-class status (research shows ~73% of historical arb profit
+-- comes from multi-outcome rebalancing gaps, and they persist longer than
+-- binary gaps, so the dedicated table makes the daily report clean).
+CREATE TABLE IF NOT EXISTS arb_multi (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  event_slug TEXT,
+  event_title TEXT,
+  outcome_count INTEGER NOT NULL,
+  side TEXT NOT NULL,                   -- YES | NO
+  stake_notional REAL NOT NULL,         -- $10 default per set
+  shares REAL,                          -- shares bought per leg (or NULL if unfillable)
+  leg_fills_json TEXT NOT NULL,         -- [{market_id, vwap, price_filled, fee_per_share, ...}]
+  total_cost REAL NOT NULL,             -- USD all-in incl. fees + slippage
+  guaranteed_payout REAL NOT NULL,      -- USD payout if any one leg wins
+  fees REAL NOT NULL,                   -- USD - total fees component
+  net_gap_pct REAL NOT NULL,            -- (payout - cost) / cost, signed
+  status TEXT NOT NULL,                 -- OPEN | observed_below_threshold | unfillable_leg | CLOSED | VOID
+  resolved_at TEXT,
+  realized_pnl REAL,
+  end_date_iso TEXT
+);
+
 -- Copy-trading (strategy #4) tables.
 CREATE TABLE IF NOT EXISTS wallets (
   wallet TEXT PRIMARY KEY,
@@ -329,6 +356,7 @@ CREATE INDEX IF NOT EXISTS idx_cv_legs_position ON cv_legs(position_id);
 CREATE INDEX IF NOT EXISTS idx_wallet_trades_wallet ON wallet_trades(wallet, ts);
 CREATE INDEX IF NOT EXISTS idx_copied_trades_leader ON copied_trades(leader_wallet, status);
 CREATE INDEX IF NOT EXISTS idx_copied_trades_status ON copied_trades(status);
+CREATE INDEX IF NOT EXISTS idx_arb_multi_status ON arb_multi(status, event_id);
 """
 
 
@@ -1057,6 +1085,82 @@ class Ledger:
                      AND substr(ts,1,10)=?""",
                 (pair_id, strategy, direction, day_iso)).fetchone()
             return row is not None
+
+    # --- multi-outcome arb (Prompt A) -------------------------------------
+    def record_arb_multi(self, row: dict[str, Any]) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO arb_multi (
+                    ts, event_id, event_slug, event_title, outcome_count,
+                    side, stake_notional, shares, leg_fills_json,
+                    total_cost, guaranteed_payout, fees, net_gap_pct,
+                    status, end_date_iso)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    utcnow_iso(), row["event_id"], row.get("event_slug"),
+                    row.get("event_title"), int(row["outcome_count"]),
+                    row["side"], float(row["stake_notional"]),
+                    row.get("shares"),
+                    json.dumps(row.get("leg_fills") or []),
+                    float(row["total_cost"]),
+                    float(row["guaranteed_payout"]),
+                    float(row["fees"]),
+                    float(row["net_gap_pct"]),
+                    row["status"],
+                    row.get("end_date_iso"),
+                ))
+            return int(cur.lastrowid)
+
+    def open_arb_multis(self) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT * FROM arb_multi WHERE status='OPEN'").fetchall())
+
+    def count_open_arb_multis(self) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM arb_multi WHERE status='OPEN'"
+            ).fetchone()
+            return int(row["n"])
+
+    def already_arb_multi_today(self, event_id: str, side: str,
+                                 day_iso: str) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT 1 FROM arb_multi
+                   WHERE event_id=? AND side=? AND status='OPEN'
+                     AND substr(ts,1,10)=?""",
+                (event_id, side, day_iso)).fetchone()
+            return row is not None
+
+    def settle_arb_multi(self, row_id: int, status: str, realized_pnl: float
+                           ) -> None:
+        with self._conn() as c:
+            c.execute(
+                """UPDATE arb_multi SET status=?, realized_pnl=?, resolved_at=?
+                    WHERE id=?""",
+                (status, realized_pnl, utcnow_iso(), int(row_id)))
+
+    def arb_multi_stats(self) -> dict[str, Any]:
+        with self._conn() as c:
+            by_status = list(c.execute(
+                "SELECT status, COUNT(*) AS n, COALESCE(SUM(realized_pnl),0) AS pnl FROM arb_multi GROUP BY status"
+            ).fetchall())
+            dist = list(c.execute(
+                "SELECT net_gap_pct FROM arb_multi"
+            ).fetchall())
+        out = {
+            "by_status": {r["status"]: int(r["n"]) for r in by_status},
+            "realized_pnl_by_status": {r["status"]: float(r["pnl"]) for r in by_status},
+            "gap_pct_buckets": {},
+        }
+        for r in dist:
+            v = r["net_gap_pct"]
+            for hi in (-0.10, -0.05, -0.02, -0.01, 0.0, 0.005, 0.01, 0.02, 0.05, 0.10, 1.0):
+                if v < hi:
+                    out["gap_pct_buckets"][hi] = out["gap_pct_buckets"].get(hi, 0) + 1
+                    break
+        return out
 
     def arb_gap_stats(self, strategy: str) -> dict[str, Any]:
         """Aggregate distribution of detected gaps for the diagnostics print.

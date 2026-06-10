@@ -199,6 +199,38 @@ def run_arb_cycle(strategy, scanner: Scanner, ledger: Ledger,
                       f"profit_per_share={det.locked_profit_per_share:.4f} "
                       f"total=${det.locked_profit_usd:.2f}")
 
+    # ---- Multi-outcome arb extension (Prompt A): write arb_multi rows
+    # for every walked event using the $stake_notional variant. This
+    # never re-fetches books - reuses the event objects from the main
+    # detector pass. Trades fire only when net_gap_pct >= min_net_gap_pct
+    # AND every leg can absorb the implied share count.
+    multi_logged = 0
+    multi_opened = 0
+    multi_unfillable = 0
+    multi_below = 0
+    if getattr(strategy, "multi_mode_enabled", False):
+        for ev in result.get("walked_events") or []:
+            for side_name in ("YES", "NO"):
+                if side_name == "YES" and not strategy.detect_yes:
+                    continue
+                if side_name == "NO" and not strategy.detect_no:
+                    continue
+                multi_det = strategy.detect_multi_side(ev, side_name)
+                if multi_det is None:
+                    continue
+                rid = strategy.commit_multi(ev, multi_det, ledger)
+                multi_logged += 1
+                # Inspect what was written
+                if multi_det["status_hint"] == "unfillable_leg":
+                    multi_unfillable += 1
+                elif multi_det["net_gap_pct"] < strategy.min_net_gap_pct:
+                    multi_below += 1
+                else:
+                    multi_opened += 1
+        if verbose:
+            print(f"  multi-arb: logged={multi_logged} opened={multi_opened} "
+                  f"unfillable={multi_unfillable} below_threshold={multi_below}")
+
     if verbose:
         print(
             f"  detector: scanned={counters['scanned']} "
