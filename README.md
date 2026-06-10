@@ -868,6 +868,71 @@ seconds** - between cycles the leader's price has often moved. We
 measure that bleed honestly so future infrastructure decisions
 (faster cron, websockets, etc.) can be cost-justified or killed.
 
+## Strategy #5: SHARPLINE (Prompt C, Phase 1)
+
+PAPER ONLY. Maker-side value betting on Polymarket sports/esports vs
+sharp bookmaker odds (Pinnacle and friends via The Odds API).
+
+- **Vig removal**: convert two-way bookmaker decimal odds into a
+  vig-free fair `P(YES)`.
+- **Match**: fuzzy team-name token-set matcher; only auto-trade pairs
+  with confidence ≥ 0.9. `AMBIGUOUS` matches (two Polymarket markets
+  close on score) are logged but never auto-traded.
+- **Edge**: post a resting paper limit at the current Polymarket YES
+  ask when `(fair - ask) / ask ≥ edge_min` (default 7%).
+- **Order lifecycle**: lifecycle columns reserved on `sharpline_orders`
+  for `RESTING | FILLED | CANCELLED | UNFILLED_RESOLVED`, with
+  `line_at_fill` and `adverse_selection`. v1 ships order **posting**;
+  fill simulation lands in the next phase.
+- **Honesty**: every row in `sharpline_orders` is tagged
+  `estimate_marker='ESTIMATE'`. Maker fills cannot reflect real queue
+  position, so all derived P&L is explicitly marked.
+- **Budget**: monthly request counter persists in `odds_api_log`;
+  cap default 450, 30-min response cache in `odds_cache`. Caches
+  never spend budget.
+- **OBSERVE MODE**: if `ODDS_API_KEY` is missing, the strategy still
+  runs - it scans Polymarket sports/esports markets and logs how many
+  WOULD have been evaluated. Master report shows
+  `sharpline: observe-only (no odds key)`.
+
+## Strategy #6: LP-SIM (Prompt C, Phase 2)
+
+PAPER ONLY. Simulates Polymarket liquidity-rewards quoting around the
+midpoint, computes our would-be score per the published formula, and
+estimates our share of the daily pool.
+
+- **Reward score**: `((band - spread)^2 / band^2) × size × sided` where
+  `sided = 1.0` two-sided, `0.5` one-sided. Tighter spreads quadratic-
+  boost; one-sided depth gets half credit; size enters linearly to
+  the reward-band cap. Implementation marker v1 in code.
+- **Competition denominator**: unobservable from the public CLOB.
+  Approximated as visible book depth in the reward band - documented
+  on each row so the estimate's bias is explicit.
+- **Output**: top `max_markets` ranked by score with estimated daily
+  reward USD. Every row tagged `estimate_marker='ESTIMATE'`.
+
+The simulator's job is to **confirm or kill** the hypothesis that
+rewards + rebates + an in-house fair-value model can make LP profitable
+on Polymarket, before any real capital is staked.
+
+## Strategy #7: LOGIC-SCAN (Prompt C, Phase 3)
+
+PAPER ONLY. Detects pairs of logically related markets and trades
+violations of strict implication.
+
+- **Templates**: champion vs finalist, winner vs advances, presidency
+  vs nomination, "by date X" vs "by date Y". All require same
+  `event_slug` on both markets (no cross-event matching).
+- **Confidence floor**: only pairs at `confidence ≥ 0.95` are
+  tradeable. Everything else (including lower-confidence detected
+  pairs) is persisted to `logic_pairs` for human review. False
+  implications are the failure mode, so transparency over volume.
+- **Trade**: when `P(A) - P(B) ≥ min_margin` (default 3pp, net of
+  fees), open the structural position; record to `logic_violations`
+  with status `traded`. When `0 < margin < min_margin`, log
+  `status='near_miss'` for distribution-tracking.
+- **Stake**: $10 per leg, both-or-nothing; partial sets forbidden.
+
 ## V2 Operations runbook
 
 PolyMarketBotV1 ships **paper-only**. There are no wallet credentials,
