@@ -72,6 +72,9 @@ active_strategies:
   - module: bucket_arb
   - module: cross_venue_arb
   - module: copy_trading
+  - module: sharpline
+  - module: lp_sim
+  - module: logic_scan
 
 strategies:
   dummy:
@@ -159,6 +162,44 @@ strategies:
       exit_below_consecutive: 3
       enter_above_rank: 10
       enter_above_consecutive: 2
+
+  # Strategy #5 (Prompt C, Phase 1): SHARPLINE
+  # Maker-side value betting on Polymarket sports/esports markets vs
+  # sharp bookmaker odds. PRE-GAME ONLY. ODDS_API_KEY from env/.env.
+  # No key -> OBSERVE MODE (logs sport market spreads, no orders).
+  sharpline:
+    edge_min: 0.07
+    stake_usd: 10.00
+    reprice_threshold: 0.02
+    stop_before_start_minutes: 0
+    max_resting_orders: 25
+    max_per_league_per_day: 5
+    polymarket_fee_pct: 0.0
+    monthly_request_cap: 450
+    match_min_confidence: 0.9
+    sports:
+      - esports_csgo
+      - esports_dota2
+      - esports_lol
+      - soccer_epl
+      - basketball_nba
+
+  # Strategy #6 (Prompt C, Phase 2): LP-SIM
+  # Liquidity-rewards quoting simulator. All output marked ESTIMATE.
+  lp_sim:
+    max_markets: 10
+    quote_size_usd: 25.0
+    quote_spread_cents: 0.02
+    reward_band_cents: 0.05
+    daily_pool_usd_default: 50.0
+
+  # Strategy #7 (Prompt C, Phase 3): LOGIC-SCAN
+  # Combinatorial consistency. Only pairs with confidence >= 0.95 trade.
+  logic_scan:
+    min_confidence_to_trade: 0.95
+    min_margin: 0.03
+    stake_usd: 10.00
+    fee_pct: 0.0
 
   weather:
     edge_threshold: 0.08            # override default

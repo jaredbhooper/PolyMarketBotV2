@@ -241,6 +241,95 @@ CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_gaps_event ON arb_gaps(event_id, ts);
 CREATE INDEX IF NOT EXISTS idx_arb_positions_status ON arb_positions(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_legs_position ON arb_legs(position_id);
+-- SHARPLINE / LP-SIM / LOGIC-SCAN (Prompt C). All paper-only.
+-- ESTIMATE tag on each row whose pnl came from a maker-side simulation.
+CREATE TABLE IF NOT EXISTS odds_api_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  month TEXT NOT NULL,
+  sport TEXT NOT NULL,
+  status_code INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS odds_cache (
+  sport TEXT PRIMARY KEY,
+  fetched_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sharpline_matches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  sport_key TEXT NOT NULL,
+  poly_market_id TEXT,
+  poly_event_slug TEXT,
+  bookmaker_event_id TEXT,
+  home_team TEXT,
+  away_team TEXT,
+  confidence REAL NOT NULL,
+  status TEXT NOT NULL                 -- MATCHED | UNMATCHED | AMBIGUOUS
+);
+
+CREATE TABLE IF NOT EXISTS sharpline_orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  match_id INTEGER NOT NULL,
+  poly_market_id TEXT NOT NULL,
+  side TEXT NOT NULL,                   -- YES | NO
+  outcome TEXT,                         -- 'home' | 'away' | etc
+  our_price REAL NOT NULL,              -- limit price we 'posted'
+  fair_prob_at_post REAL NOT NULL,
+  edge_at_post REAL NOT NULL,
+  stake_usd REAL NOT NULL,
+  league TEXT,
+  status TEXT NOT NULL,                 -- RESTING | FILLED | CANCELLED | UNFILLED_RESOLVED
+  filled_at TEXT,
+  line_at_fill REAL,                    -- fair_prob at the moment of fill
+  adverse_selection REAL,               -- fair_prob_at_post - line_at_fill (signed)
+  resolved_outcome TEXT,                -- WIN | LOSS | VOID once settled
+  realized_pnl REAL,
+  estimate_marker TEXT NOT NULL DEFAULT 'ESTIMATE'
+);
+
+CREATE TABLE IF NOT EXISTS lp_sim_state (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  poly_market_id TEXT NOT NULL,
+  quote_spread REAL NOT NULL,
+  quote_size REAL NOT NULL,
+  score REAL NOT NULL,
+  est_share_of_pool REAL NOT NULL,
+  est_daily_reward_usd REAL NOT NULL,
+  est_trading_pnl_usd REAL NOT NULL,
+  adverse_selection_usd REAL NOT NULL,
+  estimate_marker TEXT NOT NULL DEFAULT 'ESTIMATE'
+);
+
+CREATE TABLE IF NOT EXISTS logic_pairs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL,
+  market_a_id TEXT NOT NULL,            -- "more likely" implication child
+  market_b_id TEXT NOT NULL,            -- "stronger" implication parent (A => B)
+  template TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  first_seen TEXT NOT NULL,
+  notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS logic_violations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  pair_id INTEGER NOT NULL,
+  pa REAL NOT NULL,
+  pb REAL NOT NULL,
+  margin REAL NOT NULL,                 -- pa - pb
+  status TEXT NOT NULL,                 -- traded | near_miss
+  stake_usd REAL,
+  realized_pnl REAL,
+  resolved_at TEXT,
+  FOREIGN KEY(pair_id) REFERENCES logic_pairs(id)
+);
+
 -- Virtual bankroll + master report + health monitor (Prompt B).
 -- bankroll_allocations holds the latest snapshot per strategy; the full
 -- audit trail of every debit / credit lives in bankroll_transactions so
@@ -407,6 +496,8 @@ CREATE INDEX IF NOT EXISTS idx_copied_trades_status ON copied_trades(status);
 CREATE INDEX IF NOT EXISTS idx_arb_multi_status ON arb_multi(status, event_id);
 CREATE INDEX IF NOT EXISTS idx_bankroll_txn_strategy ON bankroll_transactions(strategy, ts);
 CREATE INDEX IF NOT EXISTS idx_health_strategy_ts ON health_log(strategy, ts);
+CREATE INDEX IF NOT EXISTS idx_sharpline_status ON sharpline_orders(status);
+CREATE INDEX IF NOT EXISTS idx_logic_violations_pair ON logic_violations(pair_id, ts);
 """
 
 
@@ -1125,6 +1216,168 @@ class Ledger:
             "settled": len(settled),
             "per_leader": per_leader,
         }
+
+    # --- odds-api (Prompt C, Phase 1: SHARPLINE) --------------------------
+    def odds_api_requests_this_month(self, month: str) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM odds_api_log WHERE month=?",
+                (month,)).fetchone()
+            return int(row["n"])
+
+    def record_odds_api_request(self, month: str, sport: str,
+                                  status_code: int) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO odds_api_log (ts, month, sport, status_code)
+                    VALUES (?, ?, ?, ?)""",
+                (utcnow_iso(), month, sport, int(status_code)))
+
+    def get_odds_cache(self, sport: str, ttl_seconds: int = 1800
+                         ) -> list[dict] | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT fetched_at, payload_json FROM odds_cache WHERE sport=?",
+                (sport,)).fetchone()
+        if not row:
+            return None
+        try:
+            dt = datetime.fromisoformat(row["fetched_at"].replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - dt).total_seconds()
+            if age > ttl_seconds:
+                return None
+            return json.loads(row["payload_json"])
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def put_odds_cache(self, sport: str, payload: list[dict]) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO odds_cache (sport, fetched_at, payload_json)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(sport) DO UPDATE SET
+                    fetched_at=excluded.fetched_at,
+                    payload_json=excluded.payload_json""",
+                (sport, utcnow_iso(), json.dumps(payload)))
+
+    def record_sharpline_match(self, match: dict[str, Any]) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO sharpline_matches (
+                    ts, sport_key, poly_market_id, poly_event_slug,
+                    bookmaker_event_id, home_team, away_team, confidence,
+                    status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (utcnow_iso(), match["sport_key"], match.get("poly_market_id"),
+                 match.get("poly_event_slug"), match.get("bookmaker_event_id"),
+                 match.get("home_team"), match.get("away_team"),
+                 float(match["confidence"]), match["status"]))
+            return int(cur.lastrowid)
+
+    def record_sharpline_order(self, order: dict[str, Any]) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO sharpline_orders (
+                    ts, match_id, poly_market_id, side, outcome, our_price,
+                    fair_prob_at_post, edge_at_post, stake_usd, league, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (utcnow_iso(), int(order["match_id"]),
+                 order["poly_market_id"], order["side"], order.get("outcome"),
+                 float(order["our_price"]),
+                 float(order["fair_prob_at_post"]),
+                 float(order["edge_at_post"]),
+                 float(order["stake_usd"]),
+                 order.get("league"), order["status"]))
+            return int(cur.lastrowid)
+
+    def list_sharpline_orders(self, status: str | None = None) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            if status:
+                return list(c.execute(
+                    "SELECT * FROM sharpline_orders WHERE status=?",
+                    (status,)).fetchall())
+            return list(c.execute(
+                "SELECT * FROM sharpline_orders").fetchall())
+
+    def update_sharpline_order(self, order_id: int, **fields) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k}=?" for k in fields.keys())
+        with self._conn() as c:
+            c.execute(f"UPDATE sharpline_orders SET {cols} WHERE id=?",
+                       (*fields.values(), int(order_id)))
+
+    # --- LP-SIM (Prompt C, Phase 2) ---------------------------------------
+    def record_lp_sim(self, row: dict[str, Any]) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO lp_sim_state (
+                    ts, poly_market_id, quote_spread, quote_size, score,
+                    est_share_of_pool, est_daily_reward_usd,
+                    est_trading_pnl_usd, adverse_selection_usd)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (utcnow_iso(), row["poly_market_id"],
+                 float(row["quote_spread"]), float(row["quote_size"]),
+                 float(row["score"]),
+                 float(row["est_share_of_pool"]),
+                 float(row["est_daily_reward_usd"]),
+                 float(row["est_trading_pnl_usd"]),
+                 float(row["adverse_selection_usd"])))
+            return int(cur.lastrowid)
+
+    def lp_sim_latest(self, limit: int = 10) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT * FROM lp_sim_state ORDER BY id DESC LIMIT ?",
+                (limit,)).fetchall())
+
+    # --- LOGIC-SCAN (Prompt C, Phase 3) -----------------------------------
+    def upsert_logic_pair(self, pair: dict[str, Any]) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT id FROM logic_pairs
+                   WHERE market_a_id=? AND market_b_id=?""",
+                (pair["market_a_id"], pair["market_b_id"])).fetchone()
+            if row:
+                return int(row["id"])
+            cur = c.execute(
+                """INSERT INTO logic_pairs (
+                    event_id, market_a_id, market_b_id, template,
+                    confidence, first_seen, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (pair["event_id"], pair["market_a_id"], pair["market_b_id"],
+                 pair["template"], float(pair["confidence"]),
+                 utcnow_iso(), pair.get("notes")))
+            return int(cur.lastrowid)
+
+    def list_logic_pairs(self, min_confidence: float | None = None
+                           ) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            if min_confidence is not None:
+                return list(c.execute(
+                    "SELECT * FROM logic_pairs WHERE confidence >= ?",
+                    (float(min_confidence),)).fetchall())
+            return list(c.execute("SELECT * FROM logic_pairs").fetchall())
+
+    def record_logic_violation(self, row: dict[str, Any]) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO logic_violations (
+                    ts, pair_id, pa, pb, margin, status, stake_usd)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (utcnow_iso(), int(row["pair_id"]),
+                 float(row["pa"]), float(row["pb"]),
+                 float(row["margin"]), row["status"],
+                 row.get("stake_usd")))
+            return int(cur.lastrowid)
+
+    def logic_violation_stats(self) -> dict[str, int]:
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT status, COUNT(*) AS n FROM logic_violations GROUP BY status"""
+            ).fetchall()
+            return {r["status"]: int(r["n"]) for r in rows}
 
     # --- bankroll (Prompt B) -----------------------------------------------
     def get_bankroll_row(self, strategy: str) -> sqlite3.Row | None:
