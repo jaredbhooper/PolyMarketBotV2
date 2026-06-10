@@ -241,9 +241,94 @@ CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_gaps_event ON arb_gaps(event_id, ts);
 CREATE INDEX IF NOT EXISTS idx_arb_positions_status ON arb_positions(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_legs_position ON arb_legs(position_id);
+-- Copy-trading (strategy #4) tables.
+CREATE TABLE IF NOT EXISTS wallets (
+  wallet TEXT PRIMARY KEY,
+  first_seen TEXT NOT NULL,
+  last_scouted TEXT,
+  metrics_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS wallet_trades (
+  wallet TEXT NOT NULL,
+  trade_key TEXT NOT NULL,            -- f"{transactionHash}:{asset}:{side}"
+  ts INTEGER NOT NULL,
+  side TEXT NOT NULL,
+  asset TEXT NOT NULL,
+  condition_id TEXT,
+  size REAL NOT NULL,
+  price REAL NOT NULL,
+  title TEXT,
+  event_slug TEXT,
+  outcome TEXT,
+  outcome_index INTEGER,
+  raw_json TEXT,
+  PRIMARY KEY(wallet, trade_key)
+);
+
+CREATE TABLE IF NOT EXISTS wallet_cursors (
+  wallet TEXT PRIMARY KEY,
+  last_ts INTEGER NOT NULL,
+  last_pulled_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS roster (
+  wallet TEXT PRIMARY KEY,
+  entered_at TEXT,
+  exited_at TEXT,
+  score REAL,
+  rank INTEGER,
+  status TEXT NOT NULL,                -- ACTIVE | EXITED
+  hysteresis_state_json TEXT           -- {below_25_consec, above_10_consec}
+);
+
+CREATE TABLE IF NOT EXISTS scout_snapshots (
+  date TEXT NOT NULL,
+  wallet TEXT NOT NULL,
+  rank INTEGER,
+  score REAL,
+  passed_filters INTEGER NOT NULL,
+  exclusion_reason TEXT,
+  metrics_json TEXT,
+  PRIMARY KEY(date, wallet)
+);
+
+CREATE TABLE IF NOT EXISTS copied_trades (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  leader_wallet TEXT NOT NULL,
+  market_id TEXT NOT NULL,             -- conditionId
+  token_id TEXT NOT NULL,              -- asset
+  side TEXT NOT NULL,                  -- BUY | SELL
+  leader_price REAL NOT NULL,
+  leader_size REAL NOT NULL,
+  leader_ts INTEGER NOT NULL,
+  detection_ts INTEGER NOT NULL,
+  detection_delay_s INTEGER NOT NULL,
+  our_price REAL,                      -- NULL when unfillable / skipped
+  price_drift REAL,                    -- our_price - leader_price (signed)
+  book_snapshot_json TEXT,
+  stake REAL NOT NULL,
+  shares REAL,
+  status TEXT NOT NULL,                -- open | settled | unfillable | skipped_cap
+  exit_reason TEXT,                    -- leader_exit | resolution | NULL
+  our_pnl REAL,
+  leader_pnl_equivalent REAL,
+  closed_at TEXT,
+  ts_opened TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_market ON snapshots(market_id, ts);
+CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market_id, strategy, ts);
+CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status, strategy);
+CREATE INDEX IF NOT EXISTS idx_arb_gaps_event ON arb_gaps(event_id, ts);
+CREATE INDEX IF NOT EXISTS idx_arb_positions_status ON arb_positions(status, strategy);
+CREATE INDEX IF NOT EXISTS idx_arb_legs_position ON arb_legs(position_id);
 CREATE INDEX IF NOT EXISTS idx_cv_gaps_pair ON cv_gaps(pair_id, ts);
 CREATE INDEX IF NOT EXISTS idx_cv_positions_status ON cv_positions(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_cv_legs_position ON cv_legs(position_id);
+CREATE INDEX IF NOT EXISTS idx_wallet_trades_wallet ON wallet_trades(wallet, ts);
+CREATE INDEX IF NOT EXISTS idx_copied_trades_leader ON copied_trades(leader_wallet, status);
+CREATE INDEX IF NOT EXISTS idx_copied_trades_status ON copied_trades(status);
 """
 
 
@@ -754,6 +839,214 @@ class Ledger:
                     "UPDATE cv_legs SET outcome=?, payout=? WHERE id=?",
                     (lo["outcome"], float(lo["payout"]), int(lo["leg_id"])),
                 )
+
+    # --- copy-trading (strategy #4) ---------------------------------------
+    def upsert_wallet(self, wallet: str, metrics: dict[str, Any]) -> None:
+        with self._conn() as c:
+            row = c.execute("SELECT wallet FROM wallets WHERE wallet=?",
+                             (wallet,)).fetchone()
+            if row:
+                c.execute(
+                    "UPDATE wallets SET last_scouted=?, metrics_json=? WHERE wallet=?",
+                    (utcnow_iso(), json.dumps(metrics), wallet))
+            else:
+                c.execute(
+                    """INSERT INTO wallets (wallet, first_seen, last_scouted, metrics_json)
+                        VALUES (?, ?, ?, ?)""",
+                    (wallet, utcnow_iso(), utcnow_iso(), json.dumps(metrics)))
+
+    def upsert_wallet_trades(self, wallet: str, trades: list[dict]) -> int:
+        if not trades:
+            return 0
+        n = 0
+        with self._conn() as c:
+            for t in trades:
+                key = f"{t.get('transactionHash','')}:{t.get('asset','')}:{t.get('side','')}"
+                try:
+                    c.execute(
+                        """INSERT OR IGNORE INTO wallet_trades (
+                            wallet, trade_key, ts, side, asset, condition_id,
+                            size, price, title, event_slug, outcome,
+                            outcome_index, raw_json)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            wallet, key, int(t.get("timestamp") or 0),
+                            (t.get("side") or "").upper(),
+                            t.get("asset") or "", t.get("conditionId"),
+                            float(t.get("size") or 0.0),
+                            float(t.get("price") or 0.0),
+                            t.get("title"), t.get("eventSlug"),
+                            t.get("outcome"),
+                            int(t["outcomeIndex"]) if t.get("outcomeIndex") is not None else None,
+                            json.dumps(t),
+                        ),
+                    )
+                    n += c.total_changes
+                except sqlite3.Error:
+                    pass
+        return n
+
+    def get_wallet_trades(self, wallet: str) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT raw_json FROM wallet_trades WHERE wallet=? ORDER BY ts",
+                (wallet,)).fetchall()
+        out: list[dict] = []
+        for r in rows:
+            try:
+                out.append(json.loads(r["raw_json"]))
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return out
+
+    def get_wallet_cursor(self, wallet: str) -> int | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT last_ts FROM wallet_cursors WHERE wallet=?",
+                (wallet,)).fetchone()
+            return int(row["last_ts"]) if row else None
+
+    def set_wallet_cursor(self, wallet: str, last_ts: int) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO wallet_cursors (wallet, last_ts, last_pulled_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(wallet) DO UPDATE SET last_ts=excluded.last_ts,
+                        last_pulled_at=excluded.last_pulled_at""",
+                (wallet, int(last_ts), utcnow_iso()))
+
+    def list_roster(self) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute("SELECT * FROM roster").fetchall())
+
+    def get_roster_state(self, wallet: str) -> dict:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT hysteresis_state_json FROM roster WHERE wallet=?",
+                (wallet,)).fetchone()
+            if not row:
+                return {}
+            try:
+                return json.loads(row["hysteresis_state_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                return {}
+
+    def upsert_roster(self, wallet: str, entered_at: str | None,
+                       exited_at: str | None, score: float | None,
+                       rank: int | None, status: str,
+                       hysteresis: dict) -> None:
+        with self._conn() as c:
+            row = c.execute("SELECT wallet FROM roster WHERE wallet=?",
+                             (wallet,)).fetchone()
+            if row:
+                c.execute(
+                    """UPDATE roster SET entered_at=?, exited_at=?, score=?,
+                        rank=?, status=?, hysteresis_state_json=? WHERE wallet=?""",
+                    (entered_at, exited_at, score, rank, status,
+                     json.dumps(hysteresis), wallet))
+            else:
+                c.execute(
+                    """INSERT INTO roster (wallet, entered_at, exited_at,
+                        score, rank, status, hysteresis_state_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (wallet, entered_at, exited_at, score, rank, status,
+                     json.dumps(hysteresis)))
+
+    def upsert_scout_snapshot(self, date_iso: str, wallet: str,
+                                rank: int | None, score: float | None,
+                                passed: bool, reason: str | None,
+                                metrics: dict) -> None:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO scout_snapshots (date, wallet, rank, score,
+                    passed_filters, exclusion_reason, metrics_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(date, wallet) DO UPDATE SET
+                    rank=excluded.rank, score=excluded.score,
+                    passed_filters=excluded.passed_filters,
+                    exclusion_reason=excluded.exclusion_reason,
+                    metrics_json=excluded.metrics_json""",
+                (date_iso, wallet, rank, score,
+                 1 if passed else 0, reason, json.dumps(metrics)))
+
+    def record_copied_trade(self, c: dict[str, Any]) -> int:
+        with self._conn() as con:
+            cur = con.execute(
+                """INSERT INTO copied_trades (
+                    leader_wallet, market_id, token_id, side, leader_price,
+                    leader_size, leader_ts, detection_ts, detection_delay_s,
+                    our_price, price_drift, book_snapshot_json, stake,
+                    shares, status, ts_opened)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    c["leader_wallet"], c["market_id"], c["token_id"],
+                    c["side"], float(c["leader_price"]),
+                    float(c["leader_size"]), int(c["leader_ts"]),
+                    int(c["detection_ts"]), int(c["detection_delay_s"]),
+                    c.get("our_price"), c.get("price_drift"),
+                    c.get("book_snapshot_json"),
+                    float(c["stake"]),
+                    c.get("shares"),
+                    c["status"],
+                    utcnow_iso(),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def count_open_copies(self, leader: str | None = None) -> int:
+        with self._conn() as c:
+            if leader:
+                row = c.execute(
+                    """SELECT COUNT(*) AS n FROM copied_trades
+                       WHERE leader_wallet=? AND status='open'""",
+                    (leader,)).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM copied_trades WHERE status='open'"
+                ).fetchone()
+            return int(row["n"])
+
+    def list_open_copies(self) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT * FROM copied_trades WHERE status='open'").fetchall())
+
+    def settle_copied_trade(self, trade_id: int, our_pnl: float,
+                              leader_pnl_equivalent: float,
+                              exit_reason: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                """UPDATE copied_trades SET status='settled', our_pnl=?,
+                    leader_pnl_equivalent=?, exit_reason=?, closed_at=?
+                    WHERE id=?""",
+                (our_pnl, leader_pnl_equivalent, exit_reason,
+                 utcnow_iso(), int(trade_id)))
+
+    def copy_stats(self) -> dict[str, Any]:
+        with self._conn() as c:
+            rows = list(c.execute(
+                """SELECT status, COUNT(*) as n FROM copied_trades GROUP BY status"""
+            ).fetchall())
+            settled = list(c.execute(
+                """SELECT leader_wallet, detection_delay_s, price_drift,
+                          our_pnl, leader_pnl_equivalent
+                     FROM copied_trades WHERE status='settled'""").fetchall())
+        per_leader: dict[str, dict[str, float]] = {}
+        for s in settled:
+            w = s["leader_wallet"]
+            d = per_leader.setdefault(w, {
+                "n": 0, "our_pnl": 0.0, "leader_pnl": 0.0,
+                "delay_sum": 0.0, "drift_sum": 0.0})
+            d["n"] += 1
+            d["our_pnl"] += float(s["our_pnl"] or 0)
+            d["leader_pnl"] += float(s["leader_pnl_equivalent"] or 0)
+            d["delay_sum"] += float(s["detection_delay_s"] or 0)
+            d["drift_sum"] += float(s["price_drift"] or 0)
+        return {
+            "by_status": {r["status"]: int(r["n"]) for r in rows},
+            "settled": len(settled),
+            "per_leader": per_leader,
+        }
 
     def cv_pair_traded_today(self, pair_id: int, strategy: str,
                               direction: str, day_iso: str) -> bool:

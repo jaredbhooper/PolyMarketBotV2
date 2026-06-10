@@ -38,6 +38,7 @@ active_strategies:
   - module: weather
   - module: bucket_arb
   - module: cross_venue_arb
+  - module: copy_trading
 
 strategies:
   dummy:
@@ -80,6 +81,40 @@ strategies:
     execute_fuzzy: false          # NEVER auto-trade FUZZY (source/cutoff/cond mismatch)
     kalshi_categories:            # Kalshi categories to scan (daily weather only by default)
       - Climate and Weather
+
+  # Strategy #4: copy-trading (paper only). Public-data only; no auth.
+  # Discovers candidate wallets via the global /trades tape +
+  # operator-supplied seed_wallets, filters/scores per the build spec,
+  # and paper-copies each ACTIVE roster wallet's new trades at the
+  # current CLOB book (fixed $5 stake, pessimistic fill, 1c slippage).
+  copy_trading:
+    stake_usd: 5.00
+    slippage_cents: 0.01
+    max_open_total: 40
+    max_open_per_leader: 8
+    discovery_pages: 5             # global /trades pages to aggregate for candidates
+    discovery_top_n: 200
+    max_trade_pages_per_wallet: 20
+    backtest_lookback_days: 90
+    backtest_penalty_cents: 0.02   # historical fill penalty (no historical books)
+    seed_wallets: []               # optional list of 0x... wallets to always include
+    score_weights:
+      roi_lifetime: 0.40
+      consistency: 0.25
+      niche_concentration: 0.20
+      roi_recent: 0.15
+    hard_filters:
+      min_track_record_days: 90
+      min_resolved_trades: 30
+      max_avg_entry_price: 0.88
+      max_days_since_last_trade: 14
+      max_top_single_trade_share: 0.40
+    hysteresis:
+      roster_size: 15
+      exit_below_rank: 25
+      exit_below_consecutive: 3
+      enter_above_rank: 10
+      enter_above_consecutive: 2
 
   weather:
     edge_threshold: 0.08            # override default

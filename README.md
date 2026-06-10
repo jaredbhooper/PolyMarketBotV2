@@ -713,6 +713,120 @@ The `cv` command runs only the cross-venue detector; `python main.py
 cycle` runs all active strategies in one pass (weather + bucket_arb +
 cross_venue_arb).
 
+## Strategy #4: Copy-trading (paper)
+
+PAPER ONLY. Public endpoints only - no wallet credentials, no order
+placement, no signing libraries imported anywhere. Every endpoint used
+is documented in `docs/api_notes.md` from a live probe; we never
+fabricate fields.
+
+### Three concerns, one module (`strategies/copy_trading.py`)
+
+- **SCOUT** - roster build.
+  - Discover candidates via the global `/trades` tape (paginate N pages
+    and rank by USD activity) merged with `seed_wallets` from config.
+    The public leaderboard endpoint promised in the build spec **does
+    not exist** on data-api.polymarket.com - see `docs/api_notes.md`
+    for the full list of 404s I probed. Auto-discovery via the trade
+    tape is the substitute; a future leaderboard slots in cleanly via
+    a third discovery source.
+  - For each candidate, pull `/trades?user=<wallet>` incrementally
+    using a per-wallet cursor (`wallet_cursors`), persist in
+    `wallet_trades` (dedupe on `(transactionHash, asset, side)`).
+  - Compute per-wallet metrics: track-record days, resolved-trade
+    count, deployed USD, realized P&L on round-trip positions, ROI
+    per trade, avg entry price, top single-close share of profit
+    (lottery-winner detector), 6-month consistency, dominant category
+    share, 30-day recent ROI.
+  - **Hard filters** (any failure excludes the wallet, logged with a
+    reason):
+    - track record < 90d → excluded
+    - resolved trades < 30 → excluded
+    - avg entry price > 0.88 → excluded (the **favorite-grinder trap**)
+    - days since last trade > 14 → excluded (nothing to copy)
+    - top single-close share > 40% → excluded (lottery-winner profile)
+    - lifetime ROI ≤ 0 or 30d ROI ≤ 0 → excluded
+  - **Score** = 0.40 × lifetime ROI + 0.25 × consistency + 0.20 ×
+    dominant-category share + 0.15 × 30d ROI. Weights are in config.
+  - **Roster** (size 15 by default) with hysteresis: a wallet enters
+    only after 2 consecutive scouts above rank 10; exits only after
+    3 consecutive scouts below rank 25. Persistent in `roster` with
+    per-wallet `hysteresis_state_json`.
+
+- **FOLLOWER** - per-cycle paper copy.
+  - For each ACTIVE roster wallet, pull trades since cursor, insert
+    each new trade into `copied_trades`.
+  - Simulate the $5 stake's fill against the **current** CLOB book
+    (`scanner.fetch_book(token_id)`): BUY walks the asks ascending
+    (+ 1c slippage); SELL walks the bids descending (- 1c slippage).
+    The fill row records BOTH the leader's price AND ours, side by
+    side, plus the top-3 book levels we walked through.
+  - **Honesty rule**: if $5 cannot be filled within the visible book,
+    we record `status='unfillable'` and do NOT invent a fill. The
+    spec calls that valuable data, not an error.
+  - Exposure caps from config: 40 open copies total, 8 per leader.
+    At cap we record `status='skipped_cap'` so we know what we missed.
+
+- **GRADER** - settle copied trades.
+  - For each open copy whose market has resolved on Gamma, settle
+    with our P&L (at our fill price) and the leader-equivalent P&L
+    ($5 at THEIR price). The aggregate difference = **measured
+    latency tax**. Per-leader aggregates surface in `copy-stats`.
+
+### Backtester
+
+`python main.py copy-backtest` replays each candidate wallet's last
+90 days assuming a flat $5 stake at `leader_price + $0.02` penalty
+(historical books are unavailable). Output is explicitly marked
+**ESTIMATE** in every column. Ranks candidates; **does not predict
+returns**.
+
+### Schema additions
+
+- `wallets` - per-wallet metrics snapshot.
+- `wallet_trades` - persisted trade history, primary key on
+  `(wallet, trade_key)` for cursor-based dedupe.
+- `wallet_cursors` - last-pulled timestamp per wallet.
+- `roster` - active leaders + hysteresis counters.
+- `scout_snapshots` - one row per (date, wallet) with rank, score,
+  passed/excluded + reason. Auditable.
+- `copied_trades` - paper positions with both leader_price and
+  our_price stored side by side, plus detection_delay_s,
+  price_drift, status (`open | settled | unfillable | skipped_cap`),
+  our_pnl, leader_pnl_equivalent.
+
+### Config knobs
+
+```yaml
+strategies:
+  copy_trading:
+    stake_usd: 5.00
+    slippage_cents: 0.01
+    max_open_total: 40
+    max_open_per_leader: 8
+    discovery_pages: 5
+    seed_wallets: []
+    score_weights: {roi_lifetime: 0.40, consistency: 0.25, ...}
+    hard_filters: {min_track_record_days: 90, ...}
+    hysteresis: {roster_size: 15, ...}
+```
+
+### CLI
+
+```bash
+python main.py scout            # daily scout: discover, filter, score, roster
+python main.py follow           # follower cycle: copy new trades from roster
+python main.py copy-backtest    # replay last 90d (ESTIMATES only)
+```
+
+### What this first 30 days actually delivers
+
+The deliverable is **the per-wallet latency-tax table**, not a P&L
+forecast. Detection delay on this infrastructure is **minutes, not
+seconds** - between cycles the leader's price has often moved. We
+measure that bleed honestly so future infrastructure decisions
+(faster cron, websockets, etc.) can be cost-justified or killed.
+
 ## Honest expectations
 
 Read sec 11 of the build plan. Week 1 is a systems test, not a verdict.

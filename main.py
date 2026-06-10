@@ -66,6 +66,11 @@ def _is_cv_strategy(s: Strategy) -> bool:
     return hasattr(s, "scan_cv") and callable(getattr(s, "scan_cv", None))
 
 
+def _is_copy_strategy(s: Strategy) -> bool:
+    """A copy-trading strategy implements `follow`."""
+    return hasattr(s, "follow") and callable(getattr(s, "follow", None))
+
+
 def run_cv_cycle(strategy, scanner: Scanner, ledger: Ledger, cfg: dict,
                   verbose: bool = True) -> dict:
     """Cross-venue cycle: pair Polymarket markets with Kalshi markets via
@@ -362,6 +367,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("arb-stats", help="print gap-distribution diagnostics for arb")
     sub.add_parser("cv", help="run the cross-venue arb (Polymarket x Kalshi) only")
     sub.add_parser("cv-stats", help="print cross-venue pair + gap diagnostics")
+    sub.add_parser("scout", help="run the copy-trading scout: build/update roster")
+    sub.add_parser("follow", help="run the copy-trading follower cycle once")
+    sub.add_parser("copy-backtest", help="copy-trading backtest table (ESTIMATEs)")
     args = p.parse_args(argv)
 
     if args.cmd == "cycle":
@@ -424,7 +432,69 @@ def main(argv: list[str] | None = None) -> int:
         ledger = Ledger(cfg["database"]["path"])
         print_cv_stats(cfg, ledger)
         return 0
+    if args.cmd == "scout":
+        return _run_scout()
+    if args.cmd == "follow":
+        return _run_follow()
+    if args.cmd == "copy-backtest":
+        return _run_copy_backtest()
     return 2
+
+
+def _run_scout() -> int:
+    from foundation.polymarket_data import PolymarketData
+    cfg = load_config()
+    ledger = Ledger(cfg["database"]["path"])
+    data = PolymarketData()
+    strategies = load_strategies(cfg)
+    for s in strategies:
+        if _is_copy_strategy(s):
+            res = s.scout(data, ledger, verbose=True)
+            print("scout:", res["candidates"], "candidates ->",
+                  res["survivors"], "filtered ->",
+                  res["roster_size"], "active roster")
+            for r in res["roster"][:10]:
+                print(f"  ACTIVE rank={r['rank']} score={r['score']} {r['wallet']}")
+            return 0
+    print("No copy_trading strategy active.")
+    return 0
+
+
+def _run_follow() -> int:
+    from foundation.polymarket_data import PolymarketData
+    cfg = load_config()
+    ledger = Ledger(cfg["database"]["path"])
+    scanner = Scanner(cfg)
+    data = PolymarketData()
+    strategies = load_strategies(cfg)
+    for s in strategies:
+        if _is_copy_strategy(s):
+            res = s.follow(data, scanner, ledger, verbose=True)
+            print(f"follow: leaders={res['leaders']} copied={res['copied']} "
+                  f"unfillable={res['unfillable']} skipped_cap={res['skipped_cap']}")
+            return 0
+    print("No copy_trading strategy active.")
+    return 0
+
+
+def _run_copy_backtest() -> int:
+    from foundation.polymarket_data import PolymarketData
+    cfg = load_config()
+    ledger = Ledger(cfg["database"]["path"])
+    data = PolymarketData()
+    strategies = load_strategies(cfg)
+    for s in strategies:
+        if _is_copy_strategy(s):
+            rows = s.backtest(data, ledger, verbose=True)
+            print(f"\nCopy backtest (last {s.backtest_lookback_days}d, ESTIMATES):")
+            print(f"{'wallet':44s} {'trades':>7s} {'buys':>5s} {'est PnL':>10s}  flag")
+            for r in rows[:20]:
+                print(f"  {r['wallet']:44s} {r['trades_replayed']:>7d} "
+                      f"{r['buys']:>5d} ${r['estimated_pnl_usd']:>+9.2f}  "
+                      f"{r['estimate_marker']}")
+            return 0
+    print("No copy_trading strategy active.")
+    return 0
 
 
 def print_cv_stats(cfg: dict, ledger: Ledger) -> None:
