@@ -19,7 +19,7 @@ def print_report(cfg_path: str = "config.yaml") -> None:
     cfg = _cfg(cfg_path)
     ledger = Ledger(cfg["database"]["path"])
     starting = float(cfg.get("paper", {}).get("starting_bankroll", 1000.0))
-    print(f"=== PolyMarketBotV1 daily report  ({datetime.now(timezone.utc).isoformat(timespec='seconds')}) ===")
+    print(f"=== PolyMarketBotV2 daily report  ({datetime.now(timezone.utc).isoformat(timespec='seconds')}) ===")
     print(f"Starting bankroll per strategy: ${starting:.2f}")
     print()
 
@@ -92,7 +92,7 @@ def print_master_report(cfg_path: str = "config.yaml") -> None:
     ledger = Ledger(cfg["database"]["path"])
     today = datetime.now(timezone.utc).date().isoformat()
 
-    print(f"=== PolyMarketBotV1 master report ({datetime.now(timezone.utc).isoformat(timespec='seconds')}) ===")
+    print(f"=== PolyMarketBotV2 master report ({datetime.now(timezone.utc).isoformat(timespec='seconds')}) ===")
     # ---- Health banner --------------------------------------------------
     stale_cfg = (cfg.get("health") or {}).get("stale_after_hours") or {}
     print(health_banner(ledger, stale_after_hours=stale_cfg))

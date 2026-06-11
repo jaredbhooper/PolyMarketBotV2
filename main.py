@@ -1,4 +1,4 @@
-"""PolyMarketBotV1 entrypoints: cycle, grade, report.
+"""PolyMarketBotV2 entrypoints: cycle, grade, report.
 
 Run via:
   python main.py cycle      # scan + decide + paper-trade

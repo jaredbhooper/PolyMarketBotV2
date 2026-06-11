@@ -51,7 +51,7 @@ class KalshiVenue(Venue):
             "Sports", "Economics", "Financials",
         ]
         self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "PolyMarketBotV1/0.2 (paper)"})
+        self._session.headers.update({"User-Agent": "PolyMarketBotV2/0.2 (paper)"})
         # Lazy-loaded series metadata - the settlement source lives here
         # (it is NOT on the market itself, only on the series).
         self._series_cache: dict[str, dict] = {}

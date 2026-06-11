@@ -153,7 +153,7 @@ class ForecastClient:
     def __init__(self, timeout: int = 30):
         self.timeout = timeout
         self._sess = requests.Session()
-        self._sess.headers.update({"User-Agent": "PolyMarketBotV1/0.1 (weather)"})
+        self._sess.headers.update({"User-Agent": "PolyMarketBotV2/0.1 (weather)"})
         self._cache: dict[tuple[float, float, int], EnsembleForecast] = {}
 
     def _get(self, url: str, params: dict, retries: int = 3) -> dict:

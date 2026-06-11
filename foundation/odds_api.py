@@ -47,7 +47,7 @@ class OddsAPI:
         self.api_key = os.environ.get("ODDS_API_KEY") or ""
         self.observe_mode = not self.api_key
         self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "PolyMarketBotV1/0.5 (paper)"})
+        self._session.headers.update({"User-Agent": "PolyMarketBotV2/0.5 (paper)"})
 
     def budget_status(self) -> dict[str, Any]:
         month = datetime.now(timezone.utc).strftime("%Y-%m")

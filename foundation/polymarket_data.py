@@ -25,7 +25,7 @@ class PolymarketData:
         self.timeout = timeout
         self.sleep = per_request_sleep
         self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "PolyMarketBotV1/0.4 (paper)"})
+        self._session.headers.update({"User-Agent": "PolyMarketBotV2/0.4 (paper)"})
 
     def _get(self, path: str, params: dict | None = None, retries: int = 4):
         url = f"{self.base}{path}"

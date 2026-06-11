@@ -72,7 +72,7 @@ class WundergroundClient:
         self._sess.headers.update({
             # WU's APIs serve happily to a desktop UA; avoid bot pages.
             "User-Agent": (
-                "Mozilla/5.0 (PolyMarketBotV1/0.1; verifying paper-trade settlements)"
+                "Mozilla/5.0 (PolyMarketBotV2/0.1; verifying paper-trade settlements)"
             ),
         })
 

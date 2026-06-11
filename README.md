@@ -22,7 +22,7 @@ and falls back to OBSERVE MODE without one.
 ## Repo layout
 
 ```
-PolyMarketBotV1/
+PolyMarketBotV2/
 ├── main.py                # entrypoints: cycle, scan, grade, report, status
 ├── config.yaml            # active strategies + 5 cities + paper params
 ├── foundation/            # strategy-agnostic, permanent
@@ -948,7 +948,7 @@ violations of strict implication.
 
 ## V2 Operations runbook
 
-PolyMarketBotV1 ships **paper-only**. There are no wallet credentials,
+PolyMarketBotV2 ships **paper-only**. There are no wallet credentials,
 no signing libraries, and no order placement code anywhere in the
 repo. Every API call is read-only against a public endpoint.
 

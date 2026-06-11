@@ -1,4 +1,4 @@
-# PolyMarketBotV1 config
+# PolyMarketBotV2 config
 # Active strategies + their per-strategy settings.
 # Adding a strategy = drop a file in strategies/ and add a row to `active_strategies`.
 

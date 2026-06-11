@@ -102,7 +102,7 @@ class Scanner:
         self.timeout = int(sc.get("request_timeout", 30))
         self.page_limit = int(sc.get("page_limit", 500))
         self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "PolyMarketBotV1/0.1 (paper)"})
+        self._session.headers.update({"User-Agent": "PolyMarketBotV2/0.1 (paper)"})
 
     # ------------------------------------------------------------------ HTTP
     def _get(self, url: str, params: dict | None = None, retries: int = 3):
