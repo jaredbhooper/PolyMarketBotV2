@@ -1,17 +1,23 @@
-# PolyMarketBotV1
+# PolyMarketBotV2
 
-Paper-trading rig for Polymarket. A strategy-agnostic foundation (scanner →
-edge engine → paper executor → SQLite ledger → grader → reporter) wraps a
-pluggable strategy interface. Strategy #1 is a weather/temperature ensemble
-model (Open-Meteo GFS + ECMWF → P(threshold hit)). Strategy #2 is a
-bucket-sum arbitrage detector (sec "Strategy #2" below) — it scans every
-multi-outcome (negRisk) Polymarket event and logs every detected
-complete-set arb gap, paper-trading the ones that clear a configurable
-locked-profit threshold.
+> **PAPER TRADING ONLY.** This repository simulates trades against public
+> market-data endpoints. There are no wallet credentials, no signing
+> libraries, and no order-placement code anywhere in the codebase. All
+> P&L figures are simulated estimates. **NOT FINANCIAL ADVICE.** Do not
+> use any output of this software to make real-money trading decisions
+> without independent verification.
 
-Built per `polymarketbotv1-build-plan_1.md`. Zero spend in paper mode — every
-API used (Polymarket Gamma, Polymarket CLOB, Open-Meteo) is free and
-authenticationless.
+Paper-trading rig for Polymarket (and Kalshi, via the cross-venue
+strategy). A strategy-agnostic foundation (scanner → edge engine →
+paper executor → SQLite ledger → grader → reporter) wraps a pluggable
+strategy interface. Seven strategies ship with V2 — see "Inventory"
+below.
+
+Zero spend in paper mode — every primary API used (Polymarket Gamma,
+Polymarket CLOB, Polymarket data-api, Kalshi, Open-Meteo,
+Wunderground) is free and authenticationless. Sharpline optionally
+reads a free-tier Odds API key from `ODDS_API_KEY` (env or `.env`)
+and falls back to OBSERVE MODE without one.
 
 ## Repo layout
 
@@ -887,6 +893,13 @@ sharp bookmaker odds (Pinnacle and friends via The Odds API).
 - **Honesty**: every row in `sharpline_orders` is tagged
   `estimate_marker='ESTIMATE'`. Maker fills cannot reflect real queue
   position, so all derived P&L is explicitly marked.
+- **Adverse-selection sign convention (project-wide):**
+  `POSITIVE = the line moved AGAINST our position before we got
+  filled — we got picked off; the latency tax.` `NEGATIVE = the line
+  moved IN FAVOR of our position; lucky fill.` Computed as
+  `fair_prob_at_post − line_at_fill` on YES buys and the **negated**
+  difference on NO buys so the sign means the same thing on either
+  side. (Code: `strategies/sharpline.py:simulate_fills_and_grade`.)
 - **Budget**: monthly request counter persists in `odds_api_log`;
   cap default 450, 30-min response cache in `odds_cache`. Caches
   never spend budget.
@@ -978,9 +991,9 @@ they never race.
 
 | file        | cron           | runs |
 |-------------|----------------|------|
-| `cycle.yml` | `*/30 * * * *` | `cycle` + `logic-scan` + `status`. ~5-10 min. |
-| `fast.yml`  | `*/5  * * * *` | `follow` + `sharpline-fill-cycle` + `lp-sim`. Under 1 min. Reads `ODDS_API_KEY` from secrets; without it Sharpline runs OBSERVE MODE. |
-| `daily.yml` | `0 10 * * *`   | `scout` + `grade` + `master-report`. 10:00 UTC. |
+| `cycle.yml` | `*/30 * * * *` | `cycle` + `logic-scan` + `lp-sim` + `status`. ~5-15 min. |
+| `fast.yml`  | `*/5  * * * *` | `follow` + `sharpline-fill-cycle`. Under 1 min. Neither command burns Odds API budget. |
+| `daily.yml` | `0 10 * * *`   | `scout` + **`sharpline-post`** (the only Odds-API-consuming step; sized at ~150 req/month) + `grade` + `master-report`. |
 
 To activate: push to a private GitHub repo, then Settings → Actions
 → General → **Workflow permissions: Read and write** (so the

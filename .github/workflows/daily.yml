@@ -39,14 +39,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Scout + grade + master report
+      - name: Scout + sharpline POST + grade + master report
         env:
           PYTHONUNBUFFERED: "1"
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        # sharpline-post is daily-cadence on purpose: free Odds API tier
+        # is 450 req/month (~15/day). 5 sports * 1 cycle/day = 5 req/day
+        # = 150/month, comfortable under cap. fast.yml runs the
+        # fill-detection lifecycle every 5 min; it never burns budget.
         run: |
           python main.py scout || true
+          python main.py sharpline-post || true
           python main.py grade
           python main.py master-report
 

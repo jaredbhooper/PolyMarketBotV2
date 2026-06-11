@@ -295,14 +295,19 @@ class Sharpline(Strategy):
     #   UNFILLED_RESOLVED  - market resolved unfilled; graded counterfactually
     #                         to learn whether we DODGED a loss or MISSED a win
     #
-    # adverse_selection = fair_prob_at_post - line_at_fill  (signed). A
-    # positive value means the line moved against us between post and
-    # fill - the latency tax we hand back. We don't currently have a
-    # fresh fair_prob at fill time without burning another Odds API
-    # call, so we approximate line_at_fill = the YES ask we got filled
-    # at (the market's own implied probability at that moment). That
-    # makes adverse_selection negative when the market moved in our
-    # favor before filling, positive when it moved against us.
+    # adverse_selection: SIGN CONVENTION (project-wide, see README).
+    #   POSITIVE  = the line moved AGAINST our position before we got
+    #               filled. We got picked off; this is the latency tax.
+    #   NEGATIVE  = the line moved IN FAVOR of our position. Lucky fill.
+    #
+    # For YES buys the line moving down (market values YES less) is bad
+    # for us; for NO buys the line moving up is bad. So:
+    #   YES side: adverse = fair_prob_at_post - line_at_fill
+    #   NO  side: adverse = line_at_fill - fair_prob_at_post
+    #
+    # We approximate line_at_fill = the YES ask we filled against (the
+    # market's own implied P(YES) at that instant). We don't burn an
+    # Odds API call to grab a fresh fair_prob at fill time.
 
     def simulate_fills_and_grade(self, ledger, scanner, gamma_url: str,
                                     bankroll=None,
@@ -386,7 +391,13 @@ class Sharpline(Strategy):
                 # Pay our limit price; line_at_fill = the current best ask
                 # (the market's implied prob at the moment we filled).
                 line_at_fill = best_ask
-                adverse = float(o["fair_prob_at_post"]) - line_at_fill
+                fair = float(o["fair_prob_at_post"])
+                # Sign convention: POSITIVE = picked off. Inverts on NO side
+                # because for NO buys the market moving UP is bad for us.
+                if o["side"] == "YES":
+                    adverse = fair - line_at_fill
+                else:
+                    adverse = line_at_fill - fair
                 ok = True
                 if bankroll is not None:
                     ok = bankroll.try_debit(self.name, float(o["stake_usd"]),
@@ -426,8 +437,16 @@ class Sharpline(Strategy):
             won = (o["side"] == "YES" and yes_price > 0.99) \
                 or (o["side"] == "NO" and yes_price < 0.01)
             stake = float(o["stake_usd"])
-            shares = stake / float(o["our_price"])
-            pnl = shares - stake if won else -stake
+            our_price = float(o["our_price"])
+            shares = stake / our_price
+            # Polymarket per-category quadratic taker fee on the BUY.
+            # League maps to a category via foundation.fees.
+            from foundation.fees import polymarket_taker_fee_per_share
+            fee_per_share = polymarket_taker_fee_per_share(
+                our_price, category=(o["league"] or "sports"))
+            fees_paid = fee_per_share * shares
+            pnl_gross = shares - stake if won else -stake
+            pnl = pnl_gross - fees_paid
             ledger.update_sharpline_order(
                 int(o["id"]),
                 resolved_outcome="WIN" if won else "LOSS",

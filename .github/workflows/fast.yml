@@ -38,23 +38,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Fast strategies (copy follower + sharpline + lp_sim)
+      - name: Fast strategies (copy follower + sharpline fill cycle)
         env:
           PYTHONUNBUFFERED: "1"
-          # Read-only odds key, optional. Without it sharpline runs in
-          # OBSERVE MODE (logs spreads, posts nothing). Add to repo
-          # Settings -> Secrets and variables -> Actions to enable
-          # real fair-prob computation.
+          # ODDS_API_KEY passed for symmetry but neither command below
+          # burns Odds-API budget: follower hits data-api.polymarket.com;
+          # sharpline-fill-cycle only checks the CLOB book against
+          # already-posted resting orders. Fresh odds (and posting) live
+          # in daily.yml, sized to the free-tier 450 req/month cap.
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # Each command is idempotent: cursor-tracked / TTL-cached /
-          # nothing-to-do if nothing changed. Any single failure does
-          # NOT block the others (`|| true` swallows non-zero exits).
+          # Both commands are idempotent: cursor-tracked / nothing-to-do
+          # if nothing changed. Any single failure does NOT block the
+          # other (`|| true` swallows non-zero exits). LP-Sim moved to
+          # cycle.yml because it requires a full Polymarket book scan
+          # that doesn't fit fast.yml's 4-minute budget.
           python main.py follow || true
           python main.py sharpline-fill-cycle || true
-          python main.py lp-sim || true
 
       - name: Commit ledger
         run: |

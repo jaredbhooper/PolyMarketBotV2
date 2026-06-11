@@ -130,8 +130,18 @@ class LogicScan(Strategy):
                         continue
                     pa = float(a.yes_ask)
                     pb = float(b.yes_ask)
-                    # Subtract fees on each side
-                    margin = pa - pb - 2 * self.fee_pct * max(pa, pb)
+                    # Subtract verified Polymarket per-category quadratic
+                    # fee on each leg. fee_pct (legacy linear scalar)
+                    # is preserved as an override for synthetic tests.
+                    if self.fee_pct > 0:
+                        fees = 2 * self.fee_pct * max(pa, pb)
+                    else:
+                        from foundation.fees import polymarket_taker_fee_per_share
+                        cat_hint = " ".join([a.question or "", a.slug or "",
+                                              (a.extras or {}).get("event_slug") or ""])
+                        fees = (polymarket_taker_fee_per_share(pa, cat_hint)
+                                  + polymarket_taker_fee_per_share(pb, cat_hint))
+                    margin = pa - pb - fees
                     near_miss = (0 < margin < self.min_margin)
                     if margin >= self.min_margin and rel["confidence"] >= self.min_confidence_to_trade:
                         ledger.record_logic_violation({

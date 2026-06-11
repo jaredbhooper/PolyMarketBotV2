@@ -350,11 +350,22 @@ class CrossVenueArb(Strategy):
         if math.isnan(p_vwap2) or math.isnan(k_vwap2):
             return None
 
-        # Fees per share. Polymarket: zero (paper). Kalshi: quadratic.
+        # Fees per share. Both venues use a quadratic schedule. For
+        # Polymarket we look up the per-category rate (weather 1.25%,
+        # sports 0.75%, ...) from foundation.fees - see BUILD_NOTES.md
+        # for the verified 2026-03 table.
+        from foundation.fees import polymarket_taker_fee_per_share
         kal_fee_mult = float((kal.fee_model or {}).get("multiplier", 1.0))
-        # Kalshi fee is on the contract price you pay (the side's vwap).
         kal_fee = kalshi_quadratic_fee(k_vwap2, kal_fee_mult)
-        poly_fee = 0.0
+        # Category hint: cross-venue pairs in scope are daily weather,
+        # so the matcher's bucket key already groups by 'weather' kind.
+        # Fall through to fees.py's default if the hint is missing.
+        category_hint = " ".join([
+            poly.title, poly.leg_title,
+            (poly.extras or {}).get("event_slug") or "",
+            (poly.extras or {}).get("event_title") or "",
+        ])
+        poly_fee = polymarket_taker_fee_per_share(p_vwap2, category=category_hint)
 
         # Slippage and total cost per share.
         p_cost = min(0.99, p_vwap2 + self.poly_slippage_cents) + poly_fee

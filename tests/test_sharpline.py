@@ -212,7 +212,12 @@ def test_touch_does_not_fill(monkeypatch):
 
 
 def test_strict_through_fills_and_records_adverse_selection(monkeypatch):
-    """Best ask STRICTLY BELOW our limit -> FILLED + adverse_selection."""
+    """Best ask STRICTLY BELOW our limit -> FILLED + adverse_selection.
+
+    YES buy. fair=0.60 at post; line=0.45 at fill (market thinks YES is
+    LESS likely than the sharp said). For our long-YES position the line
+    moved AGAINST us -> adverse_selection should be POSITIVE per the
+    project-wide convention (positive = picked off)."""
     monkeypatch.setenv("ODDS_API_KEY", "")
     import foundation.odds_api as oa
     monkeypatch.setattr(oa, "load_dotenv", lambda path=".env": None)
@@ -222,9 +227,6 @@ def test_strict_through_fills_and_records_adverse_selection(monkeypatch):
     oid = _seed_order(ledger, market_id="0xfill", our_price=0.50,
                        fair_prob_at_post=0.60)
     gm = {"closed": False, "clobTokenIds": '["tok_fill","tok_no"]'}
-    # Best ask at 0.45 - strictly below our 0.50 limit. line_at_fill
-    # will be 0.45; adverse_selection = 0.60 - 0.45 = +0.15 (favorable -
-    # the line moved IN OUR direction since post, so positive adverse).
     scanner = FakeBookScanner({"tok_fill":
                                   {"asks": [{"price": "0.45", "size": "100"}]}})
     import requests
@@ -237,25 +239,27 @@ def test_strict_through_fills_and_records_adverse_selection(monkeypatch):
     assert len(filled) == 1
     r = filled[0]
     assert r["line_at_fill"] == pytest.approx(0.45)
+    # 0.60 - 0.45 = +0.15. Positive => picked off per convention.
     assert r["adverse_selection"] == pytest.approx(0.15, abs=1e-6)
+    assert r["adverse_selection"] > 0
     try:
         os.unlink(path)
     except OSError:
         pass
 
 
-def test_adverse_selection_sign_when_line_moves_against(monkeypatch):
-    """fair_prob_at_post 0.60 but market moves to ask 0.65 - adverse_selection
-    must be negative (line moved AGAINST our bid)."""
+def test_adverse_selection_negative_when_line_moves_in_our_favor(monkeypatch):
+    """YES buy at limit 0.70 (we thought fair=0.60). Best ask drops to
+    0.65, we fill. Market now values YES at 0.65 > 0.60 fair - so YES
+    became MORE likely vs the sharp; that's good for our long-YES
+    position. adverse_selection must be NEGATIVE (line moved IN FAVOR
+    of us per the project-wide convention)."""
     monkeypatch.setenv("ODDS_API_KEY", "")
     import foundation.odds_api as oa
     monkeypatch.setattr(oa, "load_dotenv", lambda path=".env": None)
     ledger, path = _temp_ledger()
     cfg = {"strategies": {"sharpline": {}}}
     s = Sharpline(cfg)
-    # We posted at 0.70 thinking fair was 0.60. The best ask drops to
-    # 0.65 < 0.70 so we fill - but the market now thinks YES is more
-    # likely (0.65 > 0.60 fair), so adverse_selection should be NEGATIVE.
     _seed_order(ledger, market_id="0xadv", our_price=0.70,
                  fair_prob_at_post=0.60)
     gm = {"closed": False, "clobTokenIds": '["tok_adv","tok_no"]'}
@@ -266,7 +270,46 @@ def test_adverse_selection_sign_when_line_moves_against(monkeypatch):
                           lambda: FakeGammaSession({"0xadv": gm}))
     s.simulate_fills_and_grade(ledger, scanner, "http://gamma", verbose=False)
     r = ledger.list_sharpline_orders("FILLED")[0]
-    assert r["adverse_selection"] < 0   # 0.60 - 0.65 = -0.05
+    # 0.60 - 0.65 = -0.05; negative => line moved in favor of us.
+    assert r["adverse_selection"] < 0
+    assert r["adverse_selection"] == pytest.approx(-0.05, abs=1e-6)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def test_adverse_selection_sign_for_no_side_inverts(monkeypatch):
+    """NO buy. fair P(YES)=0.60 at post. line_at_fill = 0.55 (market
+    thinks YES less likely now -> NO became MORE valuable -> favorable
+    for our long-NO). adverse should be NEGATIVE.
+
+    Mirror: line_at_fill = 0.65 (market thinks YES MORE likely now ->
+    NO became LESS valuable -> picked off). adverse should be POSITIVE.
+    """
+    monkeypatch.setenv("ODDS_API_KEY", "")
+    import foundation.odds_api as oa
+    monkeypatch.setattr(oa, "load_dotenv", lambda path=".env": None)
+    ledger, path = _temp_ledger()
+    cfg = {"strategies": {"sharpline": {}}}
+    s = Sharpline(cfg)
+    # Favorable NO case: line moves DOWN from sharp's 0.60 to 0.55.
+    # For a NO buy on YES-token-NO we don't actually walk the NO ask
+    # book; we use the SAME _simulate path. Seed an order side='NO' and
+    # let it fill against an ask < limit.
+    _seed_order(ledger, market_id="0xnofav", side="NO",
+                 our_price=0.50, fair_prob_at_post=0.60)
+    gm = {"closed": False, "clobTokenIds": '["tok_nofav","tok_no"]'}
+    scanner = FakeBookScanner({"tok_nofav":
+                                  {"asks": [{"price": "0.45", "size": "100"}]}})
+    import requests
+    monkeypatch.setattr(requests, "Session",
+                          lambda: FakeGammaSession({"0xnofav": gm}))
+    s.simulate_fills_and_grade(ledger, scanner, "http://gamma", verbose=False)
+    r = ledger.list_sharpline_orders("FILLED")[0]
+    # NO side: adverse = line - fair = 0.45 - 0.60 = -0.15 (line down =>
+    # YES less likely => good for our NO).
+    assert r["adverse_selection"] == pytest.approx(-0.15, abs=1e-6)
     try:
         os.unlink(path)
     except OSError:

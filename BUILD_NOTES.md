@@ -76,14 +76,20 @@ Three scheduled workflows. **Files committed locally; never run or
 verified from this machine.** Push to a repo with Workflows enabled
 to activate:
 
-- `cycle.yml` — `*/30 * * * *`. Runs `python main.py cycle` + logic-scan +
-  status. Commits `polymarketbot.db` back to the branch.
-- `fast.yml` — `*/5 * * * *`. Runs `follow`, `sharpline-fill-cycle`, and
-  `lp-sim`. Each command is idempotent and finishes within the
-  workflow's 4-minute timeout. `ODDS_API_KEY` is read from repo
-  secrets; without it Sharpline runs in OBSERVE MODE.
-- `daily.yml` — `0 10 * * *`. Runs `scout`, `grade`, and
-  `master-report`.
+- `cycle.yml` — `*/30 * * * *`. Runs `python main.py cycle` +
+  `logic-scan` + `lp-sim` + `status`. logic-scan and lp-sim live here
+  (not in `fast.yml`) because both require a full Polymarket book
+  scan, which exceeds fast.yml's 4-minute budget.
+- `fast.yml` — `*/5 * * * *`. Runs `follow` + `sharpline-fill-cycle`.
+  NEITHER command burns Odds API budget - the follower hits
+  `data-api.polymarket.com`; sharpline-fill-cycle only checks the
+  CLOB book against already-resting orders. `ODDS_API_KEY` is passed
+  in (for symmetry / future expansion) but consumed only by
+  `sharpline-post` which runs in `daily.yml`.
+- `daily.yml` — `0 10 * * *`. Runs `scout`, `sharpline-post` (the
+  only Odds-API-consuming command — sized at 5 sports × 1 cycle/day
+  = ~150 req/month, comfortably under the free tier's 450 cap),
+  `grade`, and `master-report`.
 
 All three share `concurrency.group: polymarketbot-state` so they
 never race on the `git push` back to main.
