@@ -58,11 +58,22 @@ jobs:
           python main.py follow || true
           python main.py sharpline-fill-cycle || true
 
+      - name: Guard ledger.db size (must be <= 50 MB)
+        run: |
+          if [ -f ledger.db ]; then
+            sz=$(stat -c%s ledger.db)
+            echo "ledger.db size: $((sz/1024/1024)) MB ($sz bytes)"
+            if [ "$sz" -gt 52428800 ]; then
+              echo "::error::ledger.db exceeds 50 MB cap"
+              exit 1
+            fi
+          fi
+
       - name: Commit ledger
         run: |
           git config user.name "polymarketbot"
           git config user.email "bot@users.noreply.github.com"
-          git add polymarketbot.db || true
+          git add ledger.db || true
           if git diff --cached --quiet; then
             echo "no db changes to commit"
             exit 0

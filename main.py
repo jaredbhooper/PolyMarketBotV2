@@ -18,7 +18,7 @@ import yaml
 from foundation.bankroll import Bankroll
 from foundation.executor import Executor, CycleDecision
 from foundation.health import HealthSession, banner as health_banner
-from foundation.ledger import Ledger
+from foundation.ledger import Ledger, ledger_from_cfg
 from foundation.scanner import Scanner, render_scanner_table
 from strategies.base import ArbEvent, Market, Strategy
 
@@ -256,7 +256,7 @@ def run_arb_cycle(strategy, scanner: Scanner, ledger: Ledger,
 def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
           tag: str | None = None) -> dict:
     cfg = load_config(cfg_path)
-    ledger = Ledger(cfg["database"]["path"])
+    ledger = ledger_from_cfg(cfg)
     scanner = Scanner(cfg)
     executor = Executor(cfg, ledger)
     bankroll = Bankroll(cfg, ledger)
@@ -427,6 +427,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("sharpline-fill-cycle", help="run sharpline fill-and-grade lifecycle")
     sub.add_parser("lp-sim", help="lp-sim quoting estimate pass")
     sub.add_parser("logic-scan", help="logic-scan pair detection + violation check")
+    sub.add_parser("vacuum", help="prune cache.db retention + VACUUM both ledger and cache (daily housekeeping)")
     args = p.parse_args(argv)
 
     if args.cmd == "cycle":
@@ -452,7 +453,7 @@ def main(argv: list[str] | None = None) -> int:
         # everything else through the per-market path; here we want just
         # the event-level pass.
         cfg = load_config()
-        ledger = Ledger(cfg["database"]["path"])
+        ledger = ledger_from_cfg(cfg)
         scanner = Scanner(cfg)
         strategies = load_strategies(cfg)
         ran = False
@@ -467,12 +468,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "arb-stats":
         cfg = load_config()
-        ledger = Ledger(cfg["database"]["path"])
+        ledger = ledger_from_cfg(cfg)
         print_arb_stats(cfg, ledger)
         return 0
     if args.cmd == "cv":
         cfg = load_config()
-        ledger = Ledger(cfg["database"]["path"])
+        ledger = ledger_from_cfg(cfg)
         scanner = Scanner(cfg)
         strategies = load_strategies(cfg)
         ran = False
@@ -486,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "cv-stats":
         cfg = load_config()
-        ledger = Ledger(cfg["database"]["path"])
+        ledger = ledger_from_cfg(cfg)
         print_cv_stats(cfg, ledger)
         return 0
     if args.cmd == "scout":
@@ -501,7 +502,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "sharpline-post":
         cfg = load_config()
-        ledger = Ledger(cfg["database"]["path"])
+        ledger = ledger_from_cfg(cfg)
         scanner = Scanner(cfg)
         universe = scan_all(cfg, scanner, fetch_books=True)
         from strategies.sharpline import Sharpline
@@ -513,7 +514,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "sharpline-fill-cycle":
         cfg = load_config()
-        ledger = Ledger(cfg["database"]["path"])
+        ledger = ledger_from_cfg(cfg)
         scanner = Scanner(cfg)
         br = Bankroll(cfg, ledger)
         from strategies.sharpline import Sharpline
@@ -527,7 +528,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "lp-sim":
         cfg = load_config()
-        ledger = Ledger(cfg["database"]["path"])
+        ledger = ledger_from_cfg(cfg)
         scanner = Scanner(cfg)
         universe = scan_all(cfg, scanner, fetch_books=True)
         from strategies.lp_sim import LPSim
@@ -537,9 +538,22 @@ def main(argv: list[str] | None = None) -> int:
             h.markets_scanned = len(universe)
             h.fills = r.get("rows_logged", 0)
         return 0
+    if args.cmd == "vacuum":
+        cfg = load_config()
+        ledger = ledger_from_cfg(cfg)
+        keep = (cfg.get("retention") or {})
+        pruned = ledger.prune_cache(
+            snapshots_keep_days=int(keep.get("snapshots_keep_days", 7)),
+            gaps_keep_days=int(keep.get("gaps_keep_days", 7)),
+        )
+        sizes = ledger.vacuum()
+        print(f"  pruned: {pruned}")
+        print(f"  ledger.db: {sizes.get('ledger_bytes', 0)/1024/1024:.2f} MB")
+        print(f"  cache.db:  {sizes.get('cache_bytes', 0)/1024/1024:.2f} MB")
+        return 0
     if args.cmd == "logic-scan":
         cfg = load_config()
-        ledger = Ledger(cfg["database"]["path"])
+        ledger = ledger_from_cfg(cfg)
         scanner = Scanner(cfg)
         universe = scan_all(cfg, scanner, fetch_books=True)
         from strategies.logic_scan import LogicScan
@@ -551,7 +565,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "bankroll":
         cfg = load_config()
-        ledger = Ledger(cfg["database"]["path"])
+        ledger = ledger_from_cfg(cfg)
         br = Bankroll(cfg, ledger)
         snap = br.snapshot()
         print("strategy           pct   start     cash   exposure  available")
@@ -575,7 +589,7 @@ def main(argv: list[str] | None = None) -> int:
 def _run_scout() -> int:
     from foundation.polymarket_data import PolymarketData
     cfg = load_config()
-    ledger = Ledger(cfg["database"]["path"])
+    ledger = ledger_from_cfg(cfg)
     data = PolymarketData()
     strategies = load_strategies(cfg)
     for s in strategies:
@@ -594,7 +608,7 @@ def _run_scout() -> int:
 def _run_follow() -> int:
     from foundation.polymarket_data import PolymarketData
     cfg = load_config()
-    ledger = Ledger(cfg["database"]["path"])
+    ledger = ledger_from_cfg(cfg)
     scanner = Scanner(cfg)
     data = PolymarketData()
     strategies = load_strategies(cfg)
@@ -611,7 +625,7 @@ def _run_follow() -> int:
 def _run_copy_backtest() -> int:
     from foundation.polymarket_data import PolymarketData
     cfg = load_config()
-    ledger = Ledger(cfg["database"]["path"])
+    ledger = ledger_from_cfg(cfg)
     data = PolymarketData()
     strategies = load_strategies(cfg)
     for s in strategies:
@@ -643,31 +657,33 @@ def print_cv_stats(cfg: dict, ledger: Ledger) -> None:
     print(f"pair classifications: {pair_stats}")
     for sname in cv_names:
         gap_stats = ledger.cv_gap_stats(sname)
-        with sqlite3.connect(ledger.db_path) as c:
-            c.row_factory = sqlite3.Row
+        c = ledger.raw_connect()
+        try:
             top = list(c.execute(
                 """SELECT g.classification, g.direction,
                           g.locked_profit_per_share, g.locked_profit_usd,
                           g.executable_shares, g.cleared_threshold,
                           g.divergence_risk_note, p.city, p.date,
                           p.poly_leg, p.kalshi_leg
-                     FROM cv_gaps g JOIN cv_pairs p ON p.id = g.pair_id
+                     FROM cache.cv_gaps g JOIN cache.cv_pairs p ON p.id = g.pair_id
                     WHERE g.strategy=? ORDER BY g.locked_profit_per_share DESC
                     LIMIT 10""", (sname,)).fetchall())
             certs = list(c.execute(
                 """SELECT id, city, date, poly_leg, kalshi_leg, poly_source,
                           kalshi_source, divergence_risk_note
-                     FROM cv_pairs WHERE classification='CERTIFIED-IDENTICAL'
+                     FROM cache.cv_pairs WHERE classification='CERTIFIED-IDENTICAL'
                     LIMIT 10""").fetchall())
             fuzzies = list(c.execute(
                 """SELECT id, city, date, poly_leg, kalshi_leg, reason,
                           divergence_risk_note
-                     FROM cv_pairs WHERE classification='FUZZY' LIMIT 10""").fetchall())
+                     FROM cache.cv_pairs WHERE classification='FUZZY' LIMIT 10""").fetchall())
             positions = list(c.execute(
                 """SELECT id, direction, shares, total_cost, expected_payout,
                           locked_profit, divergence_risk_note, status, pnl
                      FROM cv_positions WHERE strategy=?
                     ORDER BY ts DESC""", (sname,)).fetchall())
+        finally:
+            c.close()
         print(f"\n[{sname}] cv_gaps logged: {gap_stats['total']}")
         print(f"  by classification: {gap_stats['by_classification']}")
         print(f"  by direction: {gap_stats['by_direction']}")
@@ -726,12 +742,13 @@ def print_arb_stats(cfg: dict, ledger: Ledger) -> None:
     print("======================================================")
     for sname in arb_names:
         stats = ledger.arb_gap_stats(sname)
-        with sqlite3.connect(ledger.db_path) as c:
-            c.row_factory = sqlite3.Row
+        c = ledger.raw_connect()
+        try:
+            # arb_gaps lives in cache.db; arb_positions in ledger.db.
             full = list(c.execute(
                 """SELECT side, locked_profit_per_share, locked_profit_usd,
                           executable_shares, event_slug, cleared_threshold
-                     FROM arb_gaps
+                     FROM cache.arb_gaps
                     WHERE strategy=? AND walk_mode='full_book'
                     ORDER BY ts DESC LIMIT 50""", (sname,)).fetchall())
             positions = list(c.execute(
@@ -739,6 +756,8 @@ def print_arb_stats(cfg: dict, ledger: Ledger) -> None:
                           expected_payout, locked_profit, status, pnl
                      FROM arb_positions WHERE strategy=?
                     ORDER BY ts DESC""", (sname,)).fetchall())
+        finally:
+            c.close()
         print(f"\n[{sname}] total gap rows logged: {stats['total']} "
               f"(verified MECE: {stats['verified']})")
         print(f"  by walk_mode: {stats['by_mode']}")

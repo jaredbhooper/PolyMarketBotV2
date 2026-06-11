@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import yaml
 
-from foundation.ledger import Ledger
+from foundation.ledger import Ledger, ledger_from_cfg
 
 
 def _cfg(path: str = "config.yaml") -> dict:
@@ -17,7 +17,7 @@ def _cfg(path: str = "config.yaml") -> dict:
 
 def print_report(cfg_path: str = "config.yaml") -> None:
     cfg = _cfg(cfg_path)
-    ledger = Ledger(cfg["database"]["path"])
+    ledger = ledger_from_cfg(cfg)
     starting = float(cfg.get("paper", {}).get("starting_bankroll", 1000.0))
     print(f"=== PolyMarketBotV2 daily report  ({datetime.now(timezone.utc).isoformat(timespec='seconds')}) ===")
     print(f"Starting bankroll per strategy: ${starting:.2f}")
@@ -89,7 +89,7 @@ def print_master_report(cfg_path: str = "config.yaml") -> None:
     from foundation.bankroll import Bankroll
     from foundation.health import banner as health_banner
     cfg = _cfg(cfg_path)
-    ledger = Ledger(cfg["database"]["path"])
+    ledger = ledger_from_cfg(cfg)
     today = datetime.now(timezone.utc).date().isoformat()
 
     print(f"=== PolyMarketBotV2 master report ({datetime.now(timezone.utc).isoformat(timespec='seconds')}) ===")
@@ -216,7 +216,7 @@ def _verdict(sd: dict, min_settled: int, fail_pct: float,
 
 def print_status(cfg_path: str = "config.yaml") -> None:
     cfg = _cfg(cfg_path)
-    ledger = Ledger(cfg["database"]["path"])
+    ledger = ledger_from_cfg(cfg)
     starting = float(cfg.get("paper", {}).get("starting_bankroll", 1000.0))
     with sqlite3.connect(ledger.db_path) as c:
         c.row_factory = sqlite3.Row

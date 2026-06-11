@@ -73,7 +73,24 @@ paper:
   longshot_yes_edge_threshold: 0.15
 
 database:
-  path: polymarketbot.db
+  # Two-DB layout (see foundation/ledger.py).
+  #   ledger_path - committed; the irreplaceable paper-trading record.
+  #                  Must stay under 50 MB (workflows enforce a guard).
+  #   cache_path  - gitignored; rebuildable raw scan data (snapshots,
+  #                  arb_gaps, cv_pairs, wallet_trades, odds cache,
+  #                  lp_sim estimates). Daily.yml prunes + vacuums.
+  ledger_path: ledger.db
+  cache_path: cache.db
+  # Legacy single-path key kept for back-compat with workflow snippets
+  # that still read database.path. Ignored when ledger_path is set.
+  path: ledger.db
+
+# Retention policy for cache.db. The daily.yml workflow calls
+# `python main.py vacuum` which prunes anything older than these
+# thresholds before VACUUMing both databases.
+retention:
+  snapshots_keep_days: 7
+  gaps_keep_days: 7
 
 scanner:
   gamma_url: https://gamma-api.polymarket.com

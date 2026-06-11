@@ -1,14 +1,32 @@
-"""SQLite ledger - the only thing that talks to the DB."""
+"""SQLite ledger. Two databases, attached as one logical store.
+
+  ledger.db (committed; must stay under 50 MB) - the irreplaceable
+    paper-trading record: positions, settlements, bankroll, equity,
+    health, daily/scout reports, sharpline orders, logic violations,
+    arb_positions / arb_multi / cv_positions, plus the lookup tables
+    they reference (markets, signals).
+
+  cache.db (gitignored; rebuildable) - raw data the workflows can
+    re-pull on demand: scan snapshots, arb_gaps detail, cv_pairs +
+    cv_gaps detail, wallet trade history, odds api response cache,
+    lp_sim estimates.
+
+The Ledger class always operates on a single SQLite connection with
+cache.db attached as schema name `cache`. All cache-table queries are
+prefixed accordingly (e.g. `INSERT INTO cache.snapshots ...`). The
+classification source-of-truth is `tools/migrate_split_db.py`.
+"""
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA = """
+LEDGER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   condition_id TEXT UNIQUE NOT NULL,
@@ -21,16 +39,6 @@ CREATE TABLE IF NOT EXISTS markets (
   resolution_source TEXT,
   rules_text TEXT,
   created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS snapshots (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  market_id INTEGER NOT NULL,
-  ts TEXT NOT NULL,
-  yes_ask REAL, yes_bid REAL,
-  no_ask REAL, no_bid REAL,
-  book_depth_usd REAL,
-  FOREIGN KEY(market_id) REFERENCES markets(id)
 );
 
 CREATE TABLE IF NOT EXISTS signals (
@@ -86,33 +94,6 @@ CREATE TABLE IF NOT EXISTS daily_report (
 );
 
 -- Bucket-sum arbitrage detector tables (strategy #2).
--- arb_gaps logs EVERY detected gap (even sub-threshold) so we can measure
--- how often real, fillable complete sets actually exist in the wild.
-CREATE TABLE IF NOT EXISTS arb_gaps (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts TEXT NOT NULL,
-  strategy TEXT NOT NULL,
-  event_id TEXT NOT NULL,
-  event_slug TEXT,
-  event_title TEXT,
-  n_legs INTEGER NOT NULL,
-  completeness_verified INTEGER NOT NULL,    -- 1 if MECE confirmed
-  completeness_note TEXT,
-  side TEXT NOT NULL,                        -- YES or NO
-  walk_mode TEXT NOT NULL,                   -- 'gamma_only' or 'full_book'
-  target_shares REAL,
-  executable_shares REAL,                    -- min fillable across legs
-  sum_vwap_per_share REAL,                   -- sum of leg VWAPs
-  slippage_per_share REAL,                   -- N * slippage_cents
-  safety_buffer REAL,
-  payout_per_share REAL,                     -- 1.0 (YES) or N-1 (NO)
-  locked_profit_per_share REAL,              -- payout - sum_vwap - slippage - buffer
-  locked_profit_usd REAL,                    -- profit_per_share * executable_shares
-  end_date_iso TEXT,
-  legs_json TEXT,                            -- per-leg vwap, depth, levels
-  cleared_threshold INTEGER NOT NULL DEFAULT 0
-);
-
 -- An arb_positions row is one paper-traded complete-set arb. Each row links
 -- to N arb_legs (one per outcome). All N legs settle together when the
 -- event resolves.
@@ -152,56 +133,8 @@ CREATE TABLE IF NOT EXISTS arb_legs (
 );
 
 -- Cross-venue (Polymarket x Kalshi) arbitrage tables (strategy #3).
--- cv_pairs is one row per matched candidate pair, persistent across
--- cycles. The equivalence classification + per-criterion verdicts +
--- divergence_risk_note all live here. The detector re-uses the pair
--- row to log each cycle's gap into cv_gaps.
-CREATE TABLE IF NOT EXISTS cv_pairs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts_first_seen TEXT NOT NULL,
-  ts_last_classified TEXT NOT NULL,
-  poly_market_id TEXT NOT NULL,
-  kalshi_ticker TEXT NOT NULL,
-  poly_title TEXT,
-  kalshi_title TEXT,
-  poly_leg TEXT,
-  kalshi_leg TEXT,
-  poly_close TEXT,
-  kalshi_close TEXT,
-  poly_source TEXT,
-  kalshi_source TEXT,
-  city TEXT,
-  date TEXT,
-  classification TEXT NOT NULL,        -- CERTIFIED-IDENTICAL | FUZZY | NON-MATCH
-  reason TEXT,
-  criteria_json TEXT,
-  divergence_risk_note TEXT,
-  UNIQUE(poly_market_id, kalshi_ticker)
-);
-
-CREATE TABLE IF NOT EXISTS cv_gaps (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts TEXT NOT NULL,
-  strategy TEXT NOT NULL,
-  pair_id INTEGER NOT NULL,
-  direction TEXT NOT NULL,             -- 'POLY_YES_KAL_NO' or 'POLY_NO_KAL_YES'
-  classification TEXT NOT NULL,
-  poly_vwap REAL,
-  poly_fee REAL,                       -- per-share USD
-  kalshi_vwap REAL,
-  kalshi_fee REAL,
-  safety_buffer REAL,
-  target_shares REAL,
-  executable_shares REAL,
-  total_cost_per_share REAL,
-  locked_profit_per_share REAL,
-  locked_profit_usd REAL,
-  divergence_risk_note TEXT,
-  cleared_threshold INTEGER NOT NULL DEFAULT 0,
-  legs_json TEXT,                      -- per-leg detail incl. consumed levels
-  FOREIGN KEY(pair_id) REFERENCES cv_pairs(id)
-);
-
+-- cv_pairs / cv_gaps live in cache.db; cv_positions + cv_legs are the
+-- paper-traded record and live in ledger.db.
 CREATE TABLE IF NOT EXISTS cv_positions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   strategy TEXT NOT NULL,
@@ -235,10 +168,8 @@ CREATE TABLE IF NOT EXISTS cv_legs (
   FOREIGN KEY(position_id) REFERENCES cv_positions(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_snapshots_market ON snapshots(market_id, ts);
 CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market_id, strategy, ts);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status, strategy);
-CREATE INDEX IF NOT EXISTS idx_arb_gaps_event ON arb_gaps(event_id, ts);
 CREATE INDEX IF NOT EXISTS idx_arb_positions_status ON arb_positions(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_legs_position ON arb_legs(position_id);
 -- SHARPLINE / LP-SIM / LOGIC-SCAN (Prompt C). All paper-only.
@@ -249,12 +180,6 @@ CREATE TABLE IF NOT EXISTS odds_api_log (
   month TEXT NOT NULL,
   sport TEXT NOT NULL,
   status_code INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS odds_cache (
-  sport TEXT PRIMARY KEY,
-  fetched_at TEXT NOT NULL,
-  payload_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sharpline_matches (
@@ -288,20 +213,6 @@ CREATE TABLE IF NOT EXISTS sharpline_orders (
   adverse_selection REAL,               -- fair_prob_at_post - line_at_fill (signed)
   resolved_outcome TEXT,                -- WIN | LOSS | VOID once settled
   realized_pnl REAL,
-  estimate_marker TEXT NOT NULL DEFAULT 'ESTIMATE'
-);
-
-CREATE TABLE IF NOT EXISTS lp_sim_state (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts TEXT NOT NULL,
-  poly_market_id TEXT NOT NULL,
-  quote_spread REAL NOT NULL,
-  quote_size REAL NOT NULL,
-  score REAL NOT NULL,
-  est_share_of_pool REAL NOT NULL,
-  est_daily_reward_usd REAL NOT NULL,
-  est_trading_pnl_usd REAL NOT NULL,
-  adverse_selection_usd REAL NOT NULL,
   estimate_marker TEXT NOT NULL DEFAULT 'ESTIMATE'
 );
 
@@ -405,37 +316,9 @@ CREATE TABLE IF NOT EXISTS arb_multi (
   end_date_iso TEXT
 );
 
--- Copy-trading (strategy #4) tables.
-CREATE TABLE IF NOT EXISTS wallets (
-  wallet TEXT PRIMARY KEY,
-  first_seen TEXT NOT NULL,
-  last_scouted TEXT,
-  metrics_json TEXT
-);
-
-CREATE TABLE IF NOT EXISTS wallet_trades (
-  wallet TEXT NOT NULL,
-  trade_key TEXT NOT NULL,            -- f"{transactionHash}:{asset}:{side}"
-  ts INTEGER NOT NULL,
-  side TEXT NOT NULL,
-  asset TEXT NOT NULL,
-  condition_id TEXT,
-  size REAL NOT NULL,
-  price REAL NOT NULL,
-  title TEXT,
-  event_slug TEXT,
-  outcome TEXT,
-  outcome_index INTEGER,
-  raw_json TEXT,
-  PRIMARY KEY(wallet, trade_key)
-);
-
-CREATE TABLE IF NOT EXISTS wallet_cursors (
-  wallet TEXT PRIMARY KEY,
-  last_ts INTEGER NOT NULL,
-  last_pulled_at TEXT NOT NULL
-);
-
+-- Copy-trading (strategy #4) tables. wallets / wallet_trades /
+-- wallet_cursors are CACHE (rebuildable from data-api). roster +
+-- scout_snapshots + copied_trades are LEDGER (the experiment record).
 CREATE TABLE IF NOT EXISTS roster (
   wallet TEXT PRIMARY KEY,
   entered_at TEXT,
@@ -481,16 +364,12 @@ CREATE TABLE IF NOT EXISTS copied_trades (
   ts_opened TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_snapshots_market ON snapshots(market_id, ts);
 CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market_id, strategy, ts);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status, strategy);
-CREATE INDEX IF NOT EXISTS idx_arb_gaps_event ON arb_gaps(event_id, ts);
 CREATE INDEX IF NOT EXISTS idx_arb_positions_status ON arb_positions(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_legs_position ON arb_legs(position_id);
-CREATE INDEX IF NOT EXISTS idx_cv_gaps_pair ON cv_gaps(pair_id, ts);
 CREATE INDEX IF NOT EXISTS idx_cv_positions_status ON cv_positions(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_cv_legs_position ON cv_legs(position_id);
-CREATE INDEX IF NOT EXISTS idx_wallet_trades_wallet ON wallet_trades(wallet, ts);
 CREATE INDEX IF NOT EXISTS idx_copied_trades_leader ON copied_trades(leader_wallet, status);
 CREATE INDEX IF NOT EXISTS idx_copied_trades_status ON copied_trades(status);
 CREATE INDEX IF NOT EXISTS idx_arb_multi_status ON arb_multi(status, event_id);
@@ -500,18 +379,201 @@ CREATE INDEX IF NOT EXISTS idx_sharpline_status ON sharpline_orders(status);
 CREATE INDEX IF NOT EXISTS idx_logic_violations_pair ON logic_violations(pair_id, ts);
 """
 
+# ============================================================ CACHE_SCHEMA
+# Rebuildable raw data. Lives in cache.db (gitignored).
+CACHE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  market_id INTEGER NOT NULL,
+  ts TEXT NOT NULL,
+  yes_ask REAL, yes_bid REAL,
+  no_ask REAL, no_bid REAL,
+  book_depth_usd REAL
+);
+
+CREATE TABLE IF NOT EXISTS arb_gaps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  event_slug TEXT,
+  event_title TEXT,
+  n_legs INTEGER NOT NULL,
+  completeness_verified INTEGER NOT NULL,
+  completeness_note TEXT,
+  side TEXT NOT NULL,
+  walk_mode TEXT NOT NULL,
+  target_shares REAL,
+  executable_shares REAL,
+  sum_vwap_per_share REAL,
+  slippage_per_share REAL,
+  safety_buffer REAL,
+  payout_per_share REAL,
+  locked_profit_per_share REAL,
+  locked_profit_usd REAL,
+  end_date_iso TEXT,
+  legs_json TEXT,
+  cleared_threshold INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS cv_pairs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_first_seen TEXT NOT NULL,
+  ts_last_classified TEXT NOT NULL,
+  poly_market_id TEXT NOT NULL,
+  kalshi_ticker TEXT NOT NULL,
+  poly_title TEXT,
+  kalshi_title TEXT,
+  poly_leg TEXT,
+  kalshi_leg TEXT,
+  poly_close TEXT,
+  kalshi_close TEXT,
+  poly_source TEXT,
+  kalshi_source TEXT,
+  city TEXT,
+  date TEXT,
+  classification TEXT NOT NULL,
+  reason TEXT,
+  criteria_json TEXT,
+  divergence_risk_note TEXT,
+  UNIQUE(poly_market_id, kalshi_ticker)
+);
+
+CREATE TABLE IF NOT EXISTS cv_gaps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  strategy TEXT NOT NULL,
+  pair_id INTEGER NOT NULL,
+  direction TEXT NOT NULL,
+  classification TEXT NOT NULL,
+  poly_vwap REAL,
+  poly_fee REAL,
+  kalshi_vwap REAL,
+  kalshi_fee REAL,
+  safety_buffer REAL,
+  target_shares REAL,
+  executable_shares REAL,
+  total_cost_per_share REAL,
+  locked_profit_per_share REAL,
+  locked_profit_usd REAL,
+  divergence_risk_note TEXT,
+  cleared_threshold INTEGER NOT NULL DEFAULT 0,
+  legs_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS wallets (
+  wallet TEXT PRIMARY KEY,
+  first_seen TEXT NOT NULL,
+  last_scouted TEXT,
+  metrics_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS wallet_trades (
+  wallet TEXT NOT NULL,
+  trade_key TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  side TEXT NOT NULL,
+  asset TEXT NOT NULL,
+  condition_id TEXT,
+  size REAL NOT NULL,
+  price REAL NOT NULL,
+  title TEXT,
+  event_slug TEXT,
+  outcome TEXT,
+  outcome_index INTEGER,
+  raw_json TEXT,
+  PRIMARY KEY(wallet, trade_key)
+);
+
+CREATE TABLE IF NOT EXISTS wallet_cursors (
+  wallet TEXT PRIMARY KEY,
+  last_ts INTEGER NOT NULL,
+  last_pulled_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS odds_cache (
+  sport TEXT PRIMARY KEY,
+  fetched_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS lp_sim_state (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  poly_market_id TEXT NOT NULL,
+  quote_spread REAL NOT NULL,
+  quote_size REAL NOT NULL,
+  score REAL NOT NULL,
+  est_share_of_pool REAL NOT NULL,
+  est_daily_reward_usd REAL NOT NULL,
+  est_trading_pnl_usd REAL NOT NULL,
+  adverse_selection_usd REAL NOT NULL,
+  estimate_marker TEXT NOT NULL DEFAULT 'ESTIMATE'
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_market ON snapshots(market_id, ts);
+CREATE INDEX IF NOT EXISTS idx_arb_gaps_event ON arb_gaps(event_id, ts);
+CREATE INDEX IF NOT EXISTS idx_cv_gaps_pair ON cv_gaps(pair_id, ts);
+CREATE INDEX IF NOT EXISTS idx_wallet_trades_wallet ON wallet_trades(wallet, ts);
+"""
+
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def ledger_from_cfg(cfg: dict) -> "Ledger":
+    """Build a Ledger from a `config.yaml`-shaped dict. Honours the new
+    `ledger_path` / `cache_path` keys; falls back to the legacy `path`
+    (which gets a co-located `*.cache.db` sibling)."""
+    d = (cfg.get("database") or {})
+    ledger_path = d.get("ledger_path") or d.get("path") or "ledger.db"
+    cache_path = d.get("cache_path")
+    return Ledger(ledger_path, cache_path)
+
+
 class Ledger:
-    def __init__(self, db_path: str | Path):
-        self.db_path = str(db_path)
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        with self._conn() as c:
-            c.executescript(SCHEMA)
-            self._migrate(c)
+    """Two-DB SQLite ledger. Every connection opens ledger.db and ATTACHes
+    cache.db as schema name `cache`. All cache-table SQL is qualified
+    with the `cache.` prefix.
+
+    Pass `cache_path` explicitly. For tests, pass distinct temp files
+    so each test gets an isolated pair. The legacy single-path signature
+    `Ledger(path)` still works for back-compat: if only one path is
+    given, cache.db is co-located alongside it with suffix '.cache.db'.
+    """
+
+    def __init__(self, ledger_path: str | Path,
+                 cache_path: str | Path | None = None):
+        self.ledger_path = str(ledger_path)
+        if cache_path is None:
+            # Back-compat default: co-located cache file. Used when
+            # legacy callers haven't been updated yet.
+            base = self.ledger_path.removesuffix(".db")
+            self.cache_path = f"{base}.cache.db"
+        else:
+            self.cache_path = str(cache_path)
+        # `db_path` is kept as an alias for the LEDGER path so existing
+        # raw `sqlite3.connect(ledger.db_path)` callers keep working;
+        # they only see the ledger tables until they upgrade to
+        # `raw_connect()` which attaches the cache.
+        self.db_path = self.ledger_path
+        Path(self.ledger_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.cache_path).parent.mkdir(parents=True, exist_ok=True)
+        # Create both files + their schemas via standalone connections.
+        lc = sqlite3.connect(self.ledger_path)
+        try:
+            lc.executescript(LEDGER_SCHEMA)
+            self._migrate(lc)
+            lc.commit()
+        finally:
+            lc.close()
+        cc = sqlite3.connect(self.cache_path)
+        try:
+            cc.executescript(CACHE_SCHEMA)
+            cc.commit()
+        finally:
+            cc.close()
 
     @staticmethod
     def _migrate(c: sqlite3.Connection) -> None:
@@ -529,13 +591,77 @@ class Ledger:
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.ledger_path)
         conn.row_factory = sqlite3.Row
+        # Attach cache.db so every query in this connection can reach
+        # cache tables via the `cache.<table>` prefix.
+        conn.execute("ATTACH DATABASE ? AS cache",
+                      (self.cache_path,))
         try:
             yield conn
             conn.commit()
         finally:
             conn.close()
+
+    def raw_connect(self) -> sqlite3.Connection:
+        """Unmanaged connection with cache.db attached. Used by main.py
+        and report.py for ad-hoc cross-table reporting queries. Caller
+        owns commit + close."""
+        conn = sqlite3.connect(self.ledger_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("ATTACH DATABASE ? AS cache", (self.cache_path,))
+        return conn
+
+    def vacuum(self, vacuum_ledger: bool = True,
+                 vacuum_cache: bool = True) -> dict[str, int]:
+        """Run VACUUM on each DB and return resulting byte sizes. Used by
+        the daily workflow's housekeeping step. VACUUM cannot run inside
+        an attached transaction so each DB is opened standalone."""
+        out: dict[str, int] = {}
+        if vacuum_ledger:
+            lc = sqlite3.connect(self.ledger_path)
+            lc.isolation_level = None
+            lc.execute("VACUUM")
+            lc.close()
+            out["ledger_bytes"] = os.path.getsize(self.ledger_path)
+        if vacuum_cache:
+            cc = sqlite3.connect(self.cache_path)
+            cc.isolation_level = None
+            cc.execute("VACUUM")
+            cc.close()
+            out["cache_bytes"] = os.path.getsize(self.cache_path)
+        return out
+
+    def prune_cache(self, snapshots_keep_days: int = 7,
+                     gaps_keep_days: int = 7) -> dict[str, int]:
+        """Drop cache rows older than the retention window. Daily.yml
+        runs this before VACUUM to keep cache.db from growing without
+        bound across workflow runs."""
+        out: dict[str, int] = {}
+        cutoff_ts_iso = (datetime.now(timezone.utc)
+                          .replace(microsecond=0)
+                          .isoformat()[:10])
+        # naive lexicographic cut on ISO date string
+        cut_day = (datetime.fromisoformat(cutoff_ts_iso)
+                    - __import__("datetime").timedelta(days=int(snapshots_keep_days))
+                  ).date().isoformat()
+        cut_day_gaps = (datetime.fromisoformat(cutoff_ts_iso)
+                          - __import__("datetime").timedelta(days=int(gaps_keep_days))
+                        ).date().isoformat()
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM cache.snapshots WHERE substr(ts,1,10) < ?",
+                (cut_day,))
+            out["snapshots_deleted"] = cur.rowcount
+            cur = c.execute(
+                "DELETE FROM cache.arb_gaps WHERE substr(ts,1,10) < ?",
+                (cut_day_gaps,))
+            out["arb_gaps_deleted"] = cur.rowcount
+            cur = c.execute(
+                "DELETE FROM cache.cv_gaps WHERE substr(ts,1,10) < ?",
+                (cut_day_gaps,))
+            out["cv_gaps_deleted"] = cur.rowcount
+        return out
 
     # --- markets ----------------------------------------------------------
     def upsert_market(self, m: dict[str, Any]) -> int:
@@ -574,7 +700,7 @@ class Ledger:
                         book_depth_usd) -> None:
         with self._conn() as c:
             c.execute(
-                """INSERT INTO snapshots (market_id, ts, yes_ask, yes_bid,
+                """INSERT INTO cache.snapshots (market_id, ts, yes_ask, yes_bid,
                     no_ask, no_bid, book_depth_usd) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (market_id, utcnow_iso(), yes_ask, yes_bid, no_ask, no_bid,
                  book_depth_usd),
@@ -724,7 +850,7 @@ class Ledger:
         per-share fields; legs_json carries the per-leg breakdown."""
         with self._conn() as c:
             cur = c.execute(
-                """INSERT INTO arb_gaps (
+                """INSERT INTO cache.arb_gaps (
                     ts, strategy, event_id, event_slug, event_title, n_legs,
                     completeness_verified, completeness_note,
                     side, walk_mode, target_shares, executable_shares,
@@ -832,12 +958,12 @@ class Ledger:
     def upsert_cv_pair(self, pair: dict[str, Any]) -> int:
         with self._conn() as c:
             row = c.execute(
-                "SELECT id FROM cv_pairs WHERE poly_market_id=? AND kalshi_ticker=?",
+                "SELECT id FROM cache.cv_pairs WHERE poly_market_id=? AND kalshi_ticker=?",
                 (pair["poly_market_id"], pair["kalshi_ticker"]),
             ).fetchone()
             if row:
                 c.execute(
-                    """UPDATE cv_pairs SET ts_last_classified=?, poly_title=?,
+                    """UPDATE cache.cv_pairs SET ts_last_classified=?, poly_title=?,
                         kalshi_title=?, poly_leg=?, kalshi_leg=?, poly_close=?,
                         kalshi_close=?, poly_source=?, kalshi_source=?, city=?,
                         date=?, classification=?, reason=?, criteria_json=?,
@@ -856,7 +982,7 @@ class Ledger:
                 )
                 return int(row["id"])
             cur = c.execute(
-                """INSERT INTO cv_pairs (
+                """INSERT INTO cache.cv_pairs (
                     ts_first_seen, ts_last_classified, poly_market_id, kalshi_ticker,
                     poly_title, kalshi_title, poly_leg, kalshi_leg,
                     poly_close, kalshi_close, poly_source, kalshi_source,
@@ -881,7 +1007,7 @@ class Ledger:
     def record_cv_gap(self, gap: dict[str, Any]) -> int:
         with self._conn() as c:
             cur = c.execute(
-                """INSERT INTO cv_gaps (
+                """INSERT INTO cache.cv_gaps (
                     ts, strategy, pair_id, direction, classification,
                     poly_vwap, poly_fee, kalshi_vwap, kalshi_fee,
                     safety_buffer, target_shares, executable_shares,
@@ -942,11 +1068,11 @@ class Ledger:
     def cv_pair_stats(self) -> dict[str, Any]:
         with self._conn() as c:
             rows = c.execute(
-                """SELECT classification, COUNT(*) as n FROM cv_pairs
+                """SELECT classification, COUNT(*) as n FROM cache.cv_pairs
                    GROUP BY classification""").fetchall()
             d = {r["classification"]: int(r["n"]) for r in rows}
             divergence = c.execute(
-                """SELECT COUNT(*) as n FROM cv_pairs
+                """SELECT COUNT(*) as n FROM cache.cv_pairs
                    WHERE divergence_risk_note IS NOT NULL
                      AND divergence_risk_note <> ''""").fetchone()
             d["with_divergence_risk_note"] = int(divergence["n"] or 0)
@@ -957,7 +1083,7 @@ class Ledger:
             rows = c.execute(
                 """SELECT classification, direction, cleared_threshold,
                           locked_profit_per_share, divergence_risk_note
-                     FROM cv_gaps WHERE strategy=?""",
+                     FROM cache.cv_gaps WHERE strategy=?""",
                 (strategy,)).fetchall()
         stats = {
             "total": len(rows),
@@ -1012,15 +1138,15 @@ class Ledger:
     # --- copy-trading (strategy #4) ---------------------------------------
     def upsert_wallet(self, wallet: str, metrics: dict[str, Any]) -> None:
         with self._conn() as c:
-            row = c.execute("SELECT wallet FROM wallets WHERE wallet=?",
+            row = c.execute("SELECT wallet FROM cache.wallets WHERE wallet=?",
                              (wallet,)).fetchone()
             if row:
                 c.execute(
-                    "UPDATE wallets SET last_scouted=?, metrics_json=? WHERE wallet=?",
+                    "UPDATE cache.wallets SET last_scouted=?, metrics_json=? WHERE wallet=?",
                     (utcnow_iso(), json.dumps(metrics), wallet))
             else:
                 c.execute(
-                    """INSERT INTO wallets (wallet, first_seen, last_scouted, metrics_json)
+                    """INSERT INTO cache.wallets (wallet, first_seen, last_scouted, metrics_json)
                         VALUES (?, ?, ?, ?)""",
                     (wallet, utcnow_iso(), utcnow_iso(), json.dumps(metrics)))
 
@@ -1033,7 +1159,7 @@ class Ledger:
                 key = f"{t.get('transactionHash','')}:{t.get('asset','')}:{t.get('side','')}"
                 try:
                     c.execute(
-                        """INSERT OR IGNORE INTO wallet_trades (
+                        """INSERT OR IGNORE INTO cache.wallet_trades (
                             wallet, trade_key, ts, side, asset, condition_id,
                             size, price, title, event_slug, outcome,
                             outcome_index, raw_json)
@@ -1058,7 +1184,7 @@ class Ledger:
     def get_wallet_trades(self, wallet: str) -> list[dict]:
         with self._conn() as c:
             rows = c.execute(
-                "SELECT raw_json FROM wallet_trades WHERE wallet=? ORDER BY ts",
+                "SELECT raw_json FROM cache.wallet_trades WHERE wallet=? ORDER BY ts",
                 (wallet,)).fetchall()
         out: list[dict] = []
         for r in rows:
@@ -1071,14 +1197,14 @@ class Ledger:
     def get_wallet_cursor(self, wallet: str) -> int | None:
         with self._conn() as c:
             row = c.execute(
-                "SELECT last_ts FROM wallet_cursors WHERE wallet=?",
+                "SELECT last_ts FROM cache.wallet_cursors WHERE wallet=?",
                 (wallet,)).fetchone()
             return int(row["last_ts"]) if row else None
 
     def set_wallet_cursor(self, wallet: str, last_ts: int) -> None:
         with self._conn() as c:
             c.execute(
-                """INSERT INTO wallet_cursors (wallet, last_ts, last_pulled_at)
+                """INSERT INTO cache.wallet_cursors (wallet, last_ts, last_pulled_at)
                     VALUES (?, ?, ?)
                     ON CONFLICT(wallet) DO UPDATE SET last_ts=excluded.last_ts,
                         last_pulled_at=excluded.last_pulled_at""",
@@ -1237,7 +1363,7 @@ class Ledger:
                          ) -> list[dict] | None:
         with self._conn() as c:
             row = c.execute(
-                "SELECT fetched_at, payload_json FROM odds_cache WHERE sport=?",
+                "SELECT fetched_at, payload_json FROM cache.odds_cache WHERE sport=?",
                 (sport,)).fetchone()
         if not row:
             return None
@@ -1255,7 +1381,7 @@ class Ledger:
     def put_odds_cache(self, sport: str, payload: list[dict]) -> None:
         with self._conn() as c:
             c.execute(
-                """INSERT INTO odds_cache (sport, fetched_at, payload_json)
+                """INSERT INTO cache.odds_cache (sport, fetched_at, payload_json)
                     VALUES (?, ?, ?)
                     ON CONFLICT(sport) DO UPDATE SET
                     fetched_at=excluded.fetched_at,
@@ -1312,7 +1438,7 @@ class Ledger:
     def record_lp_sim(self, row: dict[str, Any]) -> int:
         with self._conn() as c:
             cur = c.execute(
-                """INSERT INTO lp_sim_state (
+                """INSERT INTO cache.lp_sim_state (
                     ts, poly_market_id, quote_spread, quote_size, score,
                     est_share_of_pool, est_daily_reward_usd,
                     est_trading_pnl_usd, adverse_selection_usd)
@@ -1329,7 +1455,7 @@ class Ledger:
     def lp_sim_latest(self, limit: int = 10) -> list[sqlite3.Row]:
         with self._conn() as c:
             return list(c.execute(
-                "SELECT * FROM lp_sim_state ORDER BY id DESC LIMIT ?",
+                "SELECT * FROM cache.lp_sim_state ORDER BY id DESC LIMIT ?",
                 (limit,)).fetchall())
 
     # --- LOGIC-SCAN (Prompt C, Phase 3) -----------------------------------
@@ -1582,7 +1708,7 @@ class Ledger:
             rows = c.execute(
                 """SELECT walk_mode, side, completeness_verified,
                           locked_profit_per_share, cleared_threshold
-                     FROM arb_gaps WHERE strategy=?""",
+                     FROM cache.arb_gaps WHERE strategy=?""",
                 (strategy,)).fetchall()
         stats = {
             "total": len(rows),

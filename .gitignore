@@ -9,4 +9,12 @@ venv/
 .idea/
 .vscode/
 cv_run.log
-.env
+
+# Two-DB layout (foundation/ledger.py): ledger.db is committed by the
+# workflows; cache.db is rebuildable raw scan data + must stay gitignored.
+cache.db
+*.cache.db
+
+# Legacy single-DB file - now superseded by ledger.db + cache.db. Kept
+# ignored in case a local migration left a stray file around.
+polymarketbot.db

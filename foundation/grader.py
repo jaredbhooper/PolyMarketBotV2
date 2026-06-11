@@ -16,7 +16,7 @@ from typing import Iterable
 
 import yaml
 
-from foundation.ledger import Ledger
+from foundation.ledger import Ledger, ledger_from_cfg
 from strategies.base import Market, Strategy
 
 
@@ -121,7 +121,7 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
     Then for each strategy, write/update today's daily_report row.
     """
     cfg = yaml.safe_load(open(cfg_path, "r", encoding="utf-8"))
-    ledger = Ledger(cfg["database"]["path"])
+    ledger = ledger_from_cfg(cfg)
     strategies = _load_strategies(cfg)
     today = datetime.now(timezone.utc).date()
 

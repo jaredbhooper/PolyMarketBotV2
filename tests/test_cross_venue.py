@@ -229,12 +229,11 @@ def test_scan_cv_logs_certified_and_fires_above_threshold(monkeypatch):
     assert counters["fuzzy"] >= 1
     # At least one fire on the CERTIFIED pair
     assert counters["fired"] >= 1
-    # Check that no cv_position was opened on FUZZY pair
-    import sqlite3
-    c = sqlite3.connect(db_path)
-    c.row_factory = sqlite3.Row
+    # Check that no cv_position was opened on FUZZY pair. cv_pairs lives
+    # in cache.db; raw_connect attaches it as schema `cache`.
+    c = ledger.raw_connect()
     positions = list(c.execute("SELECT * FROM cv_positions").fetchall())
-    pairs = list(c.execute("SELECT id, classification FROM cv_pairs").fetchall())
+    pairs = list(c.execute("SELECT id, classification FROM cache.cv_pairs").fetchall())
     pair_class = {int(r["id"]): r["classification"] for r in pairs}
     for p in positions:
         cl = pair_class.get(int(p["pair_id"]))
