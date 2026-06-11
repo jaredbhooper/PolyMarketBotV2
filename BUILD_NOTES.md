@@ -89,7 +89,30 @@ to activate:
 - `daily.yml` — `0 10 * * *`. Runs `scout`, `sharpline-post` (the
   only Odds-API-consuming command — sized at 5 sports × 1 cycle/day
   = ~150 req/month, comfortably under the free tier's 450 cap),
-  `grade`, and `master-report`.
+  `grade`, `master-report`, then `vacuum` (prunes cache.db beyond
+  retention window + VACUUMs both DBs).
+
+All three workflows have a **50 MB guard** on `ledger.db` that fails
+the run loudly via `::error::` if the committed file ever exceeds
+50 MB. This prevents the 511 MB freelist-bloat incident from
+recurring silently.
+
+## Two-DB layout
+
+The ledger lives in two SQLite files joined via `ATTACH DATABASE`:
+
+- **`ledger.db`** (committed, ≤50 MB) — paper-trading record:
+  positions, settlements, bankroll, equity, health, daily/scout
+  reports, sharpline orders, logic violations, plus the lookup
+  tables (markets, signals).
+- **`cache.db`** (gitignored, rebuildable) — raw scan data:
+  snapshots, *_gaps, cv_pairs, wallet trade history, odds cache,
+  lp_sim estimates.
+
+Migration tool `tools/migrate_split_db.py` proved zero-loss across
+all 28 user tables + operational invariants (open positions, open
+stake, bankroll allocations, txn count). Source-of-truth for the
+LEDGER vs CACHE classification lives in that script.
 
 All three share `concurrency.group: polymarketbot-state` so they
 never race on the `git push` back to main.

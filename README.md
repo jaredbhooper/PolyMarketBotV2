@@ -980,6 +980,7 @@ python main.py status             # quick per-strategy bankroll + open stake
 python main.py bankroll           # bankroll snapshot + last 20 audit txns
 python main.py arb-stats          # arb gap distribution
 python main.py cv-stats           # cross-venue pair + gap distribution
+python main.py vacuum             # prune cache.db retention + VACUUM both DBs (daily.yml runs this)
 ```
 
 ### Scheduled workflows (`.github/workflows/`)
@@ -1009,18 +1010,36 @@ the appropriate per-category fee when computing net P&L. A unit test
 in `tests/test_fees.py` fails loudly if the rate table drifts from
 the verified source.
 
-### Where the data lives
+### Where the data lives — two-DB layout
 
-- `polymarketbot.db` — single SQLite file. Schemas in
-  `foundation/ledger.py`. Three families:
-  - V1 weather: `markets`, `snapshots`, `signals`, `paper_trades`,
-    `settlements`, `daily_report`.
-  - Arb strategies: `arb_gaps`, `arb_positions`, `arb_legs`,
-    `arb_multi`, `cv_pairs`, `cv_gaps`, `cv_positions`, `cv_legs`.
-  - Copy-trading: `wallets`, `wallet_trades`, `wallet_cursors`,
-    `roster`, `scout_snapshots`, `copied_trades`.
-  - V2 ops layer: `bankroll_allocations`, `bankroll_transactions`,
-    `equity_history`, `health_log`.
+The ledger is split across **two SQLite files**, joined via SQLite's
+`ATTACH DATABASE` at every connection. Schema definitions and the
+split classification live in `foundation/ledger.py`.
+
+- **`ledger.db`** — committed by the workflows. The **irreplaceable**
+  paper-trading record. **Must stay under 50 MB**; all three workflows
+  fail loudly via `::error::` if it grows past the cap. Tables: the
+  weather V1 record (`markets`, `signals`, `paper_trades`,
+  `settlements`, `daily_report`); all position/leg tables across
+  every strategy (`arb_positions`, `arb_legs`, `arb_multi`,
+  `cv_positions`, `cv_legs`, `copied_trades`, `sharpline_orders`,
+  `sharpline_matches`, `logic_pairs`, `logic_violations`); the
+  copy-trading roster + per-day audit (`roster`, `scout_snapshots`);
+  V2 ops layer (`bankroll_allocations`, `bankroll_transactions`,
+  `equity_history`, `health_log`, `odds_api_log`).
+- **`cache.db`** — gitignored, rebuildable raw scan data. Workflows
+  rebuild on demand. Daily.yml prunes anything older than the
+  retention window then VACUUMs. Tables: `snapshots`, `arb_gaps`,
+  `cv_pairs`, `cv_gaps`, `wallets`, `wallet_trades`,
+  `wallet_cursors`, `odds_cache`, `lp_sim_state`.
+
+Queries that need both databases use `Ledger.raw_connect()` (returns
+a connection with cache attached as schema name `cache`). Cache
+references in SQL are explicit: `SELECT * FROM cache.cv_pairs ...`.
+
+Retention is config-driven (`retention.snapshots_keep_days`,
+`retention.gaps_keep_days` — both default 7). Workflow:
+`python main.py vacuum`.
 
 ### How to read the master report
 
