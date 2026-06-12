@@ -22,12 +22,28 @@ from foundation.venues.base import Venue, VenueMarket
 # already audited - the cross-venue strategy reuses it.
 _POLYMARKET_DAILY_WEATHER_TAGS = ["highest-temperature", "lowest-temperature"]
 
+# v2: tag slugs for each cross-venue category. We pull the union and rely
+# on the equivalence engine to bucket by detected category. Each category
+# has its own scan budget so a single hot vertical (e.g. NBA playoffs)
+# can't starve the others.
+_POLYMARKET_TAGS_BY_CATEGORY: dict[str, list[str]] = {
+    "weather":   ["highest-temperature", "lowest-temperature"],
+    "sports":    ["nba", "nfl", "mlb", "nhl", "ufc", "soccer", "tennis"],
+    "crypto":    ["crypto-prices", "bitcoin", "ethereum"],
+    "politics":  ["elections", "us-elections", "trump"],
+    "economics": ["economic-data", "fed", "inflation"],
+}
+
 
 class PolymarketVenue(Venue):
     name = "polymarket"
 
-    def __init__(self, scanner: Scanner, weather_cities_cfg: list[dict] | None = None):
+    def __init__(self, scanner: Scanner, weather_cities_cfg: list[dict] | None = None,
+                  category_tags: dict[str, list[str]] | None = None):
         self.scanner = scanner
+        # v2 category map; overridable from config.cross_venue_arb.category_tags.
+        self.category_tags: dict[str, list[str]] = (
+            category_tags or _POLYMARKET_TAGS_BY_CATEGORY)
         # Map slug-hint -> resolution-source note. Built from V1's
         # weather config so cross-venue inherits the audited URL.
         self.city_to_source: dict[str, str] = {}
@@ -54,16 +70,29 @@ class PolymarketVenue(Venue):
 
     def fetch_markets(self, category_hint: str | None = None,
                        fetch_books: bool = False) -> list[VenueMarket]:
-        """Pull every market under the daily-weather tags. By default
+        """Pull markets across the requested category's tag slugs (or all
+        configured categories if category_hint is None). By default
         skips per-token CLOB book lookups - the matcher only needs
         slug/title/leg/close to bucket candidates. Books are fetched
-        lazily by `fetch_book_for` after classification, so we don't
-        pay CLOB cost on thousands of NON-MATCH markets."""
-        tags: Iterable[str] = _POLYMARKET_DAILY_WEATHER_TAGS
+        lazily by `fetch_book_for` after classification."""
+        if category_hint:
+            tags: Iterable[str] = self.category_tags.get(category_hint, [])
+        else:
+            tags = [t for tags_list in self.category_tags.values()
+                    for t in tags_list]
         seen_ids: set[str] = set()
         out: list[VenueMarket] = []
+        # Reverse map for category tagging: tag -> category.
+        tag_to_cat: dict[str, str] = {}
+        for cat, ts in self.category_tags.items():
+            for t in ts:
+                tag_to_cat[t] = cat
         for tag in tags:
-            _, markets = self.scanner.scan_tag(tag, fetch_books=fetch_books)
+            try:
+                _, markets = self.scanner.scan_tag(tag, fetch_books=fetch_books)
+            except Exception:
+                continue
+            cat = tag_to_cat.get(tag, "")
             for m in markets:
                 if m.market_id in seen_ids:
                     continue
@@ -95,6 +124,8 @@ class PolymarketVenue(Venue):
                         "parsed_hi": m.extras.get("hi"),
                         "yes_token_id": m.yes_token_id,
                         "no_token_id": m.no_token_id,
+                        "category": cat,
+                        "scan_tag": tag,
                     },
                 ))
         return out

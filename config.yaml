@@ -107,6 +107,11 @@ active_strategies:
   - module: weather
   - module: bucket_arb
   - module: cross_venue_arb
+  # cv_probe is NOT in active_strategies on purpose: it runs as a
+  # tail step of every cross-venue scan (see run_cv_cycle), not as a
+  # standalone strategy. The router below cannot dispatch it - it
+  # consumes another strategy's scan_cv() output rather than producing
+  # estimates or detections of its own.
   - module: copy_trading
   - module: sharpline
   - module: lp_sim
@@ -162,8 +167,44 @@ strategies:
     min_executable_shares: 5.0    # require this many fillable shares to log a gap
     min_hours_to_resolve: 1.0     # skip pairs resolving in less than this
     execute_fuzzy: false          # NEVER auto-trade FUZZY (source/cutoff/cond mismatch)
-    kalshi_categories:            # Kalshi categories to scan (daily weather only by default)
+    # v2 conservatism gate: hard floor on equivalence confidence required
+    # to fire (or to be probe-eligible). A mismatched pair would corrupt
+    # the experiment's headline statistic, so we err well above 0.5.
+    min_match_confidence: 0.9
+    # v2 time budget: cycle.yml is 30 min; budget the cv scan portion
+    # explicitly so the expanded multi-category catalog doesn't overrun.
+    cv_scan_budget_minutes: 8.0
+    # v2 category rotation order (advisory; the matcher classifies every
+    # bucket within the time budget regardless).
+    category_rotation:
+      - weather
+      - sports
+      - crypto
+      - politics
+      - economics
+    kalshi_categories:            # Kalshi categories to scan (multi-category for v2)
       - Climate and Weather
+      - Sports
+      - Financials
+      - Politics
+      - Economics
+
+  # Strategy #3b: cv_probe - QUARANTINED research book that paper-trades
+  # FUZZY pairs to empirically measure how often the two venues' resolution
+  # sources actually disagree (the "divergence rate"). Probe positions
+  # live in their own tables (cv_probe_positions / cv_probe_legs), draw
+  # from a separate $500 virtual capital pool, and NEVER appear in the
+  # cv-stats / scoreboard / main bankroll. Output: per-category divergence
+  # rate vs breakeven divergence rate -> POSITIVE / NEGATIVE EV verdict.
+  cv_probe:
+    min_probe_gap: 0.02            # USD/share net gap (after fees+slippage) - probe floor
+    max_probe_total: 1000          # lifetime cap on open+settled probe rows
+    max_probe_per_day: 40          # daily cap (across all categories)
+    max_probe_per_day_per_category: 15  # diversity cap so weather can't hog the book
+    probe_stake_usd: 5.0           # notional per pair
+    probe_capital: 500.0           # virtual side-book (separate from main bankroll)
+    min_match_confidence: 0.9      # MUST equal cross_venue_arb's gate
+    min_executable_shares: 1.0     # both legs must clear this fill
 
   # Strategy #4: copy-trading (paper only). Public-data only; no auth.
   # Discovers candidate wallets via the global /trades tape +

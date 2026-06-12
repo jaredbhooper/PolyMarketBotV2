@@ -486,8 +486,55 @@ CREATE TABLE IF NOT EXISTS cv_pairs (
   reason TEXT,
   criteria_json TEXT,
   divergence_risk_note TEXT,
+  category TEXT,                       -- v2: weather/sports/crypto/politics/economics
+  confidence REAL,                     -- v2: 0..1; >=0.9 required for any action
   UNIQUE(poly_market_id, kalshi_ticker)
 );
+
+-- v2 CV-PROBE (quarantined research book). Probe positions paper-trade
+-- FUZZY pairs to empirically measure how often non-identical referees
+-- actually disagree. ENTIRELY separated from main bankroll + main
+-- scoreboard. cv_probe_positions lives in ledger.db (committed) so the
+-- experiment record survives cache rebuilds.
+CREATE TABLE IF NOT EXISTS cv_probe_positions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  pair_id INTEGER NOT NULL,
+  category TEXT NOT NULL,
+  match_confidence REAL NOT NULL,
+  direction TEXT NOT NULL,
+  shares REAL NOT NULL,
+  total_cost REAL NOT NULL,
+  expected_payout REAL NOT NULL,
+  net_gap_per_share REAL NOT NULL,
+  divergence_risk_note TEXT,
+  status TEXT NOT NULL DEFAULT 'OPEN',
+  agreement_outcome TEXT,              -- AGREED/DIVERGED/VOID_MISMATCH/BOTH_VOID
+  divergence_direction TEXT,           -- BOTH_PAID / NEITHER_PAID / NULL (only set when agreement_outcome=DIVERGED)
+  pnl REAL,
+  closed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS cv_probe_legs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  position_id INTEGER NOT NULL,
+  venue TEXT NOT NULL,
+  venue_market_id TEXT NOT NULL,
+  side TEXT NOT NULL,
+  vwap REAL NOT NULL,
+  price_filled REAL NOT NULL,
+  fee_per_share REAL NOT NULL,
+  shares REAL NOT NULL,
+  cost REAL NOT NULL,
+  outcome TEXT,                        -- YES/NO/VOID at the leg's own venue
+  payout REAL,
+  levels_consumed_json TEXT,
+  FOREIGN KEY(position_id) REFERENCES cv_probe_positions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cv_probe_positions_status ON cv_probe_positions(status, ts);
+CREATE INDEX IF NOT EXISTS idx_cv_probe_positions_pair ON cv_probe_positions(pair_id);
+CREATE INDEX IF NOT EXISTS idx_cv_probe_legs_pos ON cv_probe_legs(position_id);
 
 CREATE TABLE IF NOT EXISTS cv_gaps (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -621,6 +668,7 @@ class Ledger:
         cc = sqlite3.connect(self.cache_path)
         try:
             cc.executescript(CACHE_SCHEMA)
+            self._migrate_cache(cc)
             cc.commit()
         finally:
             cc.close()
@@ -633,6 +681,24 @@ class Ledger:
             ("settlements", "wu_value", "REAL"),
             ("settlements", "wu_source", "TEXT"),
             ("settlements", "om_value", "REAL"),
+        ]:
+            cols = [r[1] for r in c.execute(
+                f"PRAGMA table_info({table})").fetchall()]
+            if col not in cols:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {type_}")
+
+    @staticmethod
+    def _migrate_cache(c: sqlite3.Connection) -> None:
+        """Forward-only column additions for cache.db tables."""
+        for table, col, type_ in [
+            ("cv_pairs", "category", "TEXT"),
+            ("cv_pairs", "confidence", "REAL"),
+            # v2 cv_probe split: when agreement_outcome=DIVERGED, distinguish
+            # the windfall direction (both legs paid) from the catastrophe
+            # direction (neither leg paid). NULL for AGREED/VOID_*/OPEN rows.
+            # (cv_probe_positions lives in CACHE_SCHEMA today; if it later
+            # moves to ledger.db, also add this column to _migrate above.)
+            ("cv_probe_positions", "divergence_direction", "TEXT"),
         ]:
             cols = [r[1] for r in c.execute(
                 f"PRAGMA table_info({table})").fetchall()]
@@ -1017,7 +1083,8 @@ class Ledger:
                         kalshi_title=?, poly_leg=?, kalshi_leg=?, poly_close=?,
                         kalshi_close=?, poly_source=?, kalshi_source=?, city=?,
                         date=?, classification=?, reason=?, criteria_json=?,
-                        divergence_risk_note=? WHERE id=?""",
+                        divergence_risk_note=?, category=?, confidence=?
+                        WHERE id=?""",
                     (
                         utcnow_iso(), pair.get("poly_title"), pair.get("kalshi_title"),
                         pair.get("poly_leg"), pair.get("kalshi_leg"),
@@ -1027,6 +1094,8 @@ class Ledger:
                         pair["classification"], pair.get("reason"),
                         json.dumps(pair.get("criteria") or {}),
                         pair.get("divergence_risk_note") or "",
+                        pair.get("category"),
+                        float(pair["confidence"]) if pair.get("confidence") is not None else None,
                         int(row["id"]),
                     ),
                 )
@@ -1037,8 +1106,8 @@ class Ledger:
                     poly_title, kalshi_title, poly_leg, kalshi_leg,
                     poly_close, kalshi_close, poly_source, kalshi_source,
                     city, date, classification, reason, criteria_json,
-                    divergence_risk_note)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    divergence_risk_note, category, confidence)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     utcnow_iso(), utcnow_iso(),
                     pair["poly_market_id"], pair["kalshi_ticker"],
@@ -1050,6 +1119,8 @@ class Ledger:
                     pair["classification"], pair.get("reason"),
                     json.dumps(pair.get("criteria") or {}),
                     pair.get("divergence_risk_note") or "",
+                    pair.get("category"),
+                    float(pair["confidence"]) if pair.get("confidence") is not None else None,
                 ),
             )
             return int(cur.lastrowid)
@@ -1184,6 +1255,132 @@ class Ledger:
                     "UPDATE cv_legs SET outcome=?, payout=? WHERE id=?",
                     (lo["outcome"], float(lo["payout"]), int(lo["leg_id"])),
                 )
+
+    # --- CV-PROBE (quarantined research book) ---------------------------
+    def record_cv_probe_position(self, pos: dict[str, Any],
+                                   legs: list[dict[str, Any]]) -> int:
+        """Insert a new cv_probe position + its legs. The position writes
+        to ledger.db (the experiment record persists across cache rebuilds)."""
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO cv_probe_positions (
+                    ts, pair_id, category, match_confidence, direction,
+                    shares, total_cost, expected_payout, net_gap_per_share,
+                    divergence_risk_note, status)
+                    VALUES (?,?,?,?,?,?,?,?,?,?, 'OPEN')""",
+                (
+                    utcnow_iso(), int(pos["pair_id"]),
+                    pos["category"], float(pos["match_confidence"]),
+                    pos["direction"], float(pos["shares"]),
+                    float(pos["total_cost"]), float(pos["expected_payout"]),
+                    float(pos["net_gap_per_share"]),
+                    pos.get("divergence_risk_note") or "",
+                ),
+            )
+            pid = int(cur.lastrowid)
+            for leg in legs:
+                c.execute(
+                    """INSERT INTO cv_probe_legs (
+                        position_id, venue, venue_market_id, side, vwap,
+                        price_filled, fee_per_share, shares, cost,
+                        levels_consumed_json)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        pid, leg["venue"], leg["venue_market_id"], leg["side"],
+                        float(leg["vwap"]), float(leg["price_filled"]),
+                        float(leg.get("fee_per_share") or 0.0),
+                        float(leg["shares"]), float(leg["cost"]),
+                        json.dumps(leg.get("levels_consumed") or []),
+                    ),
+                )
+            return pid
+
+    def cv_probe_pair_has_open_or_settled(self, pair_id: int) -> bool:
+        """DEDUPE rule: max one open or settled probe position per pair
+        per resolution event. A pair that already has any non-VOIDED row
+        is skipped (logged as 'already_probed')."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM cv_probe_positions WHERE pair_id=? "
+                "AND status IN ('OPEN','SETTLED') LIMIT 1",
+                (int(pair_id),)).fetchone()
+            return row is not None
+
+    def cv_probe_count_open(self) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM cv_probe_positions "
+                "WHERE status='OPEN'").fetchone()
+            return int(row["n"])
+
+    def cv_probe_count_today(self, day_iso: str,
+                              category: str | None = None) -> int:
+        with self._conn() as c:
+            if category:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM cv_probe_positions "
+                    "WHERE substr(ts,1,10)=? AND category=?",
+                    (day_iso, category)).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM cv_probe_positions "
+                    "WHERE substr(ts,1,10)=?",
+                    (day_iso,)).fetchone()
+            return int(row["n"])
+
+    def list_open_cv_probe(self) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT * FROM cv_probe_positions WHERE status='OPEN'"
+            ).fetchall())
+
+    def cv_probe_legs_for(self, position_id: int) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT * FROM cv_probe_legs WHERE position_id=?",
+                (int(position_id),)).fetchall())
+
+    def close_cv_probe_position(self, position_id: int,
+                                  agreement_outcome: str, pnl: float,
+                                  leg_outcomes: list[dict[str, Any]],
+                                  divergence_direction: str | None = None
+                                  ) -> None:
+        """Close a probe position. `divergence_direction` is BOTH_PAID or
+        NEITHER_PAID when agreement_outcome=DIVERGED; None otherwise."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE cv_probe_positions SET status='SETTLED', "
+                "agreement_outcome=?, divergence_direction=?, pnl=?, "
+                "closed_at=? WHERE id=?",
+                (agreement_outcome, divergence_direction, float(pnl),
+                 utcnow_iso(), int(position_id)),
+            )
+            for lo in leg_outcomes:
+                c.execute(
+                    "UPDATE cv_probe_legs SET outcome=?, payout=? WHERE id=?",
+                    (lo["outcome"], float(lo["payout"]), int(lo["leg_id"])),
+                )
+
+    def cv_probe_settled_stats(self) -> list[sqlite3.Row]:
+        """Per-category settled probe stats for the report. Groups by
+        (category, agreement_outcome, divergence_direction) so DIVERGED
+        rows split into the BOTH_PAID (windfall) and NEITHER_PAID
+        (catastrophe) buckets. Older rows that pre-date the
+        divergence_direction column have NULL there and aggregate as a
+        single legacy bucket."""
+        with self._conn() as c:
+            return list(c.execute(
+                """SELECT category, agreement_outcome,
+                          COALESCE(divergence_direction, '') AS divergence_direction,
+                          COUNT(*) AS n,
+                          COALESCE(AVG(net_gap_per_share), 0.0) AS avg_gap,
+                          COALESCE(AVG(pnl), 0.0) AS avg_pnl,
+                          COALESCE(SUM(pnl), 0.0) AS sum_pnl
+                   FROM cv_probe_positions
+                   WHERE status='SETTLED'
+                   GROUP BY category, agreement_outcome, divergence_direction
+                   ORDER BY category, agreement_outcome, divergence_direction"""
+            ).fetchall())
 
     # --- copy-trading (strategy #4) ---------------------------------------
     def upsert_wallet(self, wallet: str, metrics: dict[str, Any]) -> None:

@@ -77,7 +77,12 @@ def run_cv_cycle(strategy, scanner: Scanner, ledger: Ledger, cfg: dict,
                   verbose: bool = True) -> dict:
     """Cross-venue cycle: pair Polymarket markets with Kalshi markets via
     the rules-equivalence engine, log every cv_gap, paper-fire only
-    CERTIFIED-IDENTICAL pairs above min_arb_profit."""
+    CERTIFIED-IDENTICAL pairs above min_arb_profit.
+
+    Tail step (v2): if strategies.cv_probe is configured, run the
+    quarantined FUZZY divergence probe on the cv result. Probe never
+    touches the main bankroll; it has its own $500 virtual side-book.
+    """
     from foundation.venues.kalshi import KalshiVenue
     from foundation.venues.polymarket import PolymarketVenue
     weather_cfg = (cfg.get("strategies") or {}).get("weather") or {}
@@ -95,6 +100,19 @@ def run_cv_cycle(strategy, scanner: Scanner, ledger: Ledger, cfg: dict,
             f"nonmatch={counters['nonmatch']}"
         )
         print(f"  cv_gaps logged: {counters['logged_gaps']} | fired: {counters['fired']}")
+        per_cat = result.get("per_category") or {}
+        if per_cat:
+            cat_strs = [f"{cat}: c{v['cert']}/f{v['fuzzy']}/n{v['non']}"
+                        for cat, v in sorted(per_cat.items())]
+            print(f"  per-category (cert/fuzzy/non): {' | '.join(cat_strs)}")
+
+    # Tail step: cv_probe. Skip entirely if not configured.
+    probe_cfg = (cfg.get("strategies") or {}).get("cv_probe")
+    if probe_cfg is not None:
+        from strategies.cv_probe import CVProbe
+        probe = CVProbe(cfg)
+        probe_out = probe.run_probe(result, ledger, verbose=verbose)
+        result["probe"] = probe_out
     return result
 
 
@@ -422,6 +440,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("arb-stats", help="print gap-distribution diagnostics for arb")
     sub.add_parser("cv", help="run the cross-venue arb (Polymarket x Kalshi) only")
     sub.add_parser("cv-stats", help="print cross-venue pair + gap diagnostics")
+    sub.add_parser("cv-probe",
+                    help="print CV-PROBE research-book stats (FUZZY divergence experiment)")
     sub.add_parser("scout", help="run the copy-trading scout: build/update roster")
     sub.add_parser("follow", help="run the copy-trading follower cycle once")
     sub.add_parser("copy-backtest", help="copy-trading backtest table (ESTIMATEs)")
@@ -503,6 +523,12 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config()
         ledger = ledger_from_cfg(cfg)
         print_cv_stats(cfg, ledger)
+        return 0
+    if args.cmd == "cv-probe":
+        cfg = load_config()
+        ledger = ledger_from_cfg(cfg)
+        from foundation.report import print_cv_probe_report
+        print_cv_probe_report(cfg, ledger)
         return 0
     if args.cmd == "scout":
         return _run_scout()

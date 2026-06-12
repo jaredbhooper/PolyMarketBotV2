@@ -412,12 +412,19 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
     # Settle cross-venue positions.
     cv_settled, cv_skipped = grade_cv_positions(cfg, ledger, today, verbose=verbose)
 
+    # Settle cv_probe (quarantined research book). Same dual-venue
+    # resolution as cv_positions but tracks agreement_outcome and writes
+    # to cv_probe_positions instead.
+    probe_settled, probe_skipped = grade_cv_probe_positions(
+        cfg, ledger, today, verbose=verbose)
+
     # Recompute per-strategy daily report rows.
     update_reports(ledger, cfg, today.isoformat(), verbose=verbose)
 
     return {"settled": settled, "skipped": skipped,
             "arb_settled": arb_settled, "arb_skipped": arb_skipped,
             "cv_settled": cv_settled, "cv_skipped": cv_skipped,
+            "cv_probe_settled": probe_settled, "cv_probe_skipped": probe_skipped,
             "open_remaining": len(ledger.open_positions())}
 
 
@@ -607,6 +614,172 @@ def grade_cv_positions(cfg: dict, ledger: Ledger, today, verbose: bool = True
                   f"{pos['direction']} shares={pos['shares']:.1f} "
                   f"cost=${total_cost:.2f} payout=${total_payout:.2f} "
                   f"PnL=${pnl:+.2f}{div_note}")
+    return settled, skipped
+
+
+def _resolve_cv_leg(leg, sess, gamma: str, kalshi_base: str
+                       ) -> tuple[str | None, float | None]:
+    """Look up resolution for a single CV leg. Returns (outcome, payout).
+
+    outcome is one of: 'YES', 'NO', 'VOID', or None if not yet resolved.
+    payout is in dollars: shares if our side won, 0 if lost, or
+    leg['cost'] if VOID (stake returned at cost).
+
+    'VOID' is detected as:
+      - Polymarket: `closed=True` but `outcomePrices` missing or not [1,0]/[0,1]
+        (e.g. event invalidated). Conservative — most Polymarket markets
+        resolve cleanly to YES/NO, so VOID is rare here.
+      - Kalshi: status='settled' but result is empty or one of the
+        documented void/invalidation strings.
+    """
+    if leg["venue"] == "polymarket":
+        try:
+            r = sess.get(f"{gamma}/markets",
+                          params={"condition_ids": leg["venue_market_id"]},
+                          timeout=20)
+            data = r.json()
+            m = data[0] if data else None
+        except Exception:
+            m = None
+        if not m or not m.get("closed"):
+            return None, None
+        try:
+            op = m.get("outcomePrices")
+            if isinstance(op, str):
+                op = json.loads(op)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            op = None
+        if not op or len(op) < 2:
+            # Closed but no decisive prices -> treat as VOID.
+            return "VOID", float(leg["cost"])
+        try:
+            yes_price = float(op[0])
+            no_price = float(op[1])
+        except (TypeError, ValueError):
+            return "VOID", float(leg["cost"])
+        if yes_price > 0.99:
+            outcome = "YES"
+        elif no_price > 0.99:
+            outcome = "NO"
+        else:
+            return "VOID", float(leg["cost"])
+        side_won = (leg["side"] == outcome)
+        return outcome, float(leg["shares"]) if side_won else 0.0
+    if leg["venue"] == "kalshi":
+        try:
+            r = sess.get(f"{kalshi_base}/markets/{leg['venue_market_id']}",
+                          timeout=20)
+            data = r.json()
+            m = data.get("market") if isinstance(data, dict) else None
+        except Exception:
+            m = None
+        if not m:
+            return None, None
+        status = (m.get("status") or "").lower()
+        result = (m.get("result") or "").lower()
+        if status != "settled":
+            return None, None
+        if result in ("yes", "no"):
+            outcome = result.upper()
+            side_won = (leg["side"] == outcome)
+            return outcome, float(leg["shares"]) if side_won else 0.0
+        # Kalshi voids settle with empty/'void'/'invalidated' results.
+        if result in ("", "void", "voided", "invalidated", "cancelled", "canceled"):
+            return "VOID", float(leg["cost"])
+        # Unknown result string -> conservative VOID so the position
+        # closes cleanly rather than hanging open forever.
+        return "VOID", float(leg["cost"])
+    return None, None
+
+
+def _classify_cv_probe_agreement(leg_outcomes: list[dict]
+                                    ) -> tuple[str, str | None]:
+    """Compute (agreement_outcome, divergence_direction) for a probe
+    position.
+
+    agreement_outcome:
+      AGREED         - both venues settled (YES/NO), exactly one leg paid.
+      DIVERGED       - both settled but venues disagreed on the event.
+      VOID_MISMATCH  - one venue VOID, the other settled YES/NO.
+      BOTH_VOID      - both VOID.
+    divergence_direction (only set when agreement_outcome=DIVERGED):
+      BOTH_PAID      - venues disagreed AND we were on the right side of
+                       each (windfall: ~$1+gap per share).
+      NEITHER_PAID   - venues disagreed AND we were wrong on both
+                       (catastrophe: ~$1-gap loss per share).
+    Returns ("PENDING", None) if any leg has no resolution yet.
+
+    In any POLY_YES_KAL_NO probe, AGREED means EXACTLY one of our two
+    legs paid out (one venue settled YES and the other NO of the same
+    event). 2 payers = both venues disagreed in our favor (windfall);
+    0 payers = both disagreed against us (catastrophe)."""
+    outs = [(L.get("outcome") or "").upper() for L in leg_outcomes]
+    if not outs or any(not o for o in outs):
+        return "PENDING", None
+    if all(o == "VOID" for o in outs):
+        return "BOTH_VOID", None
+    if any(o == "VOID" for o in outs):
+        return "VOID_MISMATCH", None
+    payers = sum(1 for L in leg_outcomes if float(L.get("payout") or 0.0) > 0)
+    if payers == 1:
+        return "AGREED", None
+    if payers == len(leg_outcomes):
+        return "DIVERGED", "BOTH_PAID"
+    return "DIVERGED", "NEITHER_PAID"
+
+
+def grade_cv_probe_positions(cfg: dict, ledger: Ledger, today,
+                                verbose: bool = True) -> tuple[int, int]:
+    """Settle every OPEN cv_probe position whose legs have all resolved.
+
+    Same dual-venue resolution as cv_positions, but records
+    agreement_outcome and writes to cv_probe_positions. P&L is calculated
+    identically (sum of leg payouts - sum of leg costs); for VOID legs we
+    treat the venue as returning the stake at cost (payout=leg_cost),
+    which makes a BOTH_VOID position settle at 0 P&L."""
+    import requests
+    settled = 0
+    skipped = 0
+    open_probes = ledger.list_open_cv_probe()
+    if verbose:
+        print(f"Grader: {len(open_probes)} open cv_probe positions to evaluate.")
+    gamma = (cfg.get("scanner") or {}).get(
+        "gamma_url", "https://gamma-api.polymarket.com").rstrip("/")
+    kalshi_base = "https://api.elections.kalshi.com/trade-api/v2"
+    sess = requests.Session()
+
+    for pos in open_probes:
+        legs = ledger.cv_probe_legs_for(int(pos["id"]))
+        if not legs:
+            continue
+        leg_outcomes = []
+        all_resolved = True
+        for leg in legs:
+            outcome, payout = _resolve_cv_leg(leg, sess, gamma, kalshi_base)
+            if outcome is None or payout is None:
+                all_resolved = False
+                break
+            leg_outcomes.append({
+                "leg_id": int(leg["id"]),
+                "outcome": outcome,
+                "payout": payout,
+            })
+        if not all_resolved:
+            skipped += 1
+            continue
+        total_payout = sum(L["payout"] for L in leg_outcomes)
+        total_cost = float(pos["total_cost"])
+        pnl = total_payout - total_cost
+        agreement, divergence_direction = _classify_cv_probe_agreement(
+            leg_outcomes)
+        ledger.close_cv_probe_position(int(pos["id"]), agreement, pnl,
+                                          leg_outcomes,
+                                          divergence_direction=divergence_direction)
+        settled += 1
+        if verbose:
+            dd = f"/{divergence_direction}" if divergence_direction else ""
+            print(f"  Settled cv_probe pos {pos['id']} {pos['category']} "
+                  f"{pos['direction']} -> {agreement}{dd} PnL=${pnl:+.2f}")
     return settled, skipped
 
 

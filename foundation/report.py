@@ -148,6 +148,14 @@ def print_master_report(cfg_path: str = "config.yaml") -> None:
     except Exception as exc:
         print(f"  COPY bot_likeness render failed: {exc}")
 
+    # ---- CV-PROBE (research book) section --------------------------------
+    # Quarantined experiment - NOT part of the main bankroll scoreboard.
+    try:
+        print()
+        print_cv_probe_report(cfg, ledger)
+    except Exception as exc:
+        print(f"  CV-PROBE render failed: {exc}")
+
     # ---- Today equity snapshot (if not already there) ------------------
     for r in snapshot:
         s = r["strategy"]
@@ -315,6 +323,162 @@ def _print_copy_bot_likeness(cfg: dict, ledger: Ledger) -> None:
         print(f"    {'-'*20} {'-'*5} {'-'*10} {'-'*12}")
         for k, v in buckets.items():
             print(f"    {k:20s} {v['n']:>5d} ${v['pnl']:>+9.2f} ${v['tax']:>+11.2f}")
+    print()
+
+
+def print_cv_probe_report(cfg: dict, ledger: Ledger) -> None:
+    """CV-PROBE (research) section. Quarantined from main bankroll.
+
+    Per category + overall:
+      - pairs OPEN / SETTLED (incl. by agreement_outcome)
+      - average net gap captured on AGREED pairs (probe revenue)
+      - average loss on DIVERGED pairs (probe risk)
+      - average P&L on VOID_MISMATCH pairs
+      - total P&L
+      - breakeven divergence rate implied by the average gap:
+          breakeven = gap / (gap + loss_per_divergence)
+        (When you lose `gap+1` on divergence and earn `gap` on agreement,
+        breakeven divergence rate is gap / (gap + (1 + gap)) ~= gap / (1+2*gap).
+        We use the empirical avg loss per diverged pair from the data
+        instead of the theoretical $1+gap so the verdict reflects reality.)
+      - VERDICT line: divergence% vs breakeven% -> POSITIVE/NEGATIVE EV.
+
+    Cap snapshot at the top: open positions, lifetime opened, daily caps.
+    """
+    pcfg = (cfg.get("strategies") or {}).get("cv_probe") or {}
+    print("=== CV-PROBE (quarantined research book) ===")
+    print(f"  capital pool: ${float(pcfg.get('probe_capital', 500.0)):.0f} virtual "
+          f"(NOT part of main bankroll)")
+    print(f"  stake per pair: ${float(pcfg.get('probe_stake_usd', 5.0)):.2f}  |  "
+          f"min gap to open: ${float(pcfg.get('min_probe_gap', 0.02)):.2f}  |  "
+          f"min match conf: {float(pcfg.get('min_match_confidence', 0.9)):.2f}")
+    print(f"  daily caps: {int(pcfg.get('max_probe_per_day', 40))} total/day, "
+          f"{int(pcfg.get('max_probe_per_day_per_category', 15))} per-category/day, "
+          f"{int(pcfg.get('max_probe_total', 1000))} lifetime")
+    today = datetime.now(timezone.utc).date().isoformat()
+    open_n = ledger.cv_probe_count_open()
+    today_n = ledger.cv_probe_count_today(today)
+    print(f"  positions: {open_n} OPEN  |  {today_n} opened today")
+
+    rows = ledger.cv_probe_settled_stats()
+    if not rows:
+        print()
+        print("  (no settled probe positions yet)")
+        return
+
+    # Pivot rows by category. Each settled-stats row is
+    # (category, agreement_outcome, divergence_direction, n, avg_gap,
+    # avg_pnl, sum_pnl). The DIVERGED rows split by divergence_direction
+    # (BOTH_PAID vs NEITHER_PAID); other agreement_outcomes have
+    # divergence_direction = '' (the COALESCE in settled_stats).
+    BUCKETS = ("AGREED", "DIVERGED_BOTH", "DIVERGED_NEITHER",
+                "VOID_MISMATCH", "BOTH_VOID")
+
+    def _empty() -> dict:
+        return {"n": 0, "sum_gap": 0.0, "sum_pnl": 0.0, "sum_avg_pnl_w": 0.0}
+
+    by_cat: dict[str, dict[str, dict]] = {}
+    for r in rows:
+        cat = r["category"] or "unknown"
+        ao = r["agreement_outcome"] or "?"
+        dd = r["divergence_direction"] or ""
+        bucket_key = ao
+        if ao == "DIVERGED":
+            if dd == "BOTH_PAID":
+                bucket_key = "DIVERGED_BOTH"
+            elif dd == "NEITHER_PAID":
+                bucket_key = "DIVERGED_NEITHER"
+            else:
+                # Legacy rows from before the column existed - we cannot
+                # tell which direction they were, so bucket them under
+                # DIVERGED_NEITHER (the conservative loss direction)
+                # rather than silently dropping them. New rows always set
+                # divergence_direction so this only affects old data.
+                bucket_key = "DIVERGED_NEITHER"
+        bucket = by_cat.setdefault(cat, {})
+        cur = bucket.setdefault(bucket_key, _empty())
+        n_i = int(r["n"])
+        cur["n"] += n_i
+        cur["sum_gap"] += float(r["avg_gap"] or 0.0) * n_i
+        cur["sum_pnl"] += float(r["sum_pnl"] or 0.0)
+        cur["sum_avg_pnl_w"] += float(r["avg_pnl"] or 0.0) * n_i
+
+    # Header.
+    print()
+    print(f"  {'category':10s} {'pairs':>5s} {'AGR':>4s} {'DIV':>4s} "
+          f"{'D-Both':>6s} {'avgP+':>6s} {'D-Neith':>7s} {'avgP-':>6s} "
+          f"{'VOID':>4s} {'BOTH':>4s} {'div_rate':>9s} {'avg_gap':>9s} "
+          f"{'break_div':>10s} {'total_pnl':>10s}  verdict")
+    print("  " + "-" * 130)
+
+    def _vals(bucket: dict, key: str) -> dict:
+        return bucket.get(key, _empty())
+
+    cats_sorted = sorted(by_cat) + ["__OVERALL__"]
+    for cat in cats_sorted:
+        if cat == "__OVERALL__":
+            bucket: dict[str, dict] = {}
+            for _, c_bucket in by_cat.items():
+                for key, vals in c_bucket.items():
+                    cur = bucket.setdefault(key, _empty())
+                    cur["n"] += vals["n"]
+                    cur["sum_pnl"] += vals["sum_pnl"]
+                    cur["sum_gap"] += vals["sum_gap"]
+                    cur["sum_avg_pnl_w"] += vals["sum_avg_pnl_w"]
+            label = "OVERALL"
+        else:
+            bucket = by_cat[cat]
+            label = cat
+
+        agr = _vals(bucket, "AGREED")
+        dboth = _vals(bucket, "DIVERGED_BOTH")
+        dneith = _vals(bucket, "DIVERGED_NEITHER")
+        vm = _vals(bucket, "VOID_MISMATCH")
+        bv = _vals(bucket, "BOTH_VOID")
+
+        n_agr = agr["n"]; n_dboth = dboth["n"]; n_dneith = dneith["n"]
+        n_div = n_dboth + n_dneith
+        n_vm = vm["n"]; n_bv = bv["n"]
+
+        # BOTH_VOID excluded from divergence-rate denominator (no
+        # information about whether the venues would have agreed).
+        n_eff = n_agr + n_div + n_vm
+        n_total = n_eff + n_bv
+
+        agr_avg_gap = (agr["sum_gap"] / n_agr) if n_agr else 0.0
+        avg_pnl_dboth = (dboth["sum_avg_pnl_w"] / n_dboth) if n_dboth else 0.0
+        avg_pnl_dneith = (dneith["sum_avg_pnl_w"] / n_dneith) if n_dneith else 0.0
+        sum_pnl = (agr["sum_pnl"] + dboth["sum_pnl"] + dneith["sum_pnl"]
+                    + vm["sum_pnl"] + bv["sum_pnl"])
+
+        div_rate = (n_div / n_eff) if n_eff else 0.0
+        # Catastrophe-direction loss (positive number = $ lost per pair).
+        # Used in the empirical breakeven: how big does the gap need to
+        # be to cover the realized catastrophe rate?
+        avg_loss_neith = -avg_pnl_dneith if n_dneith else 0.0
+        # Empirical breakeven against the NEITHER_PAID direction (the
+        # actual loss direction; BOTH_PAID already pays for itself).
+        if n_dneith >= 1 and avg_loss_neith > 0:
+            breakeven = agr_avg_gap / (agr_avg_gap + avg_loss_neith)
+        elif agr_avg_gap > 0:
+            # Theoretical fallback: catastrophe loses ~$1 per share.
+            breakeven = agr_avg_gap / (agr_avg_gap + 1.0)
+        else:
+            breakeven = 0.0
+
+        if n_eff < 10:
+            verdict = f"INSUFFICIENT (n={n_eff})"
+        elif div_rate < breakeven:
+            verdict = "POSITIVE EV"
+        else:
+            verdict = "NEGATIVE EV"
+
+        print(f"  {label[:10]:10s} {n_total:>5d} {n_agr:>4d} {n_div:>4d} "
+              f"{n_dboth:>6d} ${avg_pnl_dboth:>+5.2f} "
+              f"{n_dneith:>7d} ${avg_pnl_dneith:>+5.2f} "
+              f"{n_vm:>4d} {n_bv:>4d} {div_rate*100:>7.1f}% "
+              f"${agr_avg_gap:>7.3f} {breakeven*100:>8.1f}% "
+              f"${sum_pnl:>+9.2f}  {verdict}")
     print()
 
 

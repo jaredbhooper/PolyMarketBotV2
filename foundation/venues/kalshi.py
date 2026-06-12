@@ -158,12 +158,11 @@ class KalshiVenue(Venue):
 
     @staticmethod
     def _kalshi_fee(price: float, multiplier: float = 1.0) -> float:
-        """Standard Kalshi fee per contract = ceil(fee_mult * 7c * p*(1-p)),
-        in dollars. Rounded UP to the next cent."""
-        if not (0.0 < price < 1.0):
-            return 0.0
-        raw = multiplier * 0.07 * price * (1.0 - price)
-        return math.ceil(raw * 100.0) / 100.0
+        """Thin wrapper around foundation.fees.kalshi_fee_per_contract -
+        kept for legacy callers (strategies.cross_venue_arb references
+        this static method by name)."""
+        from foundation.fees import kalshi_fee_per_contract
+        return kalshi_fee_per_contract(price, multiplier=multiplier)
 
     # ------------------------------------------------------------ public
     def fetch_markets(self, category_hint: str | None = None,

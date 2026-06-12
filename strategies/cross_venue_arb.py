@@ -79,6 +79,50 @@ def kalshi_quadratic_fee(price: float, multiplier: float = 1.0) -> float:
     return math.ceil(raw * 100.0) / 100.0
 
 
+def bucket_markets_by_category_date(markets: list[VenueMarket]
+                                       ) -> dict[tuple, list[VenueMarket]]:
+    """v2: coarse bucket by (category, date) for non-weather pairs.
+    Lets the matcher pre-filter to same-category-same-date pairs before
+    running per-category classification."""
+    from foundation.equivalence import detect_category, detect_date
+    out: dict[tuple, list[VenueMarket]] = {}
+    for m in markets:
+        # detect_category is pairwise; for a single market we approximate
+        # by category-hint on extras + sport/crypto keyword sniff.
+        text = " ".join([m.title or "", m.leg_title or "",
+                         m.extras.get("series_title") or "",
+                         m.extras.get("category") or "",
+                         m.extras.get("series_category") or "",
+                         m.venue_event_id or ""]).lower()
+        cat = (m.extras.get("category")
+                or _cheap_category_from_text(text))
+        date = detect_date(text) or (m.close_time_iso or "")[:10] or None
+        if cat == "weather" or not cat:
+            continue
+        if not date:
+            continue
+        out.setdefault((cat, date), []).append(m)
+    return out
+
+
+def _cheap_category_from_text(text: str) -> str:
+    """Single-market category sniff from concatenated text. Used by
+    bucket_markets_by_category_date for non-weather pre-bucketing."""
+    from foundation.equivalence import (POLITICS_KEYWORDS, ECONOMICS_KEYWORDS,
+                                          detect_sport, detect_crypto_asset)
+    if "climate" in text or "weather" in text or "temperature" in text:
+        return "weather"
+    if detect_sport(text):
+        return "sports"
+    if detect_crypto_asset(text):
+        return "crypto"
+    if any(k in text for k in POLITICS_KEYWORDS):
+        return "politics"
+    if any(k in text for k in ECONOMICS_KEYWORDS):
+        return "economics"
+    return ""
+
+
 # --- matcher -------------------------------------------------------------
 def bucket_markets_by_key(markets: list[VenueMarket]) -> dict[tuple, list[VenueMarket]]:
     """Group markets by (city, date, kind) for cheap candidate-pair
@@ -155,6 +199,16 @@ class CrossVenueArb(Strategy):
         # Kalshi category filter; default is weather (where the daily
         # overlap with Polymarket lives).
         self.kalshi_categories = s.get("kalshi_categories") or ["Climate and Weather"]
+        # v2: minimum match confidence for ANY action (certified or probe).
+        # Tight by design - mismatched pairs corrupt the probe statistic.
+        self.min_match_confidence = float(s.get("min_match_confidence", 0.9))
+        # v2: time budget for the entire cv scan (cycle.yml is 30 min;
+        # cv lives alongside other strategies in cycle so budget it).
+        self.cv_scan_budget_minutes = float(s.get("cv_scan_budget_minutes", 8.0))
+        # v2: category rotation. Each cycle picks ONE category by
+        # round-robin; persisted across cycles via the executor.
+        self.category_rotation = s.get("category_rotation") or [
+            "weather", "sports", "crypto", "politics", "economics"]
 
     # --- strategy ABC no-ops ----------------------------------------------
     def relevant_markets(self, markets: list[Market]) -> list[Market]:
@@ -191,54 +245,87 @@ class CrossVenueArb(Strategy):
         if verbose:
             print(f"  kalshi:     {len(kal_markets)} markets")
 
-        # Bucket both sides.
+        import time as _time
+        deadline = _time.time() + self.cv_scan_budget_minutes * 60.0
+        # Bucket both sides (weather: city/date/kind path).
         poly_buckets = bucket_markets_by_key(poly_markets)
         kal_buckets = bucket_markets_by_key(kal_markets)
+        # v2: extra bucket for non-weather categories.
+        poly_cat_buckets = bucket_markets_by_category_date(poly_markets)
+        kal_cat_buckets = bucket_markets_by_category_date(kal_markets)
         # Candidate keys = intersection.
         shared = set(poly_buckets) & set(kal_buckets)
+        shared_cat = set(poly_cat_buckets) & set(kal_cat_buckets)
         if verbose:
             print(f"  shared (city, date, kind) buckets: {len(shared)}")
+            print(f"  shared (category, date) buckets:   {len(shared_cat)}  "
+                  f"(non-weather)")
 
         # --- build + classify all candidate pairs -------------------------
         detections: list[CVDetection] = []
         certified = 0
         fuzzy = 0
         nonmatch = 0
+        per_category_counts: dict[str, dict[str, int]] = {}
         # First pass: classify every candidate pair WITHOUT fetching books
         # (so 99% of NON-MATCH pairs cost nothing). Persist CERT + FUZZY.
         cert_fuzz_pairs: list[tuple[int, VenueMarket, VenueMarket, EquivalenceResult]] = []
+
+        def _process(p: VenueMarket, k: VenueMarket, key_city: str | None,
+                       key_date: str | None) -> None:
+            nonlocal certified, fuzzy, nonmatch
+            res = classify_pair(p, k)
+            cat = res.category or "unknown"
+            per_category_counts.setdefault(cat, {"cert": 0, "fuzzy": 0, "non": 0})
+            if res.classification == "NON-MATCH":
+                nonmatch += 1
+                per_category_counts[cat]["non"] += 1
+                return
+            if res.classification == "CERTIFIED-IDENTICAL":
+                certified += 1
+                per_category_counts[cat]["cert"] += 1
+            else:
+                fuzzy += 1
+                per_category_counts[cat]["fuzzy"] += 1
+            pair_id = ledger.upsert_cv_pair({
+                "poly_market_id": p.venue_market_id,
+                "kalshi_ticker":  k.venue_market_id,
+                "poly_title": p.title,
+                "kalshi_title": k.title,
+                "poly_leg": p.leg_title,
+                "kalshi_leg": k.leg_title,
+                "poly_close": p.close_time_iso,
+                "kalshi_close": k.close_time_iso,
+                "poly_source": p.settlement_source,
+                "kalshi_source": k.settlement_source,
+                "city": key_city,
+                "date": key_date,
+                "classification": res.classification,
+                "reason": res.reason,
+                "criteria": res.criteria,
+                "divergence_risk_note": res.divergence_risk_note,
+                "category": res.category,
+                "confidence": res.confidence,
+            })
+            cert_fuzz_pairs.append((pair_id, p, k, res))
+
         for key in shared:
-            poly_legs = poly_buckets[key]
-            kal_legs = kal_buckets[key]
-            for p in poly_legs:
-                for k in kal_legs:
-                    res = classify_pair(p, k)
-                    if res.classification == "NON-MATCH":
-                        nonmatch += 1
-                        continue
-                    if res.classification == "CERTIFIED-IDENTICAL":
-                        certified += 1
-                    else:
-                        fuzzy += 1
-                    pair_id = ledger.upsert_cv_pair({
-                        "poly_market_id": p.venue_market_id,
-                        "kalshi_ticker":  k.venue_market_id,
-                        "poly_title": p.title,
-                        "kalshi_title": k.title,
-                        "poly_leg": p.leg_title,
-                        "kalshi_leg": k.leg_title,
-                        "poly_close": p.close_time_iso,
-                        "kalshi_close": k.close_time_iso,
-                        "poly_source": p.settlement_source,
-                        "kalshi_source": k.settlement_source,
-                        "city": key[0],
-                        "date": key[1],
-                        "classification": res.classification,
-                        "reason": res.reason,
-                        "criteria": res.criteria,
-                        "divergence_risk_note": res.divergence_risk_note,
-                    })
-                    cert_fuzz_pairs.append((pair_id, p, k, res))
+            if _time.time() >= deadline:
+                if verbose:
+                    print("  cv scan: time budget reached during weather classify")
+                break
+            for p in poly_buckets[key]:
+                for k in kal_buckets[key]:
+                    _process(p, k, key[0], key[1])
+        # v2: non-weather pairs by (category, date).
+        for key in shared_cat:
+            if _time.time() >= deadline:
+                if verbose:
+                    print("  cv scan: time budget reached during non-weather classify")
+                break
+            for p in poly_cat_buckets[key]:
+                for k in kal_cat_buckets[key]:
+                    _process(p, k, None, key[1])
 
         # Second pass: lazy-fetch books ONLY for classified pairs we'll
         # walk. De-dupe via id() so each market's book is fetched once
@@ -292,11 +379,21 @@ class CrossVenueArb(Strategy):
             logged += 1
 
         # --- paper-execute only certified above threshold -----------------
+        # Build a lookup of pair_id -> equivalence confidence so we can
+        # enforce the conservatism gate without re-classifying.
+        conf_by_pair: dict[int, float] = {pid: res.confidence
+                                            for pid, _p, _k, res in cert_fuzz_pairs}
         fired = 0
         for det in detections:
             if not det.cleared_threshold:
                 continue
             if det.classification != "CERTIFIED-IDENTICAL" and not self.execute_fuzzy:
+                continue
+            # v2: hard gate - never fire below 0.9 confidence even on
+            # CERTIFIED. The classifier could be marginal on an edge-case
+            # pair; the conservatism gate prevents partial-confidence
+            # certifications from triggering real fills.
+            if conf_by_pair.get(det.pair_id, 0.0) < self.min_match_confidence:
                 continue
             today = datetime.now(timezone.utc).date().isoformat()
             if ledger.cv_pair_traded_today(det.pair_id, self.name,
@@ -313,10 +410,12 @@ class CrossVenueArb(Strategy):
 
         return {
             "detections": detections,
+            "cert_fuzz_pairs": cert_fuzz_pairs,    # v2: probe consumes this
+            "per_category":   per_category_counts, # v2: report consumes this
             "counters": {
                 "polymarket_markets": len(poly_markets),
                 "kalshi_markets":     len(kal_markets),
-                "shared_keys":        len(shared),
+                "shared_keys":        len(shared) + len(shared_cat),
                 "certified":          certified,
                 "fuzzy":              fuzzy,
                 "nonmatch":           nonmatch,

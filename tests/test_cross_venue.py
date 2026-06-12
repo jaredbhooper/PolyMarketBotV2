@@ -246,6 +246,183 @@ def test_scan_cv_logs_certified_and_fires_above_threshold(monkeypatch):
         pass     # Windows file-lock during teardown is harmless
 
 
+# -------------------------------------------------------------- v2: multi-category matcher + confidence
+def test_classify_certified_sports_when_teams_date_settlement_align():
+    """Synthetic identical sports market: same teams, same date, same OT
+    rules, same source code, cutoffs within 24h -> CERTIFIED-IDENTICAL
+    with confidence >= 0.9."""
+    poly = _mk("polymarket", "0xS1",
+                "NBA: Lakers vs Celtics on Jun 11, 2026?",
+                "Lakers", "Official scoring NBA",
+                "https://nba/x", "2026-06-12T05:00:00Z",
+                [{"price": 0.50, "size": 100}],
+                [{"price": 0.50, "size": 100}],
+                extras={"event_slug": "lakers-celtics-2026-06-11"})
+    poly.rules_text = "Includes overtime. Settles via official NBA scoring."
+    kal = _mk("kalshi", "KXNBA-LAKCEL-26JUN11",
+               "NBA: Lakers vs Celtics on Jun 11, 2026?",
+               "Lakers", "Official scoring NBA (Kalshi)",
+               "https://nba/x", "2026-06-12T04:59:00Z",
+               [{"price": 0.51, "size": 100}],
+               [{"price": 0.49, "size": 100}],
+               extras={"series_ticker": "KXNBA",
+                       "series_title": "NBA Game Winner Lakers Celtics"})
+    kal.rules_text = "Includes overtime. Settles via official NBA scoring."
+    r = classify_pair(poly, kal)
+    assert r.category == "sports"
+    assert r.confidence >= 0.9
+    assert r.classification == "CERTIFIED-IDENTICAL"
+
+
+def test_classify_sports_below_confidence_threshold_is_not_certified():
+    """Mismatched OT-rule mention drops confidence under 0.9 and
+    classification falls to FUZZY -- the conservatism gate."""
+    poly = _mk("polymarket", "0xS2",
+                "NBA: Lakers vs Celtics on Jun 11, 2026?",
+                "Lakers", "Official scoring NBA",
+                "https://nba/x", "2026-06-12T05:00:00Z",
+                [{"price": 0.50, "size": 100}],
+                [{"price": 0.50, "size": 100}],
+                extras={"event_slug": "lakers-celtics-2026-06-11"})
+    poly.rules_text = "Settles in regulation only; ties refunded."
+    kal = _mk("kalshi", "KXNBA-LAKCEL-26JUN11",
+               "NBA: Lakers vs Celtics on Jun 11, 2026?",
+               "Lakers", "Official scoring NBA (Kalshi)",
+               "https://nba/x", "2026-06-12T04:59:00Z",
+               [{"price": 0.51, "size": 100}],
+               [{"price": 0.49, "size": 100}],
+               extras={"series_ticker": "KXNBA",
+                       "series_title": "NBA Game Winner Lakers Celtics"})
+    # Different overtime handling -- divergent settlement edge.
+    kal.rules_text = "Includes overtime. Settles via official NBA scoring."
+    r = classify_pair(poly, kal)
+    # Not necessarily NON-MATCH (teams align), but must NOT be CERTIFIED
+    # since the OT mention diverges.
+    assert r.classification != "CERTIFIED-IDENTICAL"
+    assert r.confidence < 0.95
+
+
+def test_classify_crypto_pair_matches_on_asset_strike_source():
+    """Synthetic BTC > $80k on Jun 11; same asset, same strike, same
+    source, same cutoff -> CERTIFIED, confidence >= 0.9."""
+    poly = _mk("polymarket", "0xCR1",
+                "Bitcoin price above $80,000 on Jun 11, 2026?",
+                "$80,000", "CoinGecko BTC",
+                "https://coingecko/btc", "2026-06-12T05:00:00Z",
+                [{"price": 0.30, "size": 100}],
+                [{"price": 0.70, "size": 100}],
+                extras={})
+    kal = _mk("kalshi", "KXBTC-26JUN11-T80000",
+               "BTC > $80,000 on Jun 11, 2026?",
+               "$80,000", "CoinGecko BTC (Kalshi)",
+               "https://coingecko/btc", "2026-06-12T05:30:00Z",
+               [{"price": 0.31, "size": 100}],
+               [{"price": 0.69, "size": 100}],
+               extras={"series_ticker": "KXBTC",
+                       "series_title": "BTC Daily Strike"})
+    r = classify_pair(poly, kal)
+    assert r.category == "crypto"
+    assert r.classification == "CERTIFIED-IDENTICAL"
+    assert r.confidence >= 0.9
+
+
+def test_classify_returns_confidence_field_on_every_result():
+    """Schema sanity: every EquivalenceResult carries a confidence in
+    [0, 1] regardless of category or classification."""
+    poly = _mk("polymarket", "0xX", "Random title", "X",
+                "Some source", None, "2026-06-12T05:00:00Z",
+                [{"price": 0.5, "size": 10}], [{"price": 0.5, "size": 10}])
+    kal = _mk("kalshi", "K-X", "Other title", "Y",
+               "Some source", None, "2026-06-12T05:00:00Z",
+               [{"price": 0.5, "size": 10}], [{"price": 0.5, "size": 10}])
+    r = classify_pair(poly, kal)
+    assert hasattr(r, "confidence")
+    assert 0.0 <= r.confidence <= 1.0
+    assert hasattr(r, "category") and r.category != ""
+
+
+# -------------------------------------------------------------- v2: time budget
+def test_scan_cv_respects_time_budget(monkeypatch):
+    """Set cv_scan_budget_minutes to ~0; the deadline must be reached
+    before the classifier even starts pairing, so certified + fuzzy +
+    nonmatch all stay at zero. Two synthetic weather buckets are present
+    -- without a budget they'd both classify."""
+    poly_a = _mk("polymarket", "0xpA",
+                  "Highest temp Miami on Jun 11, 2026?", "87F",
+                  SAME_SOURCE_POLY, "https://nws/x",
+                  "2026-06-12T05:00:00Z",
+                  [{"price": 0.05, "size": 200}],
+                  [{"price": 0.05, "size": 200}],
+                  extras={"kind": "max"})
+    kal_a = _mk("kalshi", "KXHIGHMIA-26JUN11-T87",
+                 "Highest temp Miami on Jun 11, 2026?", "87F",
+                 SAME_SOURCE_KAL, "https://nws/x",
+                 "2026-06-12T04:59:00Z",
+                 [{"price": 0.06, "size": 200}],
+                 [{"price": 0.04, "size": 200}],
+                 extras={"series_ticker": "KXHIGHMIA"},
+                 fees={"type": "quadratic", "multiplier": 1.0})
+    poly_b = _mk("polymarket", "0xpB",
+                  "Highest temp NYC on Jun 11, 2026?", "87F",
+                  SAME_SOURCE_POLY, "https://nws/y",
+                  "2026-06-12T05:00:00Z",
+                  [{"price": 0.05, "size": 200}],
+                  [{"price": 0.05, "size": 200}],
+                  extras={"kind": "max"})
+    kal_b = _mk("kalshi", "KXHIGHNY-26JUN11-T87",
+                 "Highest temp NYC on Jun 11, 2026?", "87F",
+                 SAME_SOURCE_KAL, "https://nws/y",
+                 "2026-06-12T04:59:00Z",
+                 [{"price": 0.06, "size": 200}],
+                 [{"price": 0.04, "size": 200}],
+                 extras={"series_ticker": "KXHIGHNY"},
+                 fees={"type": "quadratic", "multiplier": 1.0})
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    ledger = Ledger(db_path)
+    cfg = {"strategies": {"cross_venue_arb": {
+        "safety_buffer": 0.005,
+        "min_arb_profit": 1.0,
+        "target_shares": 50.0,
+        "poly_slippage_cents": 0.01,
+        "kalshi_slippage_cents": 0.01,
+        "min_executable_shares": 5.0,
+        "execute_fuzzy": False,
+        "kalshi_categories": ["Climate and Weather"],
+        # Tiny budget -> deadline fires after the first bucket.
+        "cv_scan_budget_minutes": 0.0,
+    }}}
+    strat = CrossVenueArb(cfg)
+
+    class FakePoly:
+        def fetch_markets(self, category_hint=None): return [poly_a, poly_b]
+        def fetch_book_for(self, vm): return None
+    class FakeKal:
+        def fetch_markets(self, category_hint=None): return [kal_a, kal_b]
+        def fetch_book_for(self, vm): return None
+
+    # `import time as _time` inside scan_cv creates a local alias to the
+    # global time module. Patching time.time on the global module is seen
+    # via that alias, so the deadline check fires on the first iteration.
+    import time as time_mod
+    base = time_mod.time()
+    def _t():
+        # Always far past `base + 0` (== deadline with 0-min budget).
+        return base + 60.0
+    monkeypatch.setattr(time_mod, "time", _t)
+
+    result = strat.scan_cv(FakePoly(), FakeKal(), ledger, verbose=False)
+    # Deadline exceeded before any pair processed.
+    assert result["counters"]["certified"] == 0
+    assert result["counters"]["fuzzy"] == 0
+    assert result["counters"]["nonmatch"] == 0
+    try:
+        os.unlink(db_path)
+    except OSError:
+        pass
+
+
 def test_kalshi_orderbook_normalization():
     """The Kalshi orderbook returns no_dollars = NO bid book ascending.
     The venue adapter should normalize to yes_asks = ascending price book

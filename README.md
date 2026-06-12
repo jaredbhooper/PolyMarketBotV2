@@ -754,11 +754,116 @@ decisions cite the same FOMC press release on both venues).
 ```bash
 python main.py cv             # one full scan: pair, classify, walk, log every gap, fire CERTIFIED
 python main.py cv-stats       # diagnostics: pair counts by classification + gap distribution
+python main.py cv-probe       # CV-PROBE research book stats (FUZZY divergence verdict)
 ```
 
 The `cv` command runs only the cross-venue detector; `python main.py
 cycle` runs all active strategies in one pass (weather + bucket_arb +
-cross_venue_arb).
+cross_venue_arb + cv_probe).
+
+### v2 expansion: all-categories scan + FUZZY divergence probe
+
+The v1 cross-venue scanner only matched daily weather between Polymarket
+and Kalshi. v2 expands the scan to **every category both venues share** —
+sports (game/match winners), crypto price markets, politics/elections,
+and economics releases — while **keeping the same conservatism gate**
+that protected the original weather path:
+
+- **Confidence floor (`min_match_confidence`, default 0.9).** Every pair
+  gets a per-category confidence score from `foundation/equivalence.py`.
+  Below 0.9 the pair is not eligible for ANYTHING — neither certified
+  trading nor the probe below. A mismatched pair (two different games
+  paired together) would register as fake "divergence" and corrupt the
+  experiment's headline statistic, so we err well above 0.5.
+- **Per-category settlement fine print.** Sports compares OT /
+  postponement / cancellation handling between rules_text; crypto
+  compares strike + cutoff + reference rate; politics + economics
+  require the same source-of-truth (BLS vs BEA matters, AP vs Reuters
+  matters). Pairs that fail any category-specific edge-case check fall
+  to FUZZY.
+- **Time budget (`cv_scan_budget_minutes`, default 8.0).** The scan
+  measures wall-clock time inside the bucket loops and exits cleanly
+  when the deadline fires, so a single hot vertical (NBA playoffs,
+  major CPI release) can't starve other categories or overrun the cycle
+  workflow's 30-minute window. Books are still fetched lazily — only on
+  pairs we'll actually walk.
+
+#### CV-PROBE: the quarantined FUZZY divergence experiment
+
+The whole point of the FUZZY category is that the two venues *say* the
+same thing but use different referees. Whether their referees actually
+disagree often enough to matter is an empirical question. CV-PROBE
+answers it.
+
+- **Quarantine first.** Probe positions live in their own SQLite tables
+  (`cv_probe_positions`, `cv_probe_legs`), draw from a separate **$500
+  virtual side-book** that is NOT part of the main $1,000 bankroll, and
+  NEVER appear in `cv-stats` or the scoreboard P&L. The master report
+  has a clearly-labelled `CV-PROBE (research)` section. Probe rows
+  carry the pair's match confidence so we can re-bucket later.
+- **Eligibility.** A pair must be FUZZY with confidence >= 0.9, have a
+  net gap >= `min_probe_gap` (default $0.02) AFTER both venues' fees +
+  slippage, and have both legs fillable within visible book depth in
+  the SAME scan cycle. No partial sets: an unfillable leg is logged
+  and the position is not opened.
+- **Selection.** Stake is fixed at `probe_stake_usd` (default $5) per
+  pair. Daily caps (`max_probe_per_day`, default 40) and per-category
+  diversity caps (`max_probe_per_day_per_category`, default 15) plus a
+  lifetime cap (`max_probe_total`, default 1000) bound the experiment.
+  Within each category's quota the largest net gaps win first.
+- **Dedupe.** Maximum ONE open or settled probe position per pair, ever.
+  If a pair gets re-classified FUZZY -> CERTIFIED later, the upgrade
+  routes it to the real strategy and the probe loses eligibility.
+- **Grading.** Each leg settles on its own venue (Polymarket via Gamma,
+  Kalshi via `/markets/{ticker}`). Per-pair `agreement_outcome` is
+  recorded as one of four states; DIVERGED is further split by
+  `divergence_direction`:
+  - **AGREED** — both venues settled the same answer. Exactly one of our
+    paired legs pays $1 → we earn the net gap.
+  - **DIVERGED — BOTH_PAID** — the two venues settled opposite answers
+    AND we happened to be on the right side of each (e.g. POLY_YES_KAL_NO
+    when Polymarket settled YES and Kalshi settled NO). Both legs pay
+    $1 → we collect ≈ $1 + gap per share, the windfall direction.
+  - **DIVERGED — NEITHER_PAID** — the two venues settled opposite answers
+    AND both went against our paired legs. Neither leg pays → we lose
+    ≈ $1 − gap per share, the catastrophe direction.
+  - **VOID_MISMATCH** — one venue voided/cancelled while the other
+    settled. The voided leg is modelled as stake-returned-at-cost; the
+    settled leg pays out normally.
+  - **BOTH_VOID** — both voided; the position unwinds at cost (≈0 P&L).
+
+  Over many pairs the two divergence directions should be roughly
+  symmetric, but because the EV of trading the gap depends on the
+  *imbalance* between them (and on whether DIVERGED pairs are common
+  enough at all), the probe report tracks BOTH_PAID and NEITHER_PAID
+  counts + their separate avg P&L instead of collapsing them.
+
+#### The CV-PROBE deliverable table
+
+The master report renders one row per category plus an overall row:
+
+```
+category   pairs  AGR  DIV  D-Both  avgP+  D-Neith  avgP-  VOID BOTH  div_rate  avg_gap  break_div  total_pnl   verdict
+sports        87   78    2       1  +1.05        1  -0.95     5    2     2.4%   $0.035       3.5%   $+1.40    POSITIVE EV
+weather      120  104    9       4  +1.04        5  -0.96     5    2     7.6%   $0.028       2.8%   $-0.85    NEGATIVE EV
+crypto        43   40    1       1  +1.06        0   0.00     2    0     2.4%   $0.041       4.2%   $+0.55    POSITIVE EV
+OVERALL      250  222   12       6  +1.05        6  -0.96    12    4     4.9%   $0.034       3.4%   $+1.10    POSITIVE EV
+```
+
+The verdict per category compares the empirical divergence rate to the
+breakeven rate implied by the average gap / average diverged-pair loss:
+
+```
+breakeven = avg_gap / (avg_gap + avg_loss_per_neither_paid)
+```
+
+`avg_loss_per_neither_paid` is the average loss conditional on the
+catastrophe direction firing — that's the only DIVERGED bucket the
+average gap has to make up for, because the windfall direction already
+pays for itself. If `diverged_rate × (loss − win) < avg_gap`, the
+category is POSITIVE EV; otherwise NEGATIVE. A category with fewer than
+10 resolved pairs reports `INSUFFICIENT (n=k)` so we don't claim a
+verdict from noise.
 
 ## Strategy #4: Copy-trading (paper)
 

@@ -8,7 +8,8 @@ Status of every strategy shipped in V2. None are disabled.
 |---|------------------|--------|-------|
 | 1 | weather          | ACTIVE | V1 carry-over; bankroll-wired. |
 | 2 | bucket_arb       | ACTIVE | single-leg + multi-mode (`arb_multi` table). |
-| 3 | cross_venue_arb  | ACTIVE | Polymarket vs Kalshi; FUZZY pairs never auto-traded. |
+| 3 | cross_venue_arb  | ACTIVE | Polymarket vs Kalshi; all categories (weather + sports + crypto + politics + economics) since v2; FUZZY pairs never auto-traded; matcher confidence floor 0.9. |
+| 3b | cv_probe        | ACTIVE | QUARANTINED research book ($500 virtual side-book). Paper-trades FUZZY pairs to measure divergence rates per category. Never touches main bankroll. |
 | 4 | copy_trading     | ACTIVE | Scout via /trades aggregation - leaderboard endpoint not reachable. |
 | 5 | sharpline        | ACTIVE | OBSERVE MODE when `ODDS_API_KEY` is empty/missing. Full fill-and-grade lifecycle (RESTING / FILLED / CANCELLED / UNFILLED_RESOLVED) wired to bankroll. |
 | 6 | lp_sim           | ACTIVE | static reward score estimate; fills not yet simulated. |
@@ -57,6 +58,65 @@ The verified schedule lives in `foundation/fees.py:DEFAULT_TAKER_RATES`
 and in `config.yaml:polymarket_fees.rates`. A test
 (`tests/test_fees.py::test_rate_table_matches_verified_2026_03_schedule`)
 fails loudly if the table ever drifts from the source.
+
+## Kalshi fee schedule (verified 2026-04)
+
+Sources (search 2026-06-12):
+- [Kalshi fee schedule PDF](https://kalshi.com/docs/kalshi-fee-schedule.pdf) (April 2026)
+- [marketmath.io — Kalshi Fee Guide 2026](https://marketmath.io/kalshi-fees-2026)
+
+Per-contract quadratic curve with series-level multiplier:
+
+```
+taker_fee_per_contract = ceil(multiplier * 0.07 * p * (1-p) * 100) / 100
+maker_fee_per_contract = ceil(multiplier * 0.0175 * p * (1-p) * 100) / 100
+```
+
+The base rates (`KALSHI_TAKER_BASE = 0.07`, `KALSHI_MAKER_BASE = 0.0175`)
+live in `foundation/fees.py` and the per-series `multiplier` is read
+from the Kalshi series endpoint's `fee_multiplier` field. Premium series
+(crypto, certain sports) carry multipliers > 1.0; the venue adapter
+plumbs them through to `kalshi_fee_per_contract`.
+
+A pinned test
+(`tests/test_fees.py::test_kalshi_base_rates_pinned_to_2026_04_schedule`)
+fails loudly if either base rate drifts, forcing a re-verification.
+
+## v2 cross-venue expansion (2026-06-12)
+
+The cross-venue scanner now covers every category both venues share, not
+just daily weather. Six pieces:
+
+1. **Per-category equivalence classifiers** in `foundation/equivalence.py`
+   (`classify_pair_sports`, `classify_pair_crypto`, `classify_pair_politics`,
+   `classify_pair_economics`) sitting alongside the original
+   `classify_pair_weather`. A dispatcher (`classify_pair`) detects the
+   pair's category from extras + titles and routes accordingly.
+2. **Confidence score** (0..1) returned with every result. The hard
+   floor for ANY action (certified trading OR probe) is
+   `min_match_confidence = 0.9`. Below that the pair is logged as
+   `cv_pairs` but never traded — a mismatched pair (two different games
+   paired together) would corrupt the probe's headline statistic.
+3. **Multi-category bucketing** in `strategies/cross_venue_arb.py`
+   (`bucket_markets_by_category_date`) sits alongside the original
+   weather bucket (`bucket_markets_by_key`). The scanner pairs both
+   buckets in the same pass; cv_gaps and cv_pairs carry a `category`
+   column so per-vertical reporting is cheap.
+4. **Time budget** (`cv_scan_budget_minutes`, default 8.0) bounds the
+   wall-clock cost of an expanded scan. The deadline check sits in the
+   bucket loop, so the scanner degrades gracefully — never overruns the
+   cycle workflow's 30-minute window.
+5. **CV-PROBE quarantined research book** (`strategies/cv_probe.py`).
+   Paper-trades FUZZY pairs to measure how often non-identical referees
+   actually disagree. Caps + dedupe + per-category diversity are
+   enforced in `CVProbe._apply_caps`. The probe's $500 virtual
+   side-book is NOT routed through `Bankroll`, so no bankroll txn is
+   ever recorded for a probe trade.
+6. **Grader path** (`foundation.grader.grade_cv_probe_positions`) settles
+   probe positions with `agreement_outcome` ∈ {AGREED, DIVERGED,
+   VOID_MISMATCH, BOTH_VOID}. Voided legs return stake-at-cost. The
+   master report's `print_cv_probe_report` renders the per-category
+   verdict table.
 
 ## Outstanding deferred work
 
@@ -121,12 +181,13 @@ never race on the `git push` back to main.
 
 - bucket_arb: 5
 - arb_multi: 5
-- cross_venue: 14
+- cross_venue: 19 (14 original + 4 v2 confidence/category + 1 time-budget)
+- cv_probe: 12 (v2 - quarantine, dedupe, caps, agreement outcomes, confidence gate)
 - copy_trading: 10
 - bankroll + health + master report: 8
 - sharpline: 12 (8 original + 4 fill-lifecycle)
 - lp_sim: 4
 - logic_scan: 7
-- fees (verified schedule): 7
+- fees: 14 (7 Polymarket + 7 Kalshi pinned-rate tests, v2 added)
 
-**Total: 72 tests, all passing.**
+**Total: 132 tests, all passing.**
