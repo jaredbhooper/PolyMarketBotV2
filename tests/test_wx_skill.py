@@ -132,18 +132,35 @@ def test_apply_calibration_identity_alpha_one():
 
 # ---------------------------------------------------------------- dispute forensics
 def test_dispute_forensics_constant_offset_flagged():
-    """Same station, multiple rows, ZERO variance => constant offset."""
-    rows = [_row(station="KLGA", om=20.0, wu=21.0) for _ in range(3)]
+    """Same station, three DIFFERENT days, same offset every day =>
+    legitimate constant offset (n=3). The v2.3 aggregator dedupes per
+    (station, resolve_date) so we have to vary the date or the rows
+    collapse to one sample."""
+    rows = [_row(station="KLGA", om=20.0, wu=21.0,
+                  resolve_date=f"2026-06-{10+i:02d}") for i in range(3)]
     fc = dispute_forensics(rows)
     assert fc["KLGA"].n == 3
     assert fc["KLGA"].mean_om_minus_wu == pytest.approx(-1.0)
     assert fc["KLGA"].std_om_minus_wu == pytest.approx(0.0)
 
 
+def test_dispute_forensics_dedupes_sibling_markets_on_same_day():
+    """v2.3 aggregation fix: sibling bucket markets on the same day at
+    the same station report the same OM and the same WU -- they're ONE
+    observation, not N. Wellington's three 2026-06-11 markets all read
+    OM=13.4 / WU=14.0; counting them three times manufactured the
+    'constant offset (likely bug)' verdict."""
+    rows = [_row(station="NZWN", om=13.4, wu=14.0, resolve_date="2026-06-11")
+             for _ in range(3)]
+    fc = dispute_forensics(rows)
+    assert fc["NZWN"].n == 1   # not 3
+    assert fc["NZWN"].mean_om_minus_wu == pytest.approx(-0.6)
+
+
 def test_dispute_forensics_variable_high_std():
-    rows = [_row(station="X", om=20.0, wu=20.0),
-             _row(station="X", om=22.0, wu=20.0),
-             _row(station="X", om=18.0, wu=20.0)]
+    rows = [_row(station="X", om=20.0, wu=20.0, resolve_date="2026-06-10"),
+             _row(station="X", om=22.0, wu=20.0, resolve_date="2026-06-11"),
+             _row(station="X", om=18.0, wu=20.0, resolve_date="2026-06-12")]
     fc = dispute_forensics(rows)
     assert fc["X"].n == 3
     assert fc["X"].mean_om_minus_wu == pytest.approx(0.0)
@@ -268,3 +285,108 @@ def test_family_skill_brier_from_p_threshold():
     rows = [_row(gfs_p=0.7, outcome="YES") for _ in range(10)]
     sk = family_skill(rows, "gfs")
     assert sk.n == 0
+
+
+# ---------------------------------------------------------------- WX-VERIFY render
+def test_print_wx_verify_renders_city_rows_from_brier_only_data(capsys):
+    """v2.3 rendering fix: when family means/errors are absent (backfilled
+    rows) but per-family p_threshold + YES/NO outcome are present, the
+    city table must still render -- showing n/a for MAE/bias and Brier
+    from p_threshold. The empty city table that shipped with n=15 was
+    the original bug."""
+    from main import _print_wx_verify
+    ledger, path = _temp_ledger()
+    try:
+        for i in range(2):
+            ledger.upsert_wx_verification({
+                "market_row_id": 100 + i, "city": "tokyo",
+                "station": "RJTT", "threshold": 30.0, "unit": "C",
+                "bound": "eq", "resolve_date": f"2026-06-{10+i:02d}",
+                "lead_time_hours": 12.0,
+                "official_value": 30.0, "official_value_unit": "C",
+                "om_value": 29.5, "om_value_unit": "C",
+                "wu_value": 30.0, "wu_value_unit": "C",
+                # ONLY p_threshold + outcome populated, no per-family means.
+                "gfs_mean": None, "gfs_spread": None, "gfs_p_threshold": 0.55,
+                "gfs_signed_error": None, "gfs_abs_error": None,
+                "ecmwf_mean": None, "ecmwf_spread": None,
+                "ecmwf_p_threshold": 0.60,
+                "ecmwf_signed_error": None, "ecmwf_abs_error": None,
+                "p_blended": 0.575, "market_price": 0.50,
+                "outcome": "YES" if i == 0 else "NO",
+                "signal_id": None, "settlement_id": None,
+            })
+        _print_wx_verify({}, ledger)
+        captured = capsys.readouterr().out
+        # The pre-fix bug was that the city table was empty even though
+        # n=15 in the header. Assert at least one tokyo row is rendered.
+        assert "tokyo" in captured
+        assert "gfs" in captured or "ecmwf" in captured
+        # MAE/bias should appear as n/a since family means are absent.
+        assert "n/a" in captured
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- regrade WU-authoritative
+def test_regrade_disputed_on_wu_flips_outcome_and_closes_trade():
+    """The 12 DISPUTED June-11 weather settlements were left OPEN because
+    OM disagreed with WU on the rounded integer. v2.3 policy: WU is the
+    real Polymarket source -- grade on WU, log OM as cross-check."""
+    from foundation.grader import regrade_disputed_on_wu
+    from datetime import date
+    ledger, path = _temp_ledger()
+    try:
+        # Synthesize a market in the same shape the scanner writes.
+        # Use the real Polymarket question phrasing so parse_group_title
+        # picks the bucket integer instead of a date integer.
+        market_id = ledger.upsert_market({
+            "condition_id": "0xabc",
+            "slug": "highest-temperature-in-tokyo-on-june-11-2026-30c",
+            "question": "Will the highest temperature in Tokyo be 30C on June 11",
+            "category": "weather",
+            "threshold": 30.0, "unit": "C",
+            "resolve_date": "2026-06-11",
+            "resolution_source": "https://wu/x",
+            "rules_text": "30C",
+        })
+        # DISPUTED settlement: WU=30 (truth), OM=28 (wedge).
+        ledger.record_settlement(
+            int(market_id), 30.0,
+            "open-meteo / wunderground disagree", "DISPUTED",
+            om_value=28.0, wu_value=30.0,
+            wu_source="https://wu/x",
+        )
+        # OPEN paper_trade: we bought NO. WU's rounded 30 == bucket 30
+        # -> outcome YES -> NO position LOSES the full stake.
+        with ledger._conn() as c:
+            c.execute(
+                """INSERT INTO paper_trades
+                    (ts, market_id, strategy, side, price_filled, stake,
+                     shares, p_model_at_entry, edge_at_entry, status)
+                    VALUES (?, ?, 'weather', 'NO', 0.50, 10.0, 20.0,
+                            0.40, 0.10, 'OPEN')""",
+                ("2026-06-10T00:00:00Z", int(market_id)))
+
+        out = regrade_disputed_on_wu({}, ledger, date(2026, 6, 12),
+                                       verbose=False)
+        # The settlement flipped DISPUTED -> YES; the trade closed with
+        # a full-stake LOSS (we bought NO at 0.50 with $10 stake; YES
+        # outcome -> we lose stake).
+        assert len(out["settled"]) == 1
+        ev = out["settled"][0]
+        assert ev["outcome"] == "YES"
+        assert ev["status"] == "LOSS"
+        assert ev["pnl"] == pytest.approx(-10.0)
+        # idempotent: a second run finds zero remaining DISPUTED.
+        again = regrade_disputed_on_wu({}, ledger, date(2026, 6, 12),
+                                         verbose=False)
+        assert again["n_settlements"] == 0
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass

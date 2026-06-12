@@ -302,14 +302,30 @@ class DisputeStation:
 
 
 def dispute_forensics(rows_all: Iterable[dict]) -> dict[str, DisputeStation]:
-    """Group rows by station and compute (OM − WU) distribution. A
-    near-zero std with a non-zero mean indicates a SYSTEMATIC OFFSET per
-    station (likely fixable by bias correction or settlement source
-    config); a large std indicates real-time SOURCE DISAGREEMENT."""
+    """Group rows by station-day and compute (OM − WU) distribution.
+
+    v2.3 aggregation fix: dedupe per (station, resolve_date) instead of
+    per market. The OM-vs-WU reading is a property of the day, not the
+    market -- Wellington has 3 sibling bucket markets on the same day
+    (13c/14c/15c) but they all see the same OM and the same WU. Counting
+    them separately previously manufactured the "constant offset (likely
+    bug)" verdict because each sibling registered as a fresh sample with
+    the same delta.
+
+    A near-zero std with a non-zero mean across MULTIPLE DAYS now legit-
+    imately indicates a systematic per-station offset (a fixable bug);
+    a large std indicates genuine real-time source disagreement; a
+    single station-day reads as 'single sample' (no verdict).
+    """
     by_station: dict[str, list[float]] = {}
+    seen_station_day: set[tuple[str, str]] = set()
     for r in rows_all:
         get = (r.get if hasattr(r, "get") else lambda k, d=None: r[k] if k in r.keys() else d)
         station = get("station") or "?"
+        day = get("resolve_date") or ""
+        key = (station, day)
+        if key in seen_station_day:
+            continue
         om = get("om_value")
         wu = get("wu_value")
         if om is None or wu is None:
@@ -318,6 +334,7 @@ def dispute_forensics(rows_all: Iterable[dict]) -> dict[str, DisputeStation]:
             d = float(om) - float(wu)
         except (TypeError, ValueError):
             continue
+        seen_station_day.add(key)
         by_station.setdefault(station, []).append(d)
     out: dict[str, DisputeStation] = {}
     for st, ds in by_station.items():

@@ -428,6 +428,148 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
             "open_remaining": len(ledger.open_positions())}
 
 
+def _verdict_from_wu(market_row, wu_val: float, kind: str
+                       ) -> tuple[str, float, int]:
+    """Recompute outcome for a single market using WU's value as truth.
+
+    Returns (outcome 'YES'/'NO', truth_value, rounded_int). The market
+    row carries parsed bound/lo/hi/unit in the markets table (or in the
+    re-parsed `extras` we synthesize); we read what's available there.
+    Round-half-up matches the resolver -- WU 73.5F rounds to 74.
+    """
+    import math
+    unit = (market_row["unit"] if "unit" in market_row.keys() else "F") or "F"
+    # WU value is stored in the market's display unit (the resolver kept
+    # it that way), so no conversion needed.
+    wu_round = math.floor(float(wu_val) + 0.5)
+    # Pull bound/lo/hi out of the synthesized Market.extras the way the
+    # original resolver does. We rebuild the Market here so we can lean
+    # on the parser the resolver uses.
+    m = _row_to_market(market_row)
+    bound = m.extras.get("parsed_bound")
+    lo = m.extras.get("lo")
+    hi = m.extras.get("hi")
+    if bound == "le":
+        won = wu_round <= (hi if hi is not None else wu_round)
+    elif bound == "ge":
+        won = wu_round >= (lo if lo is not None else wu_round)
+    elif bound == "eq":
+        won = wu_round == (lo if lo is not None else wu_round)
+    else:
+        won = (
+            (lo is None or wu_round >= lo)
+            and (hi is None or wu_round <= hi)
+        )
+    return ("YES" if won else "NO", float(wu_val), int(wu_round))
+
+
+def regrade_disputed_on_wu(cfg: dict, ledger: Ledger, today,
+                              verbose: bool = True) -> dict:
+    """Settle every DISPUTED weather settlement whose wu_value is
+    populated. Polymarket settles on Wunderground; OM stays as a logged
+    cross-check (om_value in settlements + wx_verification).
+
+    For each DISPUTED row:
+      1. Recompute YES/NO using WU rounded vs the market's bucket.
+      2. UPDATE settlements: outcome, actual_value=wu_value,
+         source_value='wunderground <station>'.
+      3. Close every OPEN paper_trade attached to the market with the
+         realized PnL.
+      4. UPDATE wx_verification.outcome so the WX-VERIFY skill table
+         picks up the now-finalized YES/NO instead of the stale DISPUTED.
+
+    Idempotent: a settlement that's already YES/NO isn't touched.
+    Returns a dict with per-position settlement detail for the report.
+    """
+    import sqlite3 as _sql
+    settled_rows: list[dict] = []
+    with _sql.connect(ledger.db_path) as c:
+        c.row_factory = _sql.Row
+        disputed = list(c.execute(
+            """SELECT s.id AS settlement_id, s.market_id, s.actual_value,
+                      s.om_value, s.wu_value, s.wu_source, s.source_value,
+                      s.outcome,
+                      m.slug, m.unit, m.resolve_date, m.question, m.category,
+                      m.threshold, m.resolution_source, m.rules_text,
+                      m.condition_id
+                 FROM settlements s
+                 JOIN markets m ON m.id = s.market_id
+                WHERE s.outcome = 'DISPUTED'
+                  AND s.wu_value IS NOT NULL"""
+        ).fetchall())
+
+    if verbose:
+        print(f"Re-grading {len(disputed)} DISPUTED settlements on WU ...")
+    for s in disputed:
+        # Determine kind (max/min) from the market slug -- the resolver
+        # writes "highest-temperature" / "lowest-temperature" tags into
+        # the slug.
+        kind = "min" if "lowest-temperature" in (s["slug"] or "") else "max"
+        try:
+            outcome, truth_val, wu_round = _verdict_from_wu(s, float(s["wu_value"]), kind)
+        except Exception as exc:
+            if verbose:
+                print(f"  ! regrade failed for market {s['market_id']}: {exc}")
+            continue
+        # Identify the station note for source_value (best-effort).
+        station = ""
+        if s["wu_source"]:
+            url = s["wu_source"]
+            station = url.split("/daily/")[-1].split("/date/")[0] \
+                if "/daily/" in url else url
+        new_source = f"wunderground {station}".strip()
+
+        # Apply the settlement update and close the linked trades.
+        with ledger._conn() as c:
+            c.execute(
+                """UPDATE settlements
+                       SET outcome=?, actual_value=?, source_value=?
+                     WHERE id=?""",
+                (outcome, truth_val, new_source, int(s["settlement_id"])),
+            )
+            c.execute(
+                """UPDATE wx_verification SET outcome=? WHERE settlement_id=?""",
+                (outcome, int(s["settlement_id"])),
+            )
+            open_trades = list(c.execute(
+                """SELECT id, side, price_filled, stake, shares, strategy
+                     FROM paper_trades
+                    WHERE market_id=? AND status='OPEN'""",
+                (int(s["market_id"]),)).fetchall())
+
+        for tr in open_trades:
+            pnl = _settle_trade_pnl(tr["side"], float(tr["price_filled"]),
+                                    float(tr["stake"]), float(tr["shares"]),
+                                    outcome)
+            status = "WIN" if tr["side"] == outcome else "LOSS"
+            ledger.close_trade(int(tr["id"]), status, pnl)
+            settled_rows.append({
+                "trade_id": int(tr["id"]),
+                "strategy": tr["strategy"],
+                "market_id": int(s["market_id"]),
+                "slug": s["slug"],
+                "resolve_date": s["resolve_date"],
+                "side": tr["side"],
+                "stake": float(tr["stake"]),
+                "shares": float(tr["shares"]),
+                "price_filled": float(tr["price_filled"]),
+                "wu_value": float(s["wu_value"]),
+                "om_value": float(s["om_value"]) if s["om_value"] is not None else None,
+                "wu_round": wu_round,
+                "outcome": outcome,
+                "status": status,
+                "pnl": pnl,
+            })
+            if verbose:
+                print(f"  settled trade {tr['id']} ({tr['strategy']}) {tr['side']}"
+                      f" stake=${tr['stake']:.2f} -> {outcome} ({status}) "
+                      f"PnL=${pnl:+.2f}  (WU={s['wu_value']}, OM={s['om_value']})")
+
+    if settled_rows:
+        update_reports(ledger, cfg, today.isoformat(), verbose=False)
+    return {"settled": settled_rows, "n_settlements": len(disputed)}
+
+
 def grade_arb_multi(cfg: dict, ledger: Ledger, today, verbose: bool = True
                        ) -> tuple[int, int]:
     """Settle every OPEN arb_multi row whose event has resolved.

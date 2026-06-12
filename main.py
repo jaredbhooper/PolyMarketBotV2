@@ -498,6 +498,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("vacuum", help="prune cache.db retention + VACUUM both ledger and cache (daily housekeeping)")
     sub.add_parser("wx-weights", help="print the current per-city adaptive weather weights, biases, and calibration")
     sub.add_parser("wx-verify", help="print the WX-VERIFY skill + dispute-forensics report")
+    sub.add_parser("wx-regrade-disputed",
+                    help="re-settle DISPUTED weather positions on WU (Wunderground is authoritative)")
     aut = sub.add_parser("autopsy", help="behavioral fingerprint + archetype for a single wallet")
     aut.add_argument("wallet")
     aut.add_argument("--refresh", action="store_true",
@@ -631,6 +633,14 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config()
         ledger = ledger_from_cfg(cfg)
         _print_wx_verify(cfg, ledger)
+        return 0
+    if args.cmd == "wx-regrade-disputed":
+        from foundation.grader import regrade_disputed_on_wu
+        from datetime import datetime, timezone
+        cfg = load_config()
+        ledger = ledger_from_cfg(cfg)
+        today = datetime.now(timezone.utc).date()
+        regrade_disputed_on_wu(cfg, ledger, today, verbose=True)
         return 0
     if args.cmd == "autopsy":
         cfg = load_config()
@@ -908,7 +918,16 @@ def _print_wx_weights(cfg: dict, ledger: Ledger) -> None:
 
 def _print_wx_verify(cfg: dict, ledger: Ledger) -> None:
     """Per-city + overall skill tables, reliability bins, and dispute
-    forensics (OM − WU per station)."""
+    forensics (OM − WU per station-day).
+
+    v2.3 rendering fix: family rows print whenever the family has ANY
+    signal we can score (per-family MAE+bias OR per-family p_threshold +
+    YES/NO outcome). Older backfilled rows lack the per-family mean
+    forecast so MAE/bias are absent -- the table still renders Brier
+    from p_threshold so we can see calibration even when the absolute
+    error is unavailable. n/a marks the missing columns honestly
+    instead of silently dropping the row.
+    """
     from foundation.wx_skill import (AdaptiveConfig, FAMILIES, family_skill,
                                        dispute_forensics)
     rows = [dict(r) for r in ledger.list_wx_verifications()]
@@ -917,7 +936,26 @@ def _print_wx_verify(cfg: dict, ledger: Ledger) -> None:
     if not rows:
         print("  no verifications yet")
         return
-    # Per-city skill table.
+
+    def _brier_only(pool: list[dict], family: str) -> tuple[int, float]:
+        """Compute (n, mean_brier) using only p_threshold + outcome.
+        Used as a fallback when family means/spreads are absent."""
+        pkey = f"{family}_p_threshold"
+        n = 0; bsum = 0.0
+        for r in pool:
+            p = r.get(pkey)
+            o = r.get("outcome")
+            if p is None or o not in ("YES", "NO"):
+                continue
+            try:
+                pf = float(p)
+            except (TypeError, ValueError):
+                continue
+            n += 1
+            y = 1.0 if o == "YES" else 0.0
+            bsum += (pf - y) ** 2
+        return n, (bsum / n if n else 0.0)
+
     by_city: dict[str, list[dict]] = {}
     for r in rows:
         by_city.setdefault(r.get("city") or "?", []).append(r)
@@ -925,23 +963,26 @@ def _print_wx_verify(cfg: dict, ledger: Ledger) -> None:
     print(f"  {'city':18s} {'n':>3s} {'fam':>5s} {'n_f':>4s} {'MAE':>6s} "
           f"{'bias':>7s} {'brier':>7s}")
     print(f"  {'-'*18} {'-'*3} {'-'*5} {'-'*4} {'-'*6} {'-'*7} {'-'*7}")
-    for cname in sorted(by_city):
-        pool = by_city[cname]
+
+    def _emit(label: str, pool: list[dict]) -> None:
         for f in FAMILIES:
             sk = family_skill(pool, f)
-            if sk.n == 0:
+            if sk.n > 0:
+                print(f"  {label:18s} {len(pool):>3d} {f:>5s} {sk.n:>4d} "
+                      f"{sk.mae:>6.2f} {sk.signed_bias:>+7.2f} "
+                      f"{sk.brier:>7.4f}")
                 continue
-            print(f"  {cname:18s} {len(pool):>3d} {f:>5s} {sk.n:>4d} "
-                  f"{sk.mae:>6.2f} {sk.signed_bias:>+7.2f} "
-                  f"{sk.brier:>7.4f}")
-    # Overall
-    for f in FAMILIES:
-        sk = family_skill(rows, f)
-        if sk.n == 0:
-            continue
-        print(f"  {'OVERALL':18s} {len(rows):>3d} {f:>5s} {sk.n:>4d} "
-              f"{sk.mae:>6.2f} {sk.signed_bias:>+7.2f} "
-              f"{sk.brier:>7.4f}")
+            # Calibration-only fallback: render Brier from p_threshold +
+            # outcome when per-family error metadata is absent.
+            n_b, brier = _brier_only(pool, f)
+            if n_b == 0:
+                continue
+            print(f"  {label:18s} {len(pool):>3d} {f:>5s} {n_b:>4d} "
+                  f"{'   n/a':>6s} {'    n/a':>7s} {brier:>7.4f}")
+
+    for cname in sorted(by_city):
+        _emit(cname, by_city[cname])
+    _emit("OVERALL", rows)
 
     # Reliability: how often did our P_blended buckets actually hit?
     print()

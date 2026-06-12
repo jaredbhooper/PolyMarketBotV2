@@ -709,36 +709,20 @@ class WeatherStrategy(Strategy):
         else:
             wu_error = f"unparseable station URL: {wu_url!r}"
 
-        # --- dispute check
+        # --- WU is authoritative (Polymarket settles on Wunderground).
+        # When WU is present for a finalized day, grade on WU regardless
+        # of OM. OM stays in the settlement row + wx_verification as a
+        # logged cross-check for the dispute-forensics aggregator and
+        # the OM<->WU wedge investigation. We only emit DISPUTED when WU
+        # is missing AND we have no other authoritative source -- in
+        # practice that branch never fires because OM is always
+        # available, so a missing-WU resolve falls through to the OM
+        # fallback at the bottom of this function.
         disagreement = None
-        if wu_rounded is not None:
+        if wu_rounded is not None and wu_val is not None:
             disagreement = abs(om_rounded - wu_rounded)
-            if disagreement >= self.dispute_threshold:
-                # When DISPUTED we still record both values; the truth is
-                # whichever WU eventually finalizes to. Leave actual_value
-                # populated with WU (the truth target) so any future bias
-                # correction has the right answer once a human flips outcome.
-                return {
-                    "outcome": "DISPUTED",
-                    "actual_value": wu_val,         # truth = WU
-                    "om_value": float(om_val),
-                    "actual_value_c": float(om_c),
-                    "wu_value": wu_val,
-                    "source_value": f"wunderground {city.station_name}",
-                    "wu_source": wu_source,
-                    "unit": unit,
-                    "kind": kind,
-                    "rounded_val": float(om_rounded),
-                    "wu_rounded_val": float(wu_rounded),
-                    "disagreement": int(disagreement),
-                    "dispute_note": (
-                        f"{kind}: Open-Meteo {om_val:.2f} -> {om_rounded}, "
-                        f"Wunderground {wu_val:.2f} -> {wu_rounded}; "
-                        f"trade stays OPEN pending human review"
-                    ),
-                }
 
-        # --- grade. Prefer WU's rounded integer when both agree, since WU IS
+        # --- grade. Prefer WU's rounded integer when available, since WU IS
         # the resolution source; fall back to OM when WU was unavailable.
         verdict_val = wu_rounded if wu_rounded is not None else om_rounded
         if bound == "le":
@@ -762,10 +746,21 @@ class WeatherStrategy(Strategy):
             truth_val = float(om_val)
             source_value = (f"open-meteo archive {city.station_name} "
                             f"(wu unavailable: {wu_error})")
+        # Forensic cross-check: if OM disagreed with WU by >=
+        # dispute_threshold, log it as a note instead of as a position
+        # state. The aggregator + the wx-verify forensics view reads
+        # om_value vs wu_value directly.
+        dispute_note = ""
+        if disagreement is not None and disagreement >= self.dispute_threshold:
+            dispute_note = (
+                f"{kind}: Open-Meteo {om_val:.2f} -> {om_rounded}; "
+                f"Wunderground {wu_val:.2f} -> {wu_rounded}; "
+                f"WU authoritative -> graded {('YES' if won else 'NO')}"
+            )
         return {
             "outcome": "YES" if won else "NO",
-            "actual_value": float(truth_val),       # truth target
-            "om_value": float(om_val),              # secondary
+            "actual_value": float(truth_val),       # truth target (WU when present)
+            "om_value": float(om_val),              # logged cross-check
             "actual_value_c": float(om_c),
             "wu_value": wu_val,
             "source_value": source_value,
@@ -775,6 +770,7 @@ class WeatherStrategy(Strategy):
             "rounded_val": float(om_rounded),
             "wu_rounded_val": float(wu_rounded) if wu_rounded is not None else None,
             "disagreement": disagreement,
+            "dispute_note": dispute_note,
         }
 
 
