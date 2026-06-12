@@ -1261,9 +1261,13 @@ class Ledger:
                 (wallet, int(last_ts), utcnow_iso()))
 
     def list_wallets_top_by_realized(self, limit: int = 20) -> list[dict]:
-        """Top wallets by realized P&L from the scout's cached metrics.
-        Used by the autopsy-top command. Reads metrics_json since the
-        wallets table doesn't have a normalized realized_pnl column."""
+        """Top wallets by realized P&L. Reads scout metrics_json when
+        available (fast path); when the wallets table is empty (fresh
+        cache, no scout run yet), falls back to enumerating distinct
+        wallets in wallet_trades and computing realized P&L per wallet
+        from the cached trade rows. The fallback is slower but means
+        `autopsy-top` produces useful output from whatever cache state
+        the operator has."""
         with self._conn() as c:
             rows = c.execute(
                 "SELECT wallet, metrics_json FROM cache.wallets "
@@ -1276,6 +1280,24 @@ class Ledger:
                 continue
             out.append({
                 "wallet": r["wallet"],
+                "realized_pnl_usd": float(m.get("realized_pnl_usd") or 0.0),
+                "n_trades": int(m.get("n_trades") or 0),
+            })
+        if out:
+            out.sort(key=lambda x: x["realized_pnl_usd"], reverse=True)
+            return out[:limit]
+        # Fallback: derive from wallet_trades directly.
+        from strategies.copy_trading import compute_metrics
+        with self._conn() as c:
+            wallets = [r["wallet"] for r in c.execute(
+                "SELECT DISTINCT wallet FROM cache.wallet_trades").fetchall()]
+        for w in wallets:
+            trades = self.get_wallet_trades(w)
+            if not trades:
+                continue
+            m = compute_metrics(trades)
+            out.append({
+                "wallet": w,
                 "realized_pnl_usd": float(m.get("realized_pnl_usd") or 0.0),
                 "n_trades": int(m.get("n_trades") or 0),
             })
