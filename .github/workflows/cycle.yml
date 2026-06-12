@@ -71,13 +71,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          # v2.3: ONE python invocation handles everything inside the
+          # master cycle_deadline_minutes. logic-scan, lp-sim, and
+          # status are now invoked in-process by main.py cycle and
+          # share the same deadline + universe -- the previous tail
+          # python commands re-fetched the universe (~4 min each) and
+          # routinely consumed all remaining workflow time.
           python main.py cycle
-          # logic_scan + lp-sim both reuse Polymarket book scans and run
-          # at the 30-min cadence; their cost fits cycle.yml's 25-min
-          # timeout but exceeds fast.yml's 4-min one.
-          python main.py logic-scan || true
-          python main.py lp-sim || true
-          python main.py status || true
 
       - name: Guard ledger.db size (must be <= 50 MB)
         # If the ledger committed-DB ever grows past 50 MB we want to

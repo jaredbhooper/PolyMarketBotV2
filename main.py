@@ -45,11 +45,23 @@ def load_strategies(cfg: dict) -> list[Strategy]:
 
 
 def scan_all(cfg: dict, scanner: Scanner, fetch_books: bool = True,
-             tags: list[str] | None = None) -> list[Market]:
+             tags: list[str] | None = None, deadline=None) -> list[Market]:
+    """Scan all configured tags. With the master deadline (v2.3) passed
+    in, this exits cleanly between tags when time is up -- a half-fetched
+    universe is far better than no universe at all because the workflow
+    cancelled the run before reaching Commit. Returns whatever markets
+    were collected up to that point."""
+    from foundation.deadline import Deadline
+    deadline = Deadline.coerce(deadline)
     seen: dict[str, Market] = {}
     cfg_tags = (cfg.get("scanner") or {}).get("tag_slugs")
     tag_list = tags or cfg_tags or DEFAULT_TAG_SLUGS
     for tag in tag_list:
+        if deadline.expired():
+            print(f"  scan_all: deadline reached, skipping remaining tags "
+                  f"(was about to scan {tag!r}; collected so far: "
+                  f"{len(seen)} markets)")
+            break
         _, markets = scanner.scan_tag(tag, fetch_books=fetch_books)
         for m in markets:
             seen[m.market_id] = m
@@ -74,7 +86,7 @@ def _is_copy_strategy(s: Strategy) -> bool:
 
 
 def run_cv_cycle(strategy, scanner: Scanner, ledger: Ledger, cfg: dict,
-                  verbose: bool = True) -> dict:
+                  verbose: bool = True, deadline=None) -> dict:
     """Cross-venue cycle: pair Polymarket markets with Kalshi markets via
     the rules-equivalence engine, log every cv_gap, paper-fire only
     CERTIFIED-IDENTICAL pairs above min_arb_profit.
@@ -83,13 +95,16 @@ def run_cv_cycle(strategy, scanner: Scanner, ledger: Ledger, cfg: dict,
     quarantined FUZZY divergence probe on the cv result. Probe never
     touches the main bankroll; it has its own $500 virtual side-book.
     """
+    from foundation.deadline import Deadline
     from foundation.venues.kalshi import KalshiVenue
     from foundation.venues.polymarket import PolymarketVenue
+    deadline = Deadline.coerce(deadline)
     weather_cfg = (cfg.get("strategies") or {}).get("weather") or {}
     cities = weather_cfg.get("cities") or []
     poly_venue = PolymarketVenue(scanner=scanner, weather_cities_cfg=cities)
     kal_venue = KalshiVenue()
-    result = strategy.scan_cv(poly_venue, kal_venue, ledger, verbose=verbose)
+    result = strategy.scan_cv(poly_venue, kal_venue, ledger,
+                                 verbose=verbose, deadline=deadline)
     counters = result["counters"]
     if verbose:
         print(
@@ -106,18 +121,22 @@ def run_cv_cycle(strategy, scanner: Scanner, ledger: Ledger, cfg: dict,
                         for cat, v in sorted(per_cat.items())]
             print(f"  per-category (cert/fuzzy/non): {' | '.join(cat_strs)}")
 
-    # Tail step: cv_probe. Skip entirely if not configured.
+    # Tail step: cv_probe. Skip entirely if not configured or if the
+    # master cycle deadline is past (probe's work is cheap but it still
+    # has a small DB write per opened position).
     probe_cfg = (cfg.get("strategies") or {}).get("cv_probe")
-    if probe_cfg is not None:
+    if probe_cfg is not None and not deadline.expired():
         from strategies.cv_probe import CVProbe
         probe = CVProbe(cfg)
         probe_out = probe.run_probe(result, ledger, verbose=verbose)
         result["probe"] = probe_out
+    elif probe_cfg is not None and verbose:
+        print("  cv_probe: skipped (master deadline reached)")
     return result
 
 
 def run_arb_cycle(strategy, scanner: Scanner, ledger: Ledger,
-                   verbose: bool = True) -> dict:
+                   verbose: bool = True, deadline=None) -> dict:
     """Event-level cycle for bucket-sum arb (and any future arb strategies).
 
     Pulls every open+active event from Gamma, groups into ArbEvents (MECE-
@@ -126,6 +145,8 @@ def run_arb_cycle(strategy, scanner: Scanner, ledger: Ledger,
     gap to arb_gaps, and paper-commits any detection whose locked profit
     clears the strategy's min_arb_profit threshold.
     """
+    from foundation.deadline import Deadline
+    deadline = Deadline.coerce(deadline)
     if verbose:
         print(f"\n=== {strategy.name} (event-level) ===")
         print("Fetching every open+active event on Gamma ...")
@@ -139,7 +160,8 @@ def run_arb_cycle(strategy, scanner: Scanner, ledger: Ledger,
         ok = sum(1 for e in arb_events if e.completeness_verified)
         print(f"  MECE-verified: {ok} / {len(arb_events)}")
 
-    result = strategy.scan_arb(arb_events, scanner=scanner, verbose=verbose)
+    result = strategy.scan_arb(arb_events, scanner=scanner, verbose=verbose,
+                                  deadline=deadline)
     detections = result["detections"]
     gamma_only_gaps = result["gamma_only_gaps"]
     counters = result["counters"]
@@ -274,6 +296,7 @@ def run_arb_cycle(strategy, scanner: Scanner, ledger: Ledger,
 def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
           tag: str | None = None) -> dict:
     import time as _time
+    from foundation.deadline import Deadline
     cycle_start = _time.time()
     phase_timings: list[tuple[str, float]] = []
 
@@ -281,6 +304,16 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
         phase_timings.append((name, _time.time() - start))
 
     cfg = load_config(cfg_path)
+    # Master cycle deadline (v2.3). Plumbed through every phase so the
+    # workflow ALWAYS reaches the phase table, Guard, and Commit. A
+    # cycle must never die by timeout -- strategies truncate inner work
+    # when the deadline fires and return whatever they completed.
+    deadline_minutes = float(cfg.get("cycle_deadline_minutes", 20))
+    deadline = Deadline.in_minutes(deadline_minutes)
+    if verbose:
+        print(f"Master cycle deadline: {deadline_minutes:.1f} minutes "
+              f"({deadline.left():.0f}s left)")
+
     ledger = ledger_from_cfg(cfg)
     scanner = Scanner(cfg)
     executor = Executor(cfg, ledger)
@@ -304,19 +337,29 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
         if _is_arb_strategy(s):
             t0 = _time.time()
             with HealthSession(ledger, s.name) as h:
-                r = run_arb_cycle(s, scanner, ledger, verbose=verbose)
-                arb_results.append(r)
-                h.markets_scanned = (r.get("counters") or {}).get("scanned", 0)
-                h.fills = r.get("fired", 0)
+                if deadline.expired():
+                    if verbose:
+                        print(f"  {s.name}: skipped (master deadline reached)")
+                else:
+                    r = run_arb_cycle(s, scanner, ledger, verbose=verbose,
+                                        deadline=deadline)
+                    arb_results.append(r)
+                    h.markets_scanned = (r.get("counters") or {}).get("scanned", 0)
+                    h.fills = r.get("fired", 0)
             _phase(s.name, t0)
         elif _is_cv_strategy(s):
             t0 = _time.time()
             with HealthSession(ledger, s.name) as h:
-                r = run_cv_cycle(s, scanner, ledger, cfg, verbose=verbose)
-                cv_results.append(r)
-                h.markets_scanned = ((r.get("counters") or {}).get("polymarket_markets", 0)
-                                       + (r.get("counters") or {}).get("kalshi_markets", 0))
-                h.fills = (r.get("counters") or {}).get("fired", 0)
+                if deadline.expired():
+                    if verbose:
+                        print(f"  {s.name}: skipped (master deadline reached)")
+                else:
+                    r = run_cv_cycle(s, scanner, ledger, cfg, verbose=verbose,
+                                       deadline=deadline)
+                    cv_results.append(r)
+                    h.markets_scanned = ((r.get("counters") or {}).get("polymarket_markets", 0)
+                                           + (r.get("counters") or {}).get("kalshi_markets", 0))
+                    h.fills = (r.get("counters") or {}).get("fired", 0)
             _phase(s.name, t0)
         else:
             per_market_strategies.append(s)
@@ -324,6 +367,8 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
 
     if not strategies:
         # Pure arb / cross-venue cycle, no per-market work.
+        _run_logic_lp_status_inline(cfg, scanner, ledger, [], deadline,
+                                       _phase, verbose=verbose)
         _print_phase_summary(phase_timings, cycle_start, verbose=verbose)
         return {
             "decisions": [], "scanned": 0, "filled": 0,
@@ -334,8 +379,14 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
     if verbose:
         print("\nScanning Polymarket (per-market) ...")
     t_scan = _time.time()
-    universe = scan_all(cfg, scanner, fetch_books=True,
-                        tags=[tag] if tag else None)
+    if deadline.expired():
+        if verbose:
+            print("  scan_per_market: skipped (master deadline reached)")
+        universe = []
+    else:
+        universe = scan_all(cfg, scanner, fetch_books=True,
+                            tags=[tag] if tag else None,
+                            deadline=deadline)
     _phase("scan_per_market", t_scan)
     if verbose:
         print(f"Scanned {len(universe)} markets (with order books).")
@@ -350,16 +401,25 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
     pending: list[CycleDecision] = []
     for strat in strategies:
         t_strat = _time.time()
+        skipped_deadline = 0
         with HealthSession(ledger, strat.name) as h:
             # Some strategies (e.g. weather's adaptive layer) need a
             # cycle-scoped read handle to the ledger. Optional hook.
             if hasattr(strat, "attach_ledger"):
                 strat.attach_ledger(ledger)
+            if deadline.expired():
+                if verbose:
+                    print(f"\n[{strat.name}] skipped (master deadline reached)")
+                _phase(strat.name, t_strat)
+                continue
             relevant = strat.relevant_markets(universe)
             h.markets_scanned = len(relevant)
             if verbose:
                 print(f"\n[{strat.name}] {len(relevant)} relevant markets")
             for m in relevant:
+                if deadline.expired():
+                    skipped_deadline += 1
+                    continue
                 mid = ledger.upsert_market({
                     "condition_id": m.market_id,
                     "slug": m.slug,
@@ -382,6 +442,9 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
                 decisions.append(d)
                 if d.decision == "PENDING_FILL":
                     pending.append(d)
+            if skipped_deadline and verbose:
+                print(f"  [{strat.name}] deadline truncated: "
+                      f"{skipped_deadline} markets deferred")
         _phase(strat.name, t_strat)
 
     # --- Phase 2: rank PENDING_FILL by post-fill edge desc, commit until cap.
@@ -423,6 +486,15 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
         print(f"\nCycle summary: {len(decisions)} considered, "
               f"{len(pending)} qualified, {len(fills)} filled "
               f"(cap {cap}, was open {open_at_start}).")
+
+    # Tail strategies that used to run as separate `python main.py ...`
+    # commands now run in-process so they share the master deadline and
+    # the already-fetched universe + scanner connections. Workflow
+    # previously cancelled mid-tail because each `python` re-fetched the
+    # universe -- a 4-minute scan each.
+    _run_logic_lp_status_inline(cfg, scanner, ledger, universe, deadline,
+                                  _phase, verbose=verbose)
+
     _print_phase_summary(phase_timings, cycle_start, verbose=verbose)
     return {
         "decisions": decisions,
@@ -433,6 +505,65 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
         "cv": cv_results,
         "phase_timings": phase_timings,
     }
+
+
+def _run_logic_lp_status_inline(cfg: dict, scanner: Scanner, ledger: Ledger,
+                                   universe: list, deadline, _phase,
+                                   verbose: bool = True) -> None:
+    """Run logic-scan + lp-sim + status as in-process tail steps inside
+    the same master deadline. v2.3 fix: the cycle.yml workflow used to
+    invoke each of these as a separate `python` subprocess that
+    re-fetched the entire universe with books (~4 min each), so they
+    routinely ate the rest of the job timeout and forced GitHub Actions
+    to cancel before Guard / Commit could run. By running them here we
+    share the deadline + the already-fetched universe and the cycle
+    ALWAYS reaches the phase-timing table."""
+    import time as _time
+    # logic-scan
+    t = _time.time()
+    if deadline.expired():
+        if verbose:
+            print("\nlogic-scan: skipped (master deadline reached)")
+    else:
+        try:
+            from strategies.logic_scan import LogicScan
+            from foundation.health import HealthSession
+            ls = LogicScan(cfg)
+            with HealthSession(ledger, ls.name) as h:
+                r = ls.scan(ledger, universe, verbose=verbose)
+                h.markets_scanned = len(universe)
+                h.fills = r.get("traded", 0) if isinstance(r, dict) else 0
+        except Exception as exc:
+            if verbose:
+                print(f"  logic-scan failed: {exc}")
+    _phase("logic_scan_tail", t)
+    # lp-sim
+    t = _time.time()
+    if deadline.expired():
+        if verbose:
+            print("\nlp-sim: skipped (master deadline reached)")
+    else:
+        try:
+            from strategies.lp_sim import LPSim
+            from foundation.health import HealthSession
+            lp = LPSim(cfg)
+            with HealthSession(ledger, lp.name) as h:
+                r = lp.run(ledger, universe, verbose=verbose)
+                h.markets_scanned = len(universe)
+                h.fills = r.get("rows_logged", 0) if isinstance(r, dict) else 0
+        except Exception as exc:
+            if verbose:
+                print(f"  lp-sim failed: {exc}")
+    _phase("lp_sim_tail", t)
+    # status -- cheap, always run for visibility
+    t = _time.time()
+    try:
+        from foundation.report import print_status
+        print_status()
+    except Exception as exc:
+        if verbose:
+            print(f"  status failed: {exc}")
+    _phase("status_tail", t)
 
 
 def _print_phase_summary(phase_timings: list[tuple[str, float]],

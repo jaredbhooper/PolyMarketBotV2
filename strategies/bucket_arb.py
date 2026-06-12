@@ -296,7 +296,7 @@ class BucketSumArb(Strategy):
 
     # --- public scan entry point -------------------------------------------
     def scan_arb(self, events: list[ArbEvent], scanner=None,
-                  verbose: bool = False) -> dict[str, Any]:
+                  verbose: bool = False, deadline=None) -> dict[str, Any]:
         """Run the detector across the event universe.
 
         Two passes (v2.2):
@@ -402,13 +402,17 @@ class BucketSumArb(Strategy):
 
         # --- PASS 2: walk the best-first up to the cap + budget ---------
         walk_candidates.sort(key=lambda x: x[0], reverse=True)
-        deadline = _time.time() + self.scan_budget_minutes * 60.0
+        from foundation.deadline import Deadline as _Deadline
+        master = _Deadline.coerce(deadline)
+        # Effective deadline = earlier of (local scan_budget, master).
+        local_ts = _time.time() + self.scan_budget_minutes * 60.0
+        deadline_ts = min(local_ts, _time.time() + master.left())
         budget_hit = False
         for prio, walk_yes, walk_no, ev in walk_candidates:
             if walked >= self.max_walks_per_cycle:
                 skipped_cap += 1
                 continue
-            if _time.time() >= deadline:
+            if _time.time() >= deadline_ts:
                 budget_hit = True
                 skipped_budget += 1
                 continue

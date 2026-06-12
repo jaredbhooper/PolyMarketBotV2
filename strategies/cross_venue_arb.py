@@ -258,7 +258,7 @@ class CrossVenueArb(Strategy):
         return [picked]
 
     def scan_cv(self, poly_venue: PolymarketVenue, kalshi_venue: KalshiVenue,
-                  ledger, verbose: bool = True) -> dict[str, Any]:
+                  ledger, verbose: bool = True, deadline=None) -> dict[str, Any]:
         """Run the full cross-venue pass:
           1. Start the wall-clock budget timer BEFORE either venue fetch
              (v2.2 fix; the budget previously didn't cover discovery).
@@ -279,11 +279,18 @@ class CrossVenueArb(Strategy):
         Returns a dict with counters + the detections list for the caller.
         """
         import time as _time
-        deadline = _time.time() + self.cv_scan_budget_minutes * 60.0
+        from foundation.deadline import Deadline as _Deadline
+        master = _Deadline.coerce(deadline)
+        # Effective deadline is the earlier of the master cycle deadline
+        # and the local cv_scan_budget. The local budget can still bound
+        # a single manual `cv` CLI; the master ensures no cycle run dies
+        # from cv discovery alone.
+        local_ts = _time.time() + self.cv_scan_budget_minutes * 60.0
+        deadline_ts = min(local_ts, _time.time() + master.left())
         budget_hit = False
 
         def _budget_left() -> bool:
-            return _time.time() < deadline
+            return _time.time() < deadline_ts
 
         if verbose:
             print(f"\n=== {self.name} ===")
@@ -374,7 +381,8 @@ class CrossVenueArb(Strategy):
             cert_fuzz_pairs.append((pair_id, p, k, res))
 
         for key in shared:
-            if _time.time() >= deadline:
+            if not _budget_left():
+                budget_hit = True
                 if verbose:
                     print("  cv scan: time budget reached during weather classify")
                 break
@@ -383,7 +391,8 @@ class CrossVenueArb(Strategy):
                     _process(p, k, key[0], key[1])
         # v2: non-weather pairs by (category, date).
         for key in shared_cat:
-            if _time.time() >= deadline:
+            if not _budget_left():
+                budget_hit = True
                 if verbose:
                     print("  cv scan: time budget reached during non-weather classify")
                 break
@@ -393,13 +402,19 @@ class CrossVenueArb(Strategy):
 
         # Second pass: lazy-fetch books ONLY for classified pairs we'll
         # walk. De-dupe via id() so each market's book is fetched once
-        # even when it appears in multiple pairs.
+        # even when it appears in multiple pairs. The book-fetch loop
+        # was the 17-minute killer in pre-v2.3 cycle runs (57k pairs
+        # x 2 HTTP calls each) -- the budget check now bounds it.
         if verbose:
             print(f"  classified pairs (cert+fuzzy): {len(cert_fuzz_pairs)}; "
                   f"fetching books on demand ...")
         seen_poly: set = set()
         seen_kal: set = set()
+        book_truncated = 0
         for pair_id, p, k, res in cert_fuzz_pairs:
+            if not _budget_left():
+                book_truncated += 1
+                continue
             if id(p) not in seen_poly:
                 try:
                     poly_venue.fetch_book_for(p)
@@ -417,6 +432,10 @@ class CrossVenueArb(Strategy):
                 if det is None:
                     continue
                 detections.append(det)
+        if book_truncated and verbose:
+            budget_hit = True
+            print(f"  cv scan: book-fetch loop deferred {book_truncated} pairs "
+                  f"(budget reached)")
 
         # --- log every detection (above threshold or not) -----------------
         logged = 0

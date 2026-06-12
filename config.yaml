@@ -35,6 +35,14 @@ verdict:
   min_settled_for_pass: 20
   fail_loss_pct: 0.10
 
+# v2.3 master cycle deadline. cycle.yml's job timeout is 28 minutes;
+# this gives the python work a softer 20-minute deadline that is plumbed
+# into every phase. A cycle MUST NEVER die by timeout -- it must always
+# reach the phase-timing table, the ledger.db guard step, and the
+# commit step. When the deadline fires, strategies truncate their inner
+# loops, log how many units they skipped, and return cleanly.
+cycle_deadline_minutes: 20
+
 # Polymarket fee schedule. Verified 2026-03 (sources in BUILD_NOTES.md).
 # Fee per share = `rate × p × (1 - p)` (quadratic, peaks at p=0.50).
 # Makers pay $0 + earn a 20-25% rebate of the counterparty's fee. We
