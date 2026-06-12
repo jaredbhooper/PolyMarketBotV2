@@ -317,6 +317,10 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
     pending: list[CycleDecision] = []
     for strat in strategies:
         with HealthSession(ledger, strat.name) as h:
+            # Some strategies (e.g. weather's adaptive layer) need a
+            # cycle-scoped read handle to the ledger. Optional hook.
+            if hasattr(strat, "attach_ledger"):
+                strat.attach_ledger(ledger)
             relevant = strat.relevant_markets(universe)
             h.markets_scanned = len(relevant)
             if verbose:
@@ -428,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("lp-sim", help="lp-sim quoting estimate pass")
     sub.add_parser("logic-scan", help="logic-scan pair detection + violation check")
     sub.add_parser("vacuum", help="prune cache.db retention + VACUUM both ledger and cache (daily housekeeping)")
+    sub.add_parser("wx-weights", help="print the current per-city adaptive weather weights, biases, and calibration")
+    sub.add_parser("wx-verify", help="print the WX-VERIFY skill + dispute-forensics report")
     args = p.parse_args(argv)
 
     if args.cmd == "cycle":
@@ -537,6 +543,16 @@ def main(argv: list[str] | None = None) -> int:
             r = s.run(ledger, universe, verbose=True)
             h.markets_scanned = len(universe)
             h.fills = r.get("rows_logged", 0)
+        return 0
+    if args.cmd == "wx-weights":
+        cfg = load_config()
+        ledger = ledger_from_cfg(cfg)
+        _print_wx_weights(cfg, ledger)
+        return 0
+    if args.cmd == "wx-verify":
+        cfg = load_config()
+        ledger = ledger_from_cfg(cfg)
+        _print_wx_verify(cfg, ledger)
         return 0
     if args.cmd == "vacuum":
         cfg = load_config()
@@ -729,6 +745,149 @@ def print_cv_stats(cfg: dict, ledger: Ledger) -> None:
                 print(f"    #{p['id']} {p['direction']:18s} shares={p['shares']:.1f} "
                       f"cost=${p['total_cost']:.2f} locked=${p['locked_profit']:.2f} "
                       f"status={p['status']} pnl={pnl_s}{div}")
+
+
+def _print_wx_weights(cfg: dict, ledger: Ledger) -> None:
+    """Inspect the adaptive weather layer: per-city family weights,
+    per-city per-family biases, and the global calibration alpha."""
+    from foundation.wx_skill import (AdaptiveConfig, adaptive_for_city,
+                                       fit_calibration)
+    s = (cfg.get("strategies") or {}).get("weather") or {}
+    adapt_cfg_raw = s.get("adaptive_weights")
+    enabled = True
+    if adapt_cfg_raw is False:
+        enabled = False
+        adapt_cfg_raw = {}
+    elif not isinstance(adapt_cfg_raw, dict):
+        adapt_cfg_raw = {}
+    adapt_cfg = AdaptiveConfig(
+        enabled=enabled,
+        window_days=int(adapt_cfg_raw.get("window_days", 60)),
+        shrink_n=int(adapt_cfg_raw.get("shrink_n", 20)),
+        min_n=int(adapt_cfg_raw.get("min_n", 10)),
+        calib_min_n=int(adapt_cfg_raw.get("calib_min_n", 30)),
+        max_bias_correction=float(adapt_cfg_raw.get(
+            "max_bias_correction", 1.5)),
+        epsilon_mae=float(adapt_cfg_raw.get("epsilon_mae", 0.05)),
+    )
+    rows = [dict(r) for r in ledger.list_wx_verifications()]
+    print()
+    print(f"=== Adaptive weather weights ===")
+    kill = " (KILL SWITCH off - layer disabled)" if not enabled else ""
+    print(f"  config: window={adapt_cfg.window_days}d  shrink_n={adapt_cfg.shrink_n}"
+          f"  min_n={adapt_cfg.min_n}  calib_min_n={adapt_cfg.calib_min_n}"
+          f"  max_bias_clip=±{adapt_cfg.max_bias_correction:.1f}{kill}")
+    print(f"  verifications loaded: {len(rows)}")
+    print()
+    print(f"  {'city':18s} {'n':>4s} {'w_gfs':>7s} {'w_ecmwf':>9s} "
+          f"{'b_gfs':>7s} {'b_ecmwf':>9s} {'status':>8s}")
+    print(f"  {'-'*18} {'-'*4} {'-'*7} {'-'*9} {'-'*7} {'-'*9} {'-'*8}")
+    cities_in_cfg = [c.get("city") for c in (s.get("cities") or [])
+                       if c.get("city")]
+    for cname in sorted(set(cities_in_cfg)):
+        st = adaptive_for_city(rows, cname, adapt_cfg)
+        print(f"  {cname:18s} {st.n_resolutions:>4d} "
+              f"{st.weights.get('gfs', 0.5):>7.3f} "
+              f"{st.weights.get('ecmwf', 0.5):>9.3f} "
+              f"{st.biases.get('gfs', 0.0):>+7.2f} "
+              f"{st.biases.get('ecmwf', 0.0):>+9.2f} "
+              f"{st.weights_status:>8s}")
+    # Overall row
+    overall = adaptive_for_city(rows, None, adapt_cfg)
+    print(f"  {'-'*18} {'-'*4} {'-'*7} {'-'*9} {'-'*7} {'-'*9} {'-'*8}")
+    print(f"  {'OVERALL':18s} {overall.n_resolutions:>4d} "
+          f"{overall.weights.get('gfs', 0.5):>7.3f} "
+          f"{overall.weights.get('ecmwf', 0.5):>9.3f} "
+          f"{overall.biases.get('gfs', 0.0):>+7.2f} "
+          f"{overall.biases.get('ecmwf', 0.0):>+9.2f} "
+          f"{overall.weights_status:>8s}")
+    cal = fit_calibration(rows, adapt_cfg)
+    print()
+    print(f"  calibration alpha = {cal.alpha:.3f}  n={cal.n}  status={cal.status}")
+    print(f"  (alpha=1.0 = identity; alpha<1 shrinks predictions toward 0.5)")
+    print()
+
+
+def _print_wx_verify(cfg: dict, ledger: Ledger) -> None:
+    """Per-city + overall skill tables, reliability bins, and dispute
+    forensics (OM − WU per station)."""
+    from foundation.wx_skill import (AdaptiveConfig, FAMILIES, family_skill,
+                                       dispute_forensics)
+    rows = [dict(r) for r in ledger.list_wx_verifications()]
+    print()
+    print(f"=== WX-VERIFY  (n={len(rows)} verifications) ===")
+    if not rows:
+        print("  no verifications yet")
+        return
+    # Per-city skill table.
+    by_city: dict[str, list[dict]] = {}
+    for r in rows:
+        by_city.setdefault(r.get("city") or "?", []).append(r)
+    print()
+    print(f"  {'city':18s} {'n':>3s} {'fam':>5s} {'n_f':>4s} {'MAE':>6s} "
+          f"{'bias':>7s} {'brier':>7s}")
+    print(f"  {'-'*18} {'-'*3} {'-'*5} {'-'*4} {'-'*6} {'-'*7} {'-'*7}")
+    for cname in sorted(by_city):
+        pool = by_city[cname]
+        for f in FAMILIES:
+            sk = family_skill(pool, f)
+            if sk.n == 0:
+                continue
+            print(f"  {cname:18s} {len(pool):>3d} {f:>5s} {sk.n:>4d} "
+                  f"{sk.mae:>6.2f} {sk.signed_bias:>+7.2f} "
+                  f"{sk.brier:>7.4f}")
+    # Overall
+    for f in FAMILIES:
+        sk = family_skill(rows, f)
+        if sk.n == 0:
+            continue
+        print(f"  {'OVERALL':18s} {len(rows):>3d} {f:>5s} {sk.n:>4d} "
+              f"{sk.mae:>6.2f} {sk.signed_bias:>+7.2f} "
+              f"{sk.brier:>7.4f}")
+
+    # Reliability: how often did our P_blended buckets actually hit?
+    print()
+    print("  Reliability of P_blended (predicted vs observed YES-rate):")
+    buckets = [(0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1.001)]
+    print(f"    {'bucket':14s} {'n':>4s} {'predicted':>10s} {'observed':>9s}")
+    for lo, hi in buckets:
+        n_bk = 0; pred_sum = 0.0; obs_sum = 0.0
+        for r in rows:
+            p = r.get("p_blended")
+            o = r.get("outcome")
+            if p is None or o not in ("YES", "NO"):
+                continue
+            try:
+                p = float(p)
+            except (TypeError, ValueError):
+                continue
+            if not (lo <= p < hi):
+                continue
+            n_bk += 1
+            pred_sum += p
+            obs_sum += 1.0 if o == "YES" else 0.0
+        if n_bk == 0:
+            continue
+        print(f"    [{lo:.2f}, {hi:.2f}) {n_bk:>4d} "
+              f"{pred_sum/n_bk:>10.3f} {obs_sum/n_bk:>9.3f}")
+
+    # Dispute forensics.
+    print()
+    print("  Dispute forensics  (OM − WU per station, native units):")
+    fc = dispute_forensics(rows)
+    if not fc:
+        print("    no rows with both OM + WU values")
+    else:
+        print(f"    {'station':14s} {'n':>3s} {'mean':>7s} {'std':>6s}  verdict")
+        print(f"    {'-'*14} {'-'*3} {'-'*7} {'-'*6}  {'-'*30}")
+        for st, ds in sorted(fc.items()):
+            verdict = ("constant offset (likely bug)"
+                       if ds.n >= 2 and ds.std_om_minus_wu < 0.3
+                       else "variable (real source diff)" if ds.n >= 2
+                       else "single sample")
+            print(f"    {st:14s} {ds.n:>3d} {ds.mean_om_minus_wu:>+7.2f} "
+                  f"{ds.std_om_minus_wu:>6.2f}  {verdict}")
+    print()
 
 
 def print_arb_stats(cfg: dict, ledger: Ledger) -> None:

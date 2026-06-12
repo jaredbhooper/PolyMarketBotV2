@@ -343,6 +343,78 @@ class WeatherStrategy(Strategy):
         # Cross-check against Wunderground (the actual resolution source).
         self.dispute_threshold = float(s.get("dispute_threshold_degrees", 1.0))
         self.wu = WundergroundClient()
+        # Adaptive layer (v2.1). NEVER prunes individual ensemble members
+        # - members are interchangeable samples, per-member skill is
+        # noise. We only learn (a) MODEL-FAMILY weights per city,
+        # (b) per-city per-family BIAS corrections, (c) probability
+        # CALIBRATION. All three layers shrink toward neutral priors so
+        # thin data cannot dominate. Kill-switch: adaptive_weights=false
+        # reverts to the exact pre-v2.1 behaviour.
+        from foundation.wx_skill import AdaptiveConfig
+        # Backwards compat: allow `adaptive_weights: false` as a top-level
+        # boolean OR a dict of params. Check the raw value BEFORE the
+        # `or {}` coercion (which turns False into the default dict).
+        raw_adapt = s.get("adaptive_weights")
+        if raw_adapt is False:
+            self.adaptive_enabled = False
+            self.adaptive_cfg = AdaptiveConfig(enabled=False)
+            adapt_cfg = {}
+        else:
+            adapt_cfg = raw_adapt or {}
+            if not isinstance(adapt_cfg, dict):
+                adapt_cfg = {}
+            self.adaptive_enabled = bool(adapt_cfg.get("enabled", True))
+            self.adaptive_cfg = AdaptiveConfig(
+                enabled=self.adaptive_enabled,
+                window_days=int(adapt_cfg.get("window_days", 60)),
+                shrink_n=int(adapt_cfg.get("shrink_n", 20)),
+                min_n=int(adapt_cfg.get("min_n", 10)),
+                calib_min_n=int(adapt_cfg.get("calib_min_n", 30)),
+                max_bias_correction=float(adapt_cfg.get(
+                    "max_bias_correction", 1.5)),
+                epsilon_mae=float(adapt_cfg.get("epsilon_mae", 0.05)),
+            )
+        # Per-cycle cache of adaptive state. Cleared on attach_ledger; the
+        # cycle loop wires the ledger in BEFORE calling estimate so the
+        # cache is fresh each cycle.
+        self._adaptive_cache: dict[str, Any] = {}
+        self._adaptive_ledger = None
+        self._adaptive_verifications_cached = None
+        self._adaptive_calibration = None
+
+    def attach_ledger(self, ledger) -> None:
+        """Called by main.py once per cycle before estimate() so the
+        adaptive layer can pull verification rows. Resets the per-cycle
+        cache - the cached values are valid only for this cycle."""
+        self._adaptive_ledger = ledger
+        self._adaptive_cache = {}
+        self._adaptive_verifications_cached = None
+        self._adaptive_calibration = None
+
+    def _adaptive_state(self, city: str | None):
+        """Lazy compute per-city CityAdaptive + CalibrationParam. Cached
+        for the cycle. When no ledger is attached or adaptive is OFF,
+        returns (None, None) and the caller falls back to the existing
+        pool-all-members logic."""
+        if not self.adaptive_enabled or self._adaptive_ledger is None:
+            return None, None
+        if self._adaptive_verifications_cached is None:
+            try:
+                rows = self._adaptive_ledger.list_wx_verifications()
+                self._adaptive_verifications_cached = [dict(r) for r in rows]
+            except Exception:
+                self._adaptive_verifications_cached = []
+        rows = self._adaptive_verifications_cached
+        # Calibration is computed across all cities (one global parameter).
+        if self._adaptive_calibration is None:
+            from foundation.wx_skill import fit_calibration
+            self._adaptive_calibration = fit_calibration(rows, self.adaptive_cfg)
+        if city in self._adaptive_cache:
+            return self._adaptive_cache[city], self._adaptive_calibration
+        from foundation.wx_skill import adaptive_for_city
+        state = adaptive_for_city(rows, city, self.adaptive_cfg)
+        self._adaptive_cache[city] = state
+        return state, self._adaptive_calibration
 
     # ------------- foundation contract --------------------------------
     def relevant_markets(self, markets: list[Market]) -> list[Market]:
@@ -412,19 +484,72 @@ class WeatherStrategy(Strategy):
             families_keys.setdefault(family_of(k), []).append(k)
         families_arr = {f: np.array([extrema[k] for k in ks])
                         for f, ks in families_keys.items()}
-        all_max = np.array(list(extrema.values()))
+
+        # ---------- Adaptive layer: per-family BIAS correction ----------
+        # Apply ONCE before any aggregation. NEVER touches individual
+        # members in a selective way - we just shift the whole family
+        # toward zero signed error using the rolling-window estimate
+        # (which itself is shrunk toward zero - see foundation/wx_skill).
+        # The bias correction is ALWAYS applied even with kill switch off,
+        # because adaptive_for_city returns zero biases when n < min_n.
+        adapt_state, adapt_calibration = self._adaptive_state(city.city)
+        if adapt_state is not None:
+            # Map per-family bias (gfs / ecmwf) onto raw families
+            # (gfs / ifs / aifs / icon). ECMWF bias applies to both ifs
+            # and aifs. ICON has no learned bias yet (only adapt gfs +
+            # ecmwf for now); it stays uncorrected.
+            family_bias = {"gfs": adapt_state.biases.get("gfs", 0.0),
+                            "ifs": adapt_state.biases.get("ecmwf", 0.0),
+                            "aifs": adapt_state.biases.get("ecmwf", 0.0),
+                            "icon": 0.0}
+            for f, arr in families_arr.items():
+                b = float(family_bias.get(f, 0.0))
+                if b != 0.0:
+                    families_arr[f] = arr - b
+
+        all_max = np.concatenate([a for a in families_arr.values() if len(a)]) \
+            if families_arr else np.array([])
 
         p_all, p_raw, p_gauss, mu, sigma = _prob_for_band(
             all_max, bound, lo_c, hi_c, self.blend_raw_weight,
         )
-        # Per-family P and per-family member counts.
+        # Per-family P, mean, spread, member counts (always computed so
+        # we can log them into signal metadata for future verification).
         family_p: dict[str, float] = {}
         family_n: dict[str, int] = {}
+        family_means: dict[str, float] = {}
+        family_spreads: dict[str, float] = {}
         for f, arr in families_arr.items():
             family_n[f] = int(len(arr))
             if len(arr) >= 1:
                 family_p[f] = float(_prob_for_band(
                     arr, bound, lo_c, hi_c, self.blend_raw_weight)[0])
+                family_means[f] = float(np.mean(arr))
+                family_spreads[f] = float(np.std(arr)) if len(arr) > 1 else 0.0
+
+        # ---------- Adaptive layer: re-blend with family weights ----------
+        # If adaptive is OFF or all families are below min_n, the
+        # adaptive_for_city returns equal weights AND p_all already
+        # reflects the pool-all-members baseline. We keep p_all in that
+        # case (cheaper, byte-identical to pre-v2.1).
+        if (adapt_state is not None
+                and self.adaptive_enabled
+                and adapt_state.weights_status != "SHRUNK"):
+            ecmwf_count = family_n.get("ifs", 0) + family_n.get("aifs", 0)
+            if ecmwf_count > 0:
+                ecmwf_all = np.concatenate([
+                    families_arr.get(f, np.array([]))
+                    for f in ("ifs", "aifs") if f in families_arr
+                ])
+                p_ecmwf_adj = float(_prob_for_band(
+                    ecmwf_all, bound, lo_c, hi_c, self.blend_raw_weight)[0])
+            else:
+                p_ecmwf_adj = None
+            p_gfs_adj = family_p.get("gfs")
+            w_gfs = adapt_state.weights.get("gfs", 0.5)
+            w_ecmwf = adapt_state.weights.get("ecmwf", 0.5)
+            if p_gfs_adj is not None and p_ecmwf_adj is not None:
+                p_all = w_gfs * p_gfs_adj + w_ecmwf * p_ecmwf_adj
 
         # Disagreement gate: only families with enough members count.
         gated_ps = [p for f, p in family_p.items()
@@ -457,7 +582,27 @@ class WeatherStrategy(Strategy):
             p_ecmwf = float(_prob_for_band(
                 ecmwf_all, bound, lo_c, hi_c, self.blend_raw_weight)[0])
 
+        # ---------- Adaptive layer: probability CALIBRATION ----------
+        # Logistic shrink toward 0.5 to match observed reliability. Below
+        # calib_min_n verifications, alpha=1.0 (identity).
+        if adapt_calibration is not None and adapt_calibration.alpha != 1.0:
+            from foundation.wx_skill import apply_calibration
+            p_all = apply_calibration(p_all, adapt_calibration)
+
         p_final = float(max(self.clamp_min, min(self.clamp_max, p_all)))
+
+        # Audit blob: the EXACT adaptive parameters that produced p_final.
+        # Embedded in signal metadata so any future P&L difference between
+        # a trade and a re-evaluation can be attributed to the weights
+        # that made it.
+        adaptive_audit = None
+        if adapt_state is not None:
+            adaptive_audit = adapt_state.to_signal_metadata()
+            if adapt_calibration is not None:
+                adaptive_audit["calibration_alpha"] = adapt_calibration.alpha
+                adaptive_audit["calibration_n"] = adapt_calibration.n
+                adaptive_audit["calibration_status"] = adapt_calibration.status
+
         return Estimate(
             p_final=p_final,
             confidence=confidence,
@@ -472,6 +617,10 @@ class WeatherStrategy(Strategy):
                 # Per-family member counts + Ps (new with multi-family bundle).
                 "family_n": family_n,
                 "family_p": family_p,
+                # New in v2.1: per-family mean + spread so the verifier
+                # can compute signed_error / abs_error at settlement.
+                "family_means": family_means,
+                "family_spreads": family_spreads,
                 "n_members": int(len(all_max)),
                 # Per-family member counts. n_ecmwf is IFS+AIFS pooled for
                 # back-compat with the pre-bundle code; n_ifs and n_aifs
@@ -488,6 +637,9 @@ class WeatherStrategy(Strategy):
                 "disagreement_pair": worst_pair,
                 "min_family_members_for_gate": self.min_family_members,
                 "elevation_m": fc.elevation_m,
+                # Adaptive weights audit (v2.1). None when the kill switch
+                # is off or ledger isn't attached.
+                "adaptive": adaptive_audit,
             },
         )
 

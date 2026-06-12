@@ -132,6 +132,15 @@ def print_master_report(cfg_path: str = "config.yaml") -> None:
     print()
     print_report(cfg_path)
 
+    # ---- WX-VERIFY section (v2.1) ---------------------------------------
+    # Always rendered; degrades gracefully when there's no data yet.
+    try:
+        from main import _print_wx_verify
+        print()
+        _print_wx_verify(cfg, ledger)
+    except Exception as exc:
+        print(f"  WX-VERIFY render failed: {exc}")
+
     # ---- Today equity snapshot (if not already there) ------------------
     for r in snapshot:
         s = r["strategy"]

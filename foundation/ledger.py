@@ -172,6 +172,55 @@ CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market_id, strategy, ts
 CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_positions_status ON arb_positions(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_legs_position ON arb_legs(position_id);
+-- Weather verification + adaptive-weighting telemetry (v2.1).
+-- One row per resolved weather market. Logged by the grader on
+-- settlement; backfilled from existing signals + settlements where data
+-- permits. Source of truth for foundation.wx_skill which derives
+-- per-city family weights, bias corrections, and calibration.
+--
+-- Core principle (this lives here too so it travels with the schema):
+-- we NEVER select or prune individual ensemble members. We only ever
+-- learn (a) MODEL FAMILY weights, (b) per-city BIAS corrections, (c)
+-- probability CALIBRATION. Per-member skill is noise.
+CREATE TABLE IF NOT EXISTS wx_verification (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_logged TEXT NOT NULL,
+  market_row_id INTEGER NOT NULL,
+  city TEXT,
+  station TEXT,
+  threshold REAL,
+  unit TEXT,
+  bound TEXT,
+  resolve_date TEXT,
+  lead_time_hours REAL,
+  -- Both observed values + the official market settlement value.
+  official_value REAL,
+  official_value_unit TEXT,
+  om_value REAL,
+  om_value_unit TEXT,
+  wu_value REAL,
+  wu_value_unit TEXT,
+  -- Per family (gfs = GEFS; ecmwf = IFS + AIFS pooled). Skill is
+  -- learned at FAMILY granularity, never per-member.
+  gfs_mean REAL,
+  gfs_spread REAL,
+  gfs_p_threshold REAL,
+  gfs_signed_error REAL,
+  gfs_abs_error REAL,
+  ecmwf_mean REAL,
+  ecmwf_spread REAL,
+  ecmwf_p_threshold REAL,
+  ecmwf_signed_error REAL,
+  ecmwf_abs_error REAL,
+  -- Blended probability + market state
+  p_blended REAL,
+  market_price REAL,
+  outcome TEXT,
+  signal_id INTEGER,
+  settlement_id INTEGER,
+  UNIQUE(market_row_id)
+);
+
 -- SHARPLINE / LP-SIM / LOGIC-SCAN (Prompt C). All paper-only.
 -- ESTIMATE tag on each row whose pnl came from a maker-side simulation.
 CREATE TABLE IF NOT EXISTS odds_api_log (
@@ -377,6 +426,7 @@ CREATE INDEX IF NOT EXISTS idx_bankroll_txn_strategy ON bankroll_transactions(st
 CREATE INDEX IF NOT EXISTS idx_health_strategy_ts ON health_log(strategy, ts);
 CREATE INDEX IF NOT EXISTS idx_sharpline_status ON sharpline_orders(status);
 CREATE INDEX IF NOT EXISTS idx_logic_violations_pair ON logic_violations(pair_id, ts);
+CREATE INDEX IF NOT EXISTS idx_wx_verify_city_date ON wx_verification(city, resolve_date);
 """
 
 # ============================================================ CACHE_SCHEMA
@@ -1342,6 +1392,87 @@ class Ledger:
             "settled": len(settled),
             "per_leader": per_leader,
         }
+
+    # --- signals lookup helpers used by the wx verifier -------------------
+    def latest_signal(self, market_row_id: int, strategy: str
+                        ) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                """SELECT * FROM signals WHERE market_id=? AND strategy=?
+                   ORDER BY id DESC LIMIT 1""",
+                (int(market_row_id), strategy)).fetchone()
+
+    def latest_snapshot(self, market_row_id: int) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                """SELECT * FROM cache.snapshots WHERE market_id=?
+                   ORDER BY id DESC LIMIT 1""",
+                (int(market_row_id),)).fetchone()
+
+    # --- wx_verification (weather skill telemetry) ------------------------
+    def upsert_wx_verification(self, row: dict[str, Any]) -> int:
+        """Idempotent on market_row_id. Re-running grade safely refreshes
+        the row with newer values (e.g., when WU/OM updates after a partial
+        early settlement)."""
+        with self._conn() as c:
+            existing = c.execute(
+                "SELECT id FROM wx_verification WHERE market_row_id=?",
+                (int(row["market_row_id"]),)).fetchone()
+            cols = (
+                "ts_logged, market_row_id, city, station, threshold, unit, "
+                "bound, resolve_date, lead_time_hours, official_value, "
+                "official_value_unit, om_value, om_value_unit, wu_value, "
+                "wu_value_unit, gfs_mean, gfs_spread, gfs_p_threshold, "
+                "gfs_signed_error, gfs_abs_error, ecmwf_mean, ecmwf_spread, "
+                "ecmwf_p_threshold, ecmwf_signed_error, ecmwf_abs_error, "
+                "p_blended, market_price, outcome, signal_id, settlement_id"
+            )
+            vals = (
+                utcnow_iso(), int(row["market_row_id"]), row.get("city"),
+                row.get("station"), row.get("threshold"), row.get("unit"),
+                row.get("bound"), row.get("resolve_date"),
+                row.get("lead_time_hours"),
+                row.get("official_value"), row.get("official_value_unit"),
+                row.get("om_value"), row.get("om_value_unit"),
+                row.get("wu_value"), row.get("wu_value_unit"),
+                row.get("gfs_mean"), row.get("gfs_spread"),
+                row.get("gfs_p_threshold"), row.get("gfs_signed_error"),
+                row.get("gfs_abs_error"),
+                row.get("ecmwf_mean"), row.get("ecmwf_spread"),
+                row.get("ecmwf_p_threshold"), row.get("ecmwf_signed_error"),
+                row.get("ecmwf_abs_error"),
+                row.get("p_blended"), row.get("market_price"),
+                row.get("outcome"), row.get("signal_id"),
+                row.get("settlement_id"),
+            )
+            if existing:
+                # UPDATE in column order.
+                col_list = cols.split(", ")
+                set_clause = ", ".join(f"{cl}=?" for cl in col_list[1:])
+                c.execute(f"UPDATE wx_verification SET {set_clause} WHERE id=?",
+                           (*vals[1:], int(existing["id"])))
+                return int(existing["id"])
+            placeholders = ", ".join("?" for _ in cols.split(", "))
+            cur = c.execute(
+                f"INSERT INTO wx_verification ({cols}) VALUES ({placeholders})",
+                vals,
+            )
+            return int(cur.lastrowid)
+
+    def list_wx_verifications(self, city: str | None = None,
+                                since_date_iso: str | None = None,
+                                ) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM wx_verification WHERE 1=1"
+        args: list[Any] = []
+        if city:
+            sql += " AND city=?"
+            args.append(city)
+        if since_date_iso:
+            sql += " AND resolve_date >= ?"
+            args.append(since_date_iso)
+        sql += " ORDER BY resolve_date"
+        with self._conn() as c:
+            return list(c.execute(sql, args).fetchall())
 
     # --- odds-api (Prompt C, Phase 1: SHARPLINE) --------------------------
     def odds_api_requests_this_month(self, month: str) -> int:

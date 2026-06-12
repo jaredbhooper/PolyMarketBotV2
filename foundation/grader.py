@@ -88,6 +88,173 @@ def _row_to_market(row: sqlite3.Row) -> Market:
     )
 
 
+def _backfill_wx_verifications(ledger: Ledger, verbose: bool = False) -> int:
+    """For every market that already has a settlement row but no
+    matching wx_verification row, run the logger once. Returns the
+    count of rows backfilled."""
+    n = 0
+    with sqlite3.connect(ledger.ledger_path) as c:
+        c.row_factory = sqlite3.Row
+        rows = list(c.execute(
+            """SELECT s.id AS settlement_id, s.market_id,
+                      s.actual_value, s.om_value, s.wu_value,
+                      s.source_value, s.outcome,
+                      m.slug, m.question, m.category, m.resolve_date,
+                      m.resolution_source, m.rules_text, m.threshold, m.unit
+                 FROM settlements s
+                 JOIN markets m ON m.id = s.market_id
+                 LEFT JOIN wx_verification v ON v.market_row_id = s.market_id
+                WHERE v.id IS NULL"""
+        ).fetchall())
+    for s in rows:
+        # We need a trade-shaped object to reuse _log_wx_verification.
+        # Synthesize the minimal columns it reads.
+        trade_stub = {"strategy": "weather", "market_id": int(s["market_id"])}
+        market_stub_cols = {"id": int(s["market_id"]),
+                              "resolve_date": s["resolve_date"],
+                              "slug": s["slug"]}
+        try:
+            _log_wx_verification(
+                ledger,
+                trade_stub,
+                market_stub_cols,
+                outcome=s["outcome"],
+                om_val=s["om_value"], wu_val=s["wu_value"],
+                source_value=s["source_value"] or "",
+                settlement_id=int(s["settlement_id"]),
+            )
+            n += 1
+        except Exception as exc:
+            if verbose:
+                print(f"  wx-verify backfill failed for market {s['market_id']}: {exc}")
+    if verbose and n:
+        print(f"  wx-verify backfilled {n} rows from existing settlements")
+    return n
+
+
+def _log_wx_verification(ledger: Ledger, trade_row, market_row,
+                           outcome: str, om_val, wu_val, source_value: str,
+                           settlement_id: int | None) -> None:
+    """Write one wx_verification row for a resolved weather market.
+
+    Idempotent on market_row_id (the ledger uses upsert). Tolerant of
+    missing per-family fields in older signal metadata - those columns
+    just stay NULL and the skill aggregation silently skips them.
+    Truth value preference: WU > OM (WU is the actual market source).
+    """
+    if trade_row["strategy"] != "weather":
+        return
+    sig = ledger.latest_signal(int(trade_row["market_id"]), "weather")
+    if sig is None:
+        return
+    try:
+        meta = json.loads(sig["metadata_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        meta = {}
+    city = meta.get("city")
+    station = meta.get("station")
+    unit = meta.get("unit")
+    bound = meta.get("bound")
+    lo = meta.get("lo")
+    hi = meta.get("hi")
+    threshold = lo if lo is not None else hi
+
+    # Truth: prefer WU since that's the market source; else OM. Both
+    # values + units are stored side-by-side for forensic dispute analysis.
+    om_val_f = float(om_val) if om_val is not None else None
+    wu_val_f = float(wu_val) if wu_val is not None else None
+    if wu_val_f is not None:
+        official_value = wu_val_f
+    elif om_val_f is not None:
+        official_value = om_val_f
+    else:
+        official_value = None
+    # Units: the resolution sources return the SAME unit the market uses.
+    om_unit = unit
+    wu_unit = unit
+    official_unit = unit
+
+    # Per-family (gfs, ecmwf=ifs+aifs pooled). family_means / family_spreads
+    # land in metadata only on estimates emitted by the post-v2.1 weather
+    # code path; backfilled estimates leave them None and we accept that.
+    family_p = meta.get("family_p") or {}
+    family_means = meta.get("family_means") or {}
+    family_spreads = meta.get("family_spreads") or {}
+    family_n = meta.get("family_n") or {}
+
+    def _ecmwf_pool(d):
+        ifs = d.get("ifs"); aifs = d.get("aifs")
+        if ifs is None and aifs is None:
+            return None
+        if ifs is None:
+            return aifs
+        if aifs is None:
+            return ifs
+        # ECMWF mean = member-count-weighted average of IFS + AIFS means.
+        n_ifs = family_n.get("ifs", 0)
+        n_aifs = family_n.get("aifs", 0)
+        n_tot = (n_ifs + n_aifs) or 1
+        return (n_ifs * ifs + n_aifs * aifs) / n_tot
+
+    gfs_mean = family_means.get("gfs")
+    gfs_spread = family_spreads.get("gfs")
+    gfs_p = family_p.get("gfs")
+    ecmwf_mean = _ecmwf_pool(family_means)
+    ecmwf_spread = _ecmwf_pool(family_spreads)
+    ecmwf_p = meta.get("p_ecmwf")
+
+    def _err(mean, truth):
+        if mean is None or truth is None:
+            return None, None
+        try:
+            se = float(mean) - float(truth)
+            return se, abs(se)
+        except (TypeError, ValueError):
+            return None, None
+
+    gfs_se, gfs_ae = _err(gfs_mean, official_value)
+    ecmwf_se, ecmwf_ae = _err(ecmwf_mean, official_value)
+
+    # Lead time: from the signal's timestamp to the resolve_date midnight.
+    lead = None
+    try:
+        sig_ts = datetime.fromisoformat(sig["ts"].replace("Z", "+00:00"))
+        if sig_ts.tzinfo is None:
+            sig_ts = sig_ts.replace(tzinfo=timezone.utc)
+        rd = (market_row["resolve_date"] or "").split("T")[0]
+        if rd:
+            r_dt = datetime.fromisoformat(rd).replace(tzinfo=timezone.utc)
+            lead = (r_dt - sig_ts).total_seconds() / 3600.0
+    except (ValueError, TypeError, AttributeError):
+        pass
+
+    # Last-known market price (from snapshot near settlement)
+    snap = ledger.latest_snapshot(int(trade_row["market_id"]))
+    market_price = float(snap["yes_ask"]) if snap and snap["yes_ask"] is not None else None
+
+    ledger.upsert_wx_verification({
+        "market_row_id": int(trade_row["market_id"]),
+        "city": city, "station": station,
+        "threshold": threshold, "unit": unit, "bound": bound,
+        "resolve_date": market_row["resolve_date"],
+        "lead_time_hours": lead,
+        "official_value": official_value, "official_value_unit": official_unit,
+        "om_value": om_val_f, "om_value_unit": om_unit,
+        "wu_value": wu_val_f, "wu_value_unit": wu_unit,
+        "gfs_mean": gfs_mean, "gfs_spread": gfs_spread,
+        "gfs_p_threshold": gfs_p,
+        "gfs_signed_error": gfs_se, "gfs_abs_error": gfs_ae,
+        "ecmwf_mean": ecmwf_mean, "ecmwf_spread": ecmwf_spread,
+        "ecmwf_p_threshold": ecmwf_p,
+        "ecmwf_signed_error": ecmwf_se, "ecmwf_abs_error": ecmwf_ae,
+        "p_blended": float(sig["p_final"]) if sig["p_final"] is not None else None,
+        "market_price": market_price,
+        "outcome": outcome,
+        "signal_id": int(sig["id"]),
+        "settlement_id": settlement_id,
+    })
+
+
 @dataclass
 class GradeOutcome:
     market_row_id: int
@@ -139,6 +306,11 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
         print(f"Grader: {len(open_rows)} open positions to evaluate "
               f"(cap {grade_cap} per run).")
 
+    # Backfill wx_verifications for any weather paper_trade whose market
+    # has already resolved. Idempotent (upsert by market_row_id) - cheap
+    # to call every run and self-healing if earlier runs missed any.
+    backfilled = _backfill_wx_verifications(ledger, verbose=verbose)
+
     for trade in open_rows:
         if settled >= grade_cap:
             if verbose:
@@ -186,7 +358,7 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
             wu_val = resolved.get("wu_value")
             om_val = resolved.get("om_value")
             wu_source = resolved.get("wu_source", "")
-            ledger.record_settlement(
+            settlement_id = ledger.record_settlement(
                 int(trade["market_id"]),
                 float(actual) if actual is not None else None,
                 source, outcome,
@@ -194,6 +366,16 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
                 wu_value=float(wu_val) if wu_val is not None else None,
                 wu_source=wu_source,
             )
+            # Log the verification row right here - we have the freshest
+            # OM + WU values in scope, and we want the row written even
+            # for DISPUTED outcomes (the dispute forensics depend on it).
+            try:
+                _log_wx_verification(
+                    ledger, trade, market_row, outcome,
+                    om_val, wu_val, source, settlement_id)
+            except Exception as exc:
+                if verbose:
+                    print(f"  wx-verify log failed for trade {trade['id']}: {exc}")
             if outcome == "DISPUTED" and verbose:
                 print(f"  !! DISPUTED trade {trade['id']} ({trade['strategy']}) "
                       f"{market.slug}: {resolved.get('dispute_note', '')}; "
