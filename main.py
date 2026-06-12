@@ -464,7 +464,11 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
 
                 # Shadow challenger: score the same market with the v2
                 # model + log both decisions to shadow_trades. This is
-                # paper-only and never touches the main bankroll.
+                # paper-only and never touches the main bankroll. A
+                # "would-trade" side is recorded ONLY when the executor
+                # decision is PENDING_FILL (i.e. the model would have
+                # actually fired through the foundation gates) -- not
+                # merely favored one side at NO_EDGE.
                 if is_weather and shadow_challenger is not None:
                     try:
                         est_v2 = shadow_challenger.estimate(m)
@@ -472,34 +476,46 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
                                                       shadow_challenger,
                                                       strategies_cfg)
                                   if est_v2 is not None else None)
+                        champ_would_fire = (getattr(d, "decision", "")
+                                              == "PENDING_FILL")
+                        chal_would_fire = (d_v2 is not None
+                                             and getattr(d_v2, "decision", "")
+                                                  == "PENDING_FILL")
                         ledger.upsert_shadow_trade({
                             "market_id": mid,
                             "city": (est.metadata or {}).get("city"),
                             "resolve_date": m.resolve_date,
                             "champ_p": float(est.p_final),
-                            "champ_side": getattr(d, "side", None) or "NONE",
+                            "champ_side": (d.side if champ_would_fire
+                                              else "NONE"),
                             "champ_edge": getattr(d, "edge", None),
                             "champ_price_filled": (
-                                d.fill.price_filled if d.fill else None),
+                                d.fill.price_filled
+                                if champ_would_fire and d.fill else None),
                             "champ_stake": (
-                                d.fill.stake if d.fill else None),
+                                d.fill.stake
+                                if champ_would_fire and d.fill else None),
                             "champ_shares": (
-                                d.fill.shares if d.fill else None),
+                                d.fill.shares
+                                if champ_would_fire and d.fill else None),
                             "chal_p": (float(est_v2.p_final)
                                           if est_v2 is not None else None),
-                            "chal_side": (getattr(d_v2, "side", None) or "NONE"
-                                            if d_v2 is not None else "NONE"),
+                            "chal_side": (d_v2.side if chal_would_fire
+                                             else "NONE"),
                             "chal_edge": (getattr(d_v2, "edge", None)
                                               if d_v2 is not None else None),
                             "chal_price_filled": (
                                 d_v2.fill.price_filled
-                                if d_v2 and d_v2.fill else None),
+                                if chal_would_fire and d_v2 and d_v2.fill
+                                else None),
                             "chal_stake": (
                                 d_v2.fill.stake
-                                if d_v2 and d_v2.fill else None),
+                                if chal_would_fire and d_v2 and d_v2.fill
+                                else None),
                             "chal_shares": (
                                 d_v2.fill.shares
-                                if d_v2 and d_v2.fill else None),
+                                if chal_would_fire and d_v2 and d_v2.fill
+                                else None),
                         })
                     except Exception as exc:
                         if verbose:
