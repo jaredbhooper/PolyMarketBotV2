@@ -304,6 +304,26 @@ strategies:
     stake_usd: 10.00
     fee_pct: 0.0
 
+  # v2.3 WeatherModel challenger. Runs in shadow alongside the live
+  # `weather` strategy on every cycle. Logs both models' probabilities
+  # + edges to shadow_trades; same fixed grader scores both. NEVER
+  # touches the main bankroll. Promotion gate is OFF by default --
+  # the report shows whether the challenger WOULD have promoted, but
+  # the live executor keeps using the champion until you flip
+  # promotion_enabled.
+  weather_v2:
+    edge_threshold: 0.08            # same gates as champion so head-to-head pairs
+    kelly_fraction: 0.15
+    bias_window_days: 30            # rolling window for per-city per-model bias
+    sigma_window_days: 60           # rolling window for learned kernel sigma
+    weight_window_days: 30          # rolling window for inverse-Brier family weights
+    min_sigma_c: 0.3                # floor on kernel sigma (Celsius)
+    clamp_min: 0.02
+    clamp_max: 0.98
+    forecast_days: 3
+    promotion_enabled: false        # OFF: report verdict only, don't swap models
+    promotion_min_n: 75
+
   weather:
     edge_threshold: 0.08            # override default
     kelly_fraction: 0.15

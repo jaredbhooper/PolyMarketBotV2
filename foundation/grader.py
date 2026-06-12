@@ -418,6 +418,12 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
     probe_settled, probe_skipped = grade_cv_probe_positions(
         cfg, ledger, today, verbose=verbose)
 
+    # Settle shadow_trades (WeatherModel v2 challenger head-to-head book).
+    # Both legs are paper-only -- no bankroll txns -- but the same fill
+    # math drives champ_pnl + chal_pnl so the daily report can compare.
+    shadow_settled, shadow_skipped = grade_shadow_trades(
+        cfg, ledger, today, verbose=verbose)
+
     # Recompute per-strategy daily report rows.
     update_reports(ledger, cfg, today.isoformat(), verbose=verbose)
 
@@ -425,6 +431,7 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
             "arb_settled": arb_settled, "arb_skipped": arb_skipped,
             "cv_settled": cv_settled, "cv_skipped": cv_skipped,
             "cv_probe_settled": probe_settled, "cv_probe_skipped": probe_skipped,
+            "shadow_settled": shadow_settled, "shadow_skipped": shadow_skipped,
             "open_remaining": len(ledger.open_positions())}
 
 
@@ -926,6 +933,55 @@ def grade_cv_probe_positions(cfg: dict, ledger: Ledger, today,
             dd = f"/{divergence_direction}" if divergence_direction else ""
             print(f"  Settled cv_probe pos {pos['id']} {pos['category']} "
                   f"{pos['direction']} -> {agreement}{dd} PnL=${pnl:+.2f}")
+    return settled, skipped
+
+
+def grade_shadow_trades(cfg: dict, ledger: Ledger, today,
+                            verbose: bool = True) -> tuple[int, int]:
+    """Settle every OPEN shadow_trades row whose market has a final
+    settlement outcome. v2.3 WeatherModel head-to-head book.
+
+    For each side (champion / challenger):
+      - If the row has no side at all (NONE / null), pnl stays at 0 --
+        the model declined to trade. Brier is still computed at report
+        time from champ_p / chal_p.
+      - Otherwise apply the same _settle_trade_pnl shape: a winning
+        side returns shares - stake; a losing side returns -stake.
+    """
+    settled = 0
+    skipped = 0
+    open_rows = ledger.list_open_shadow_trades()
+    if verbose:
+        print(f"Grader: {len(open_rows)} open shadow_trades to evaluate.")
+
+    def _side_pnl(side: str | None, price_filled, stake, shares,
+                    outcome: str) -> float | None:
+        if not side or side == "NONE" or stake is None or shares is None:
+            return 0.0
+        if outcome not in ("YES", "NO"):
+            return None
+        if side == outcome:
+            return float(shares) - float(stake)
+        return -float(stake)
+
+    for row in open_rows:
+        market_id = int(row["market_id"])
+        settlement = ledger.get_settlement(market_id)
+        if not settlement:
+            skipped += 1
+            continue
+        outcome = settlement["outcome"]
+        if outcome not in ("YES", "NO"):
+            skipped += 1
+            continue
+        champ_pnl = _side_pnl(row["champ_side"], row["champ_price_filled"],
+                                row["champ_stake"], row["champ_shares"],
+                                outcome)
+        chal_pnl = _side_pnl(row["chal_side"], row["chal_price_filled"],
+                               row["chal_stake"], row["chal_shares"],
+                               outcome)
+        ledger.close_shadow_trade(int(row["id"]), outcome, champ_pnl, chal_pnl)
+        settled += 1
     return settled, skipped
 
 

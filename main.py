@@ -399,9 +399,25 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
     # Each strategy runs inside a HealthSession so that an exception in
     # one strategy does NOT abort the cycle for the others.
     pending: list[CycleDecision] = []
+    # Build the v2 challenger ONCE (lazily; only if weather is among
+    # the active strategies and weather_v2 is configured). Shadow
+    # writes never affect the main bankroll.
+    shadow_challenger = None
+    if (cfg.get("strategies") or {}).get("weather_v2") is not None \
+            and any(getattr(s, "name", "") == "weather" for s in strategies):
+        try:
+            from strategies.weather_v2 import WeatherModelV2
+            shadow_challenger = WeatherModelV2(cfg)
+            shadow_challenger.attach_ledger(ledger)
+        except Exception as exc:
+            if verbose:
+                print(f"  weather_v2 init failed: {exc}")
+            shadow_challenger = None
+
     for strat in strategies:
         t_strat = _time.time()
         skipped_deadline = 0
+        is_weather = getattr(strat, "name", "") == "weather"
         with HealthSession(ledger, strat.name) as h:
             # Some strategies (e.g. weather's adaptive layer) need a
             # cycle-scoped read handle to the ledger. Optional hook.
@@ -435,6 +451,9 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
                                        m.book_depth_usd)
                 est = strat.estimate(m)
                 if est is None:
+                    # v2 challenger may still want to score even when
+                    # champion bails out (no symmetric reason here but
+                    # left as a hook). Skip head-to-head for clarity.
                     continue
                 ledger.record_signal(mid, strat.name, est.p_final, est.confidence,
                                      est.metadata)
@@ -442,6 +461,50 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
                 decisions.append(d)
                 if d.decision == "PENDING_FILL":
                     pending.append(d)
+
+                # Shadow challenger: score the same market with the v2
+                # model + log both decisions to shadow_trades. This is
+                # paper-only and never touches the main bankroll.
+                if is_weather and shadow_challenger is not None:
+                    try:
+                        est_v2 = shadow_challenger.estimate(m)
+                        d_v2 = (executor.evaluate(m, est_v2,
+                                                      shadow_challenger,
+                                                      strategies_cfg)
+                                  if est_v2 is not None else None)
+                        ledger.upsert_shadow_trade({
+                            "market_id": mid,
+                            "city": (est.metadata or {}).get("city"),
+                            "resolve_date": m.resolve_date,
+                            "champ_p": float(est.p_final),
+                            "champ_side": getattr(d, "side", None) or "NONE",
+                            "champ_edge": getattr(d, "edge", None),
+                            "champ_price_filled": (
+                                d.fill.price_filled if d.fill else None),
+                            "champ_stake": (
+                                d.fill.stake if d.fill else None),
+                            "champ_shares": (
+                                d.fill.shares if d.fill else None),
+                            "chal_p": (float(est_v2.p_final)
+                                          if est_v2 is not None else None),
+                            "chal_side": (getattr(d_v2, "side", None) or "NONE"
+                                            if d_v2 is not None else "NONE"),
+                            "chal_edge": (getattr(d_v2, "edge", None)
+                                              if d_v2 is not None else None),
+                            "chal_price_filled": (
+                                d_v2.fill.price_filled
+                                if d_v2 and d_v2.fill else None),
+                            "chal_stake": (
+                                d_v2.fill.stake
+                                if d_v2 and d_v2.fill else None),
+                            "chal_shares": (
+                                d_v2.fill.shares
+                                if d_v2 and d_v2.fill else None),
+                        })
+                    except Exception as exc:
+                        if verbose:
+                            print(f"  shadow log failed for market "
+                                    f"{mid}: {exc}")
             if skipped_deadline and verbose:
                 print(f"  [{strat.name}] deadline truncated: "
                       f"{skipped_deadline} markets deferred")

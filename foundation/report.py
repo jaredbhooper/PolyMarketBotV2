@@ -156,6 +156,15 @@ def print_master_report(cfg_path: str = "config.yaml") -> None:
     except Exception as exc:
         print(f"  CV-PROBE render failed: {exc}")
 
+    # ---- WeatherModel CHAMPION vs CHALLENGER section --------------------
+    # Shadow book; never touches the main bankroll. Promotion gate
+    # is config-driven (default OFF).
+    try:
+        print()
+        print_weather_v2_shadow(cfg, ledger)
+    except Exception as exc:
+        print(f"  WEATHER v2 shadow render failed: {exc}")
+
     # ---- Today equity snapshot (if not already there) ------------------
     for r in snapshot:
         s = r["strategy"]
@@ -479,6 +488,75 @@ def print_cv_probe_report(cfg: dict, ledger: Ledger) -> None:
               f"{n_vm:>4d} {n_bv:>4d} {div_rate*100:>7.1f}% "
               f"${agr_avg_gap:>7.3f} {breakeven*100:>8.1f}% "
               f"${sum_pnl:>+9.2f}  {verdict}")
+    print()
+
+
+def print_weather_v2_shadow(cfg: dict, ledger: Ledger) -> None:
+    """WeatherModel CHAMPION vs CHALLENGER section. Brier + expectancy
+    per city + overall, on the shadow book. Promotion verdict follows
+    the rule in cfg.strategies.weather_v2: challenger replaces champion
+    only after >= promotion_min_n shadow-graded markets with lower
+    Brier AND non-negative expectancy delta. Default OFF (promotion is
+    not auto-applied; the section reports whether the conditions
+    would have triggered)."""
+    v2cfg = (cfg.get("strategies") or {}).get("weather_v2") or {}
+    print("=== WEATHER v2 (shadow CHAMPION vs CHALLENGER) ===")
+    print(f"  shadow book: paper only, never touches main bankroll")
+    print(f"  promotion gate: enabled={bool(v2cfg.get('promotion_enabled', False))}  "
+          f"min_n={int(v2cfg.get('promotion_min_n', 75))}")
+
+    overall = ledger.shadow_overall_stats()
+    n_overall = int(overall["n"]) if overall and overall["n"] is not None else 0
+    if n_overall == 0:
+        print()
+        print("  (no settled shadow trades yet)")
+        return
+
+    rows = ledger.shadow_stats_by_city()
+    print()
+    print(f"  {'city':<14s} {'n':>4s} {'cN':>4s} {'champ_brier':>11s} "
+          f"{'chal_brier':>10s} {'champ_E':>9s} {'chal_E':>9s} "
+          f"{'champ_$':>9s} {'chal_$':>9s}")
+    print(f"  {'-'*14} {'-'*4} {'-'*4} {'-'*11} {'-'*10} {'-'*9} {'-'*9} "
+          f"{'-'*9} {'-'*9}")
+    for r in rows:
+        city = r["city"] or "?"
+        n = int(r["n"]); cN = int(r["champ_n_trades"] or 0)
+        cb = float(r["champ_brier"] or 0.0); xb = float(r["chal_brier"] or 0.0)
+        ce = float(r["champ_expectancy"] or 0.0)
+        xe = float(r["chal_expectancy"] or 0.0)
+        ct = float(r["champ_total_pnl"] or 0.0)
+        xt = float(r["chal_total_pnl"] or 0.0)
+        print(f"  {city[:14]:<14s} {n:>4d} {cN:>4d} {cb:>11.4f} "
+              f"{xb:>10.4f} ${ce:>+7.2f} ${xe:>+7.2f} ${ct:>+7.2f} ${xt:>+7.2f}")
+    # Overall row
+    cb = float(overall["champ_brier"] or 0.0)
+    xb = float(overall["chal_brier"] or 0.0)
+    ce = float(overall["champ_expectancy"] or 0.0)
+    xe = float(overall["chal_expectancy"] or 0.0)
+    print(f"  {'-'*14} {'-'*4} {'-'*4} {'-'*11} {'-'*10} {'-'*9} {'-'*9} "
+          f"{'-'*9} {'-'*9}")
+    print(f"  {'OVERALL':<14s} {n_overall:>4d} {' ':>4s} {cb:>11.4f} "
+          f"{xb:>10.4f} ${ce:>+7.2f} ${xe:>+7.2f}")
+
+    # Promotion verdict.
+    min_n = int(v2cfg.get("promotion_min_n", 75))
+    enabled = bool(v2cfg.get("promotion_enabled", False))
+    print()
+    if n_overall < min_n:
+        print(f"  promotion verdict: INSUFFICIENT (n={n_overall} < min_n={min_n})")
+    else:
+        brier_better = xb < cb
+        exp_non_neg = xe >= ce
+        if brier_better and exp_non_neg:
+            verdict = "WOULD PROMOTE" if not enabled else "PROMOTING"
+        else:
+            reasons = []
+            if not brier_better: reasons.append(f"Brier {xb:.4f} >= {cb:.4f}")
+            if not exp_non_neg: reasons.append(
+                f"Expectancy {xe:+.2f} < {ce:+.2f}")
+            verdict = "HOLD (" + "; ".join(reasons) + ")"
+        print(f"  promotion verdict: {verdict}")
     print()
 
 

@@ -428,6 +428,45 @@ CREATE INDEX IF NOT EXISTS idx_sharpline_status ON sharpline_orders(status);
 CREATE INDEX IF NOT EXISTS idx_logic_violations_pair ON logic_violations(pair_id, ts);
 CREATE INDEX IF NOT EXISTS idx_wx_verify_city_date ON wx_verification(city, resolve_date);
 
+-- v2.3 shadow_trades: WeatherModel v2 head-to-head book. Every market
+-- the live weather strategy scans logs BOTH the champion model's and
+-- the challenger model's evaluation here. Shadow trades simulate the
+-- same Kelly/fill rules and get graded by the same fixed grader, but
+-- NEVER touch the main bankroll. The daily report renders a
+-- CHAMPION vs CHALLENGER comparison + a promotion verdict based on
+-- shadow Brier + expectancy.
+CREATE TABLE IF NOT EXISTS shadow_trades (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  market_id INTEGER NOT NULL,
+  city TEXT,
+  resolve_date TEXT,
+  -- CHAMPION model (existing weather strategy)
+  champ_p REAL,
+  champ_side TEXT,             -- YES / NO / NONE
+  champ_edge REAL,
+  champ_price_filled REAL,
+  champ_stake REAL,
+  champ_shares REAL,
+  champ_pnl REAL,
+  -- CHALLENGER model (WeatherModelV2)
+  chal_p REAL,
+  chal_side TEXT,
+  chal_edge REAL,
+  chal_price_filled REAL,
+  chal_stake REAL,
+  chal_shares REAL,
+  chal_pnl REAL,
+  outcome TEXT,                -- YES / NO / VOID after grading
+  status TEXT NOT NULL DEFAULT 'OPEN',
+  closed_at TEXT,
+  UNIQUE(market_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_trades_status
+  ON shadow_trades(status, resolve_date);
+CREATE INDEX IF NOT EXISTS idx_shadow_trades_city
+  ON shadow_trades(city, status);
+
 -- v2.2 cv_state: tiny kv table for cross-cycle state the cv strategy
 -- needs (Kalshi category round-robin pointer, etc). MUST live in
 -- ledger.db (committed) so GitHub Actions runners pick up where the
@@ -1465,6 +1504,141 @@ class Ledger:
                    GROUP BY category, agreement_outcome, divergence_direction
                    ORDER BY category, agreement_outcome, divergence_direction"""
             ).fetchall())
+
+    # --- shadow_trades (WeatherModel v2 challenger book) -----------------
+    def upsert_shadow_trade(self, row: dict[str, Any]) -> int:
+        """Idempotent on market_id. Used by main.py cycle() weather phase
+        to log BOTH the champion's and challenger's evaluation of each
+        scanned market. The challenger never touches the main bankroll;
+        this row is only used to drive the CHAMPION vs CHALLENGER table
+        in the daily report and the promotion gate."""
+        with self._conn() as c:
+            existing = c.execute(
+                "SELECT id FROM shadow_trades WHERE market_id=?",
+                (int(row["market_id"]),)).fetchone()
+            if existing:
+                c.execute(
+                    """UPDATE shadow_trades
+                          SET ts=?, city=?, resolve_date=?,
+                              champ_p=?, champ_side=?, champ_edge=?,
+                              champ_price_filled=?, champ_stake=?, champ_shares=?,
+                              chal_p=?, chal_side=?, chal_edge=?,
+                              chal_price_filled=?, chal_stake=?, chal_shares=?
+                        WHERE id=?""",
+                    (
+                        row.get("ts") or utcnow_iso(),
+                        row.get("city"),
+                        row.get("resolve_date"),
+                        row.get("champ_p"),
+                        row.get("champ_side"),
+                        row.get("champ_edge"),
+                        row.get("champ_price_filled"),
+                        row.get("champ_stake"),
+                        row.get("champ_shares"),
+                        row.get("chal_p"),
+                        row.get("chal_side"),
+                        row.get("chal_edge"),
+                        row.get("chal_price_filled"),
+                        row.get("chal_stake"),
+                        row.get("chal_shares"),
+                        int(existing["id"]),
+                    ),
+                )
+                return int(existing["id"])
+            cur = c.execute(
+                """INSERT INTO shadow_trades (
+                       ts, market_id, city, resolve_date,
+                       champ_p, champ_side, champ_edge,
+                       champ_price_filled, champ_stake, champ_shares,
+                       chal_p, chal_side, chal_edge,
+                       chal_price_filled, chal_stake, chal_shares,
+                       status)
+                   VALUES (?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, 'OPEN')""",
+                (
+                    row.get("ts") or utcnow_iso(),
+                    int(row["market_id"]),
+                    row.get("city"),
+                    row.get("resolve_date"),
+                    row.get("champ_p"),
+                    row.get("champ_side"),
+                    row.get("champ_edge"),
+                    row.get("champ_price_filled"),
+                    row.get("champ_stake"),
+                    row.get("champ_shares"),
+                    row.get("chal_p"),
+                    row.get("chal_side"),
+                    row.get("chal_edge"),
+                    row.get("chal_price_filled"),
+                    row.get("chal_stake"),
+                    row.get("chal_shares"),
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def list_open_shadow_trades(self) -> list[sqlite3.Row]:
+        with self._conn() as c:
+            return list(c.execute(
+                "SELECT * FROM shadow_trades WHERE status='OPEN'"
+            ).fetchall())
+
+    def close_shadow_trade(self, shadow_id: int, outcome: str,
+                              champ_pnl: float | None,
+                              chal_pnl: float | None) -> None:
+        with self._conn() as c:
+            c.execute(
+                """UPDATE shadow_trades
+                      SET status='SETTLED', outcome=?,
+                          champ_pnl=?, chal_pnl=?, closed_at=?
+                    WHERE id=?""",
+                (outcome,
+                 None if champ_pnl is None else float(champ_pnl),
+                 None if chal_pnl is None else float(chal_pnl),
+                 utcnow_iso(), int(shadow_id)),
+            )
+
+    def shadow_stats_by_city(self) -> list[sqlite3.Row]:
+        """Per-city aggregate of settled shadow trades. Champion vs
+        challenger Brier + expectancy (avg pnl per shadowed market).
+        Brier is computed using champ_p / chal_p as the YES probability
+        regardless of which side the model would have traded -- the
+        probability IS the calibration question, independent of the
+        trade decision. Markets where the model declined to trade still
+        contribute to Brier."""
+        with self._conn() as c:
+            return list(c.execute(
+                """SELECT city,
+                          COUNT(*) AS n,
+                          SUM(CASE WHEN champ_side IS NOT NULL
+                                    AND champ_side != 'NONE' THEN 1 ELSE 0 END) AS champ_n_trades,
+                          SUM(CASE WHEN chal_side IS NOT NULL
+                                    AND chal_side != 'NONE' THEN 1 ELSE 0 END) AS chal_n_trades,
+                          AVG((champ_p - CASE WHEN outcome='YES' THEN 1.0 ELSE 0.0 END)
+                              *(champ_p - CASE WHEN outcome='YES' THEN 1.0 ELSE 0.0 END)) AS champ_brier,
+                          AVG((chal_p - CASE WHEN outcome='YES' THEN 1.0 ELSE 0.0 END)
+                              *(chal_p - CASE WHEN outcome='YES' THEN 1.0 ELSE 0.0 END)) AS chal_brier,
+                          AVG(COALESCE(champ_pnl, 0.0)) AS champ_expectancy,
+                          AVG(COALESCE(chal_pnl, 0.0)) AS chal_expectancy,
+                          SUM(COALESCE(champ_pnl, 0.0)) AS champ_total_pnl,
+                          SUM(COALESCE(chal_pnl, 0.0)) AS chal_total_pnl
+                     FROM shadow_trades
+                    WHERE status='SETTLED' AND outcome IN ('YES','NO')
+                    GROUP BY city
+                    ORDER BY city"""
+            ).fetchall())
+
+    def shadow_overall_stats(self) -> sqlite3.Row | None:
+        with self._conn() as c:
+            return c.execute(
+                """SELECT COUNT(*) AS n,
+                          AVG((champ_p - CASE WHEN outcome='YES' THEN 1.0 ELSE 0.0 END)
+                              *(champ_p - CASE WHEN outcome='YES' THEN 1.0 ELSE 0.0 END)) AS champ_brier,
+                          AVG((chal_p - CASE WHEN outcome='YES' THEN 1.0 ELSE 0.0 END)
+                              *(chal_p - CASE WHEN outcome='YES' THEN 1.0 ELSE 0.0 END)) AS chal_brier,
+                          AVG(COALESCE(champ_pnl, 0.0)) AS champ_expectancy,
+                          AVG(COALESCE(chal_pnl, 0.0)) AS chal_expectancy
+                     FROM shadow_trades
+                    WHERE status='SETTLED' AND outcome IN ('YES','NO')"""
+            ).fetchone()
 
     # --- cv_state kv (cross-cycle persistence) ---------------------------
     def cv_state_get(self, key: str, default: str | None = None
