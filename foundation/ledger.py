@@ -1260,6 +1260,28 @@ class Ledger:
                         last_pulled_at=excluded.last_pulled_at""",
                 (wallet, int(last_ts), utcnow_iso()))
 
+    def list_wallets_top_by_realized(self, limit: int = 20) -> list[dict]:
+        """Top wallets by realized P&L from the scout's cached metrics.
+        Used by the autopsy-top command. Reads metrics_json since the
+        wallets table doesn't have a normalized realized_pnl column."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT wallet, metrics_json FROM cache.wallets "
+                "WHERE metrics_json IS NOT NULL").fetchall()
+        out = []
+        for r in rows:
+            try:
+                m = json.loads(r["metrics_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            out.append({
+                "wallet": r["wallet"],
+                "realized_pnl_usd": float(m.get("realized_pnl_usd") or 0.0),
+                "n_trades": int(m.get("n_trades") or 0),
+            })
+        out.sort(key=lambda x: x["realized_pnl_usd"], reverse=True)
+        return out[:limit]
+
     def list_roster(self) -> list[sqlite3.Row]:
         with self._conn() as c:
             return list(c.execute("SELECT * FROM roster").fetchall())

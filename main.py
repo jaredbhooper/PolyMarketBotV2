@@ -434,6 +434,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("vacuum", help="prune cache.db retention + VACUUM both ledger and cache (daily housekeeping)")
     sub.add_parser("wx-weights", help="print the current per-city adaptive weather weights, biases, and calibration")
     sub.add_parser("wx-verify", help="print the WX-VERIFY skill + dispute-forensics report")
+    aut = sub.add_parser("autopsy", help="behavioral fingerprint + archetype for a single wallet")
+    aut.add_argument("wallet")
+    aut.add_argument("--refresh", action="store_true",
+                     help="pull fresh trades via Polymarket data API before classifying")
+    autt = sub.add_parser("autopsy-top",
+                          help="run autopsy over top wallets by realized P&L from the candidate pool")
+    autt.add_argument("-n", "--limit", type=int, default=20)
+    autt.add_argument("--refresh", action="store_true")
     args = p.parse_args(argv)
 
     if args.cmd == "cycle":
@@ -553,6 +561,26 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config()
         ledger = ledger_from_cfg(cfg)
         _print_wx_verify(cfg, ledger)
+        return 0
+    if args.cmd == "autopsy":
+        cfg = load_config()
+        ledger = ledger_from_cfg(cfg)
+        pmd = None
+        if args.refresh:
+            from foundation.polymarket_data import PolymarketData
+            pmd = PolymarketData()
+        _print_autopsy_single(cfg, ledger, args.wallet, polymarket_data=pmd,
+                              refresh=args.refresh)
+        return 0
+    if args.cmd == "autopsy-top":
+        cfg = load_config()
+        ledger = ledger_from_cfg(cfg)
+        pmd = None
+        if args.refresh:
+            from foundation.polymarket_data import PolymarketData
+            pmd = PolymarketData()
+        _print_autopsy_top(cfg, ledger, n=args.limit,
+                           polymarket_data=pmd, refresh=args.refresh)
         return 0
     if args.cmd == "vacuum":
         cfg = load_config()
@@ -887,6 +915,102 @@ def _print_wx_verify(cfg: dict, ledger: Ledger) -> None:
                        else "single sample")
             print(f"    {st:14s} {ds.n:>3d} {ds.mean_om_minus_wu:>+7.2f} "
                   f"{ds.std_om_minus_wu:>6.2f}  {verdict}")
+    print()
+
+
+def _print_autopsy_single(cfg: dict, ledger: Ledger, wallet: str,
+                            polymarket_data=None, refresh: bool = False) -> None:
+    from foundation.autopsy import autopsy
+    aut_cfg = (cfg.get("autopsy") or {})
+    res = autopsy(wallet, ledger, polymarket_data=polymarket_data,
+                  cfg=aut_cfg, refresh=refresh)
+    fp = res["fingerprint"]
+    print()
+    print("=== Wallet autopsy ===")
+    print(f"  wallet:           {res['wallet']}")
+    print(f"  n_trades:         {fp['n_trades']}  "
+          f"n_resolved:{fp.get('n_resolved', 0)}  "
+          f"track_record:{fp.get('track_record_days', 0):.0f}d")
+    print(f"  realized_pnl_usd: {fp.get('realized_pnl_usd', 0.0):+.2f}  "
+          f"roi/trade:{fp.get('roi_per_trade', 0.0):+.3f}")
+    print()
+    print("  --- HABITAT ---")
+    print(f"  dominant_category={fp.get('dominant_category', '?')}  "
+          f"dominant_share={fp.get('dominant_share', 0.0):.2f}  "
+          f"n_categories_active={fp.get('n_categories_active', 0)}")
+    print()
+    print("  --- TIMING ---")
+    med = fp.get("median_interval_sec", float("inf"))
+    med_s = f"{med:.0f}s" if med != float("inf") else "n/a"
+    print(f"  median_interval={med_s}  "
+          f"interval_cv={fp.get('interval_cv', 0.0):.2f}  "
+          f"hour_entropy_norm={fp.get('hour_entropy_norm', 0.0):.2f}  "
+          f"share_overnight_utc={fp.get('share_overnight', 0.0):.2f}")
+    print(f"  trades_per_active_day={fp.get('trades_per_active_day', 0.0):.2f}  "
+          f"stake_uniformity={fp.get('stake_uniformity', 0.0):.2f}")
+    print()
+    print("  --- ENTRY PRICE ---")
+    print(f"  mean={fp.get('entry_price_mean', 0.0):.2f}  "
+          f"std={fp.get('entry_price_std', 0.0):.2f}  "
+          f"p10/p50/p90={fp.get('entry_price_p10', 0.0):.2f}/"
+          f"{fp.get('entry_price_p50', 0.0):.2f}/"
+          f"{fp.get('entry_price_p90', 0.0):.2f}")
+    print(f"  share_entry_extreme={fp.get('share_entry_extreme', 0.0):.2f}")
+    print()
+    print("  --- HOLD + EXIT ---")
+    print(f"  median_hold_days={fp.get('median_hold_days', 0.0):.2f}  "
+          f"pct_held_to_end={fp.get('pct_held_to_end', 0.0):.2f}")
+    print()
+    print("  --- BEHAVIOR ---")
+    print(f"  two_sided_pairs={fp.get('two_sided_pairs', 0)} (rate "
+          f"{fp.get('two_sided_rate', 0.0):.2f}) -- MM signature")
+    print(f"  offsetting_pairs={fp.get('offsetting_pairs', 0)} (rate "
+          f"{fp.get('offsetting_rate', 0.0):.2f}) -- arb signature")
+    print()
+    print("  --- VERDICT ---")
+    print(f"  archetype:        {res['archetype']}  "
+          f"(confidence {res['confidence']:.2f})")
+    print(f"  closest strategy: {res['closest_strategy']}")
+    print(f"  copyability:      {res['copyability']}")
+    print(f"  evidence:")
+    for e in res["evidence"]:
+        print(f"    - {e}")
+    print()
+
+
+def _print_autopsy_top(cfg: dict, ledger: Ledger, n: int = 20,
+                        polymarket_data=None, refresh: bool = False) -> None:
+    from foundation.autopsy import autopsy_top, ARCHETYPE_ANALOGUE
+    aut_cfg = (cfg.get("autopsy") or {})
+    out = autopsy_top(ledger, polymarket_data=polymarket_data,
+                      cfg=aut_cfg, n=n, refresh=refresh)
+    print()
+    print("=== Wallet autopsy (top-N by realized P&L) ===")
+    if not out["results"]:
+        print("  no candidate wallets cached. Run `scout` first.")
+        return
+    print(f"  processed: {out['n_processed']}")
+    print()
+    print("  --- ARCHETYPE CENSUS ---")
+    print(f"  {'archetype':18s} {'count':>5s}  {'closest strategy / copyability'}")
+    print(f"  {'-'*18} {'-'*5}  {'-'*60}")
+    for arch in ("speed-reactor", "market-maker", "arbitrageur",
+                  "sharp-line-taker", "niche-judgment",
+                  "endgame-grinder", "mixed"):
+        cnt = out["census"].get(arch, 0)
+        if cnt == 0:
+            continue
+        a = ARCHETYPE_ANALOGUE[arch]
+        print(f"  {arch:18s} {cnt:>5d}  {a['analogue']} | {a['copyable']}")
+    print()
+    print("  --- PER-WALLET VERDICTS ---")
+    print(f"  {'wallet':44s} {'pnl_usd':>10s} {'n':>5s} {'archetype':18s} {'conf':>5s}")
+    print(f"  {'-'*44} {'-'*10} {'-'*5} {'-'*18} {'-'*5}")
+    for r in sorted(out["results"], key=lambda x: x.get("realized_pnl_usd", 0.0),
+                     reverse=True):
+        print(f"  {r['wallet']:44s} {r.get('realized_pnl_usd', 0.0):>+10.2f} "
+              f"{r['n_trades']:>5d} {r['archetype']:18s} "
+              f"{r.get('confidence', 0.0):>5.2f}")
     print()
 
 
