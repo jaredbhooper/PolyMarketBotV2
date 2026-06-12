@@ -141,6 +141,13 @@ def print_master_report(cfg_path: str = "config.yaml") -> None:
     except Exception as exc:
         print(f"  WX-VERIFY render failed: {exc}")
 
+    # ---- Copy-trading bot-likeness section ------------------------------
+    try:
+        print()
+        _print_copy_bot_likeness(cfg, ledger)
+    except Exception as exc:
+        print(f"  COPY bot_likeness render failed: {exc}")
+
     # ---- Today equity snapshot (if not already there) ------------------
     for r in snapshot:
         s = r["strategy"]
@@ -233,6 +240,82 @@ def print_status(cfg_path: str = "config.yaml") -> None:
             "SELECT DISTINCT strategy FROM paper_trades").fetchall()]:
             print(f"[{s}] bankroll=${ledger.bankroll(s, starting):.2f}  "
                   f"open=${ledger.open_stake(s):.2f}")
+
+
+def _print_copy_bot_likeness(cfg: dict, ledger: Ledger) -> None:
+    """Active roster + settled copy P&L bucketed by leader bot_likeness.
+    Score is informational only (NOT a hard filter)."""
+    import sqlite3
+    print("=== COPY bot-likeness ===")
+    with sqlite3.connect(ledger.db_path) as c:
+        c.row_factory = sqlite3.Row
+        c.execute("ATTACH DATABASE ? AS cache", (ledger.cache_path,))
+        # active roster + per-wallet bot_likeness from cached metrics.
+        rows = list(c.execute(
+            "SELECT wallet, score, rank, status FROM roster "
+            "WHERE status='ACTIVE' ORDER BY rank").fetchall())
+        if not rows:
+            print("  no ACTIVE roster wallets")
+        else:
+            wallets = [r["wallet"] for r in rows]
+            placeholders = ",".join("?" * len(wallets))
+            metric_rows = c.execute(
+                f"SELECT wallet, metrics_json FROM cache.wallets "
+                f"WHERE wallet IN ({placeholders})", wallets).fetchall()
+            bl_map: dict[str, float] = {}
+            for mr in metric_rows:
+                try:
+                    md = json.loads(mr["metrics_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    md = {}
+                bl_map[mr["wallet"]] = float(md.get("bot_likeness") or 0.0)
+            print(f"  {'wallet':44s} {'rank':>4s} {'score':>7s} {'bot_lik':>8s}")
+            print(f"  {'-'*44} {'-'*4} {'-'*7} {'-'*8}")
+            for r in rows:
+                bl = bl_map.get(r["wallet"], 0.0)
+                rank = r["rank"] if r["rank"] is not None else 0
+                sc = r["score"] if r["score"] is not None else 0.0
+                print(f"  {r['wallet']:44s} {rank:>4d} {sc:>7.3f} {bl:>8.3f}")
+
+        # settled copy P&L + latency tax bucketed by leader bot_likeness.
+        print()
+        print("  --- settled P&L by leader bot_likeness ---")
+        settled = list(c.execute(
+            """SELECT leader_wallet, our_pnl,
+                      COALESCE(leader_pnl_equivalent, 0.0) AS lpe
+               FROM copied_trades WHERE status='settled'""").fetchall())
+        if not settled:
+            print("    (no settled copy trades yet)")
+            print()
+            return
+        # leader -> bot_likeness from cache.wallets.metrics_json
+        leaders = list({r["leader_wallet"] for r in settled})
+        placeholders = ",".join("?" * len(leaders))
+        leader_bl: dict[str, float] = {}
+        for mr in c.execute(
+            f"SELECT wallet, metrics_json FROM cache.wallets "
+            f"WHERE wallet IN ({placeholders})", leaders).fetchall():
+            try:
+                md = json.loads(mr["metrics_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                md = {}
+            leader_bl[mr["wallet"]] = float(md.get("bot_likeness") or 0.0)
+        buckets = {"low (<0.33)": {"n": 0, "pnl": 0.0, "tax": 0.0},
+                   "mid (0.33-0.66)": {"n": 0, "pnl": 0.0, "tax": 0.0},
+                   "high (>=0.66)": {"n": 0, "pnl": 0.0, "tax": 0.0}}
+        for r in settled:
+            bl = leader_bl.get(r["leader_wallet"], 0.0)
+            key = ("low (<0.33)" if bl < 0.33
+                    else "mid (0.33-0.66)" if bl < 0.66
+                    else "high (>=0.66)")
+            buckets[key]["n"] += 1
+            buckets[key]["pnl"] += float(r["our_pnl"] or 0.0)
+            buckets[key]["tax"] += float(r["our_pnl"] or 0.0) - float(r["lpe"] or 0.0)
+        print(f"    {'bucket':20s} {'n':>5s} {'copy_pnl':>10s} {'latency_tax':>12s}")
+        print(f"    {'-'*20} {'-'*5} {'-'*10} {'-'*12}")
+        for k, v in buckets.items():
+            print(f"    {k:20s} {v['n']:>5d} ${v['pnl']:>+9.2f} ${v['tax']:>+11.2f}")
+    print()
 
 
 def telegram_send(text: str) -> bool:

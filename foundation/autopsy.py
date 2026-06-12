@@ -65,6 +65,23 @@ DEFAULT_AUTOPSY_CFG: dict[str, Any] = {
 }
 
 
+# Bot-likeness score components and default weights. NOT a hard
+# filter - this is a soft signal stored on every scout snapshot. High
+# values mean the wallet looks more like an always-on bot than a
+# human trader (regular cadence, even hour distribution, uniform
+# stake, crypto-heavy, high daily volume).
+DEFAULT_BOT_LIKENESS_WEIGHTS: dict[str, float] = {
+    "hour_entropy": 0.25,
+    "interval_regularity": 0.25,
+    "stake_uniformity": 0.20,
+    "crypto_share": 0.15,
+    "trades_per_active_day": 0.15,
+}
+# Anchor for trades_per_active_day -> [0,1]: at or above this many
+# trades/day the component saturates at 1.0.
+BOT_LIKENESS_TPD_ANCHOR = 20.0
+
+
 # Closest existing strategy in *our* lineup + copyability note.
 ARCHETYPE_ANALOGUE: dict[str, dict[str, str]] = {
     "speed-reactor": {
@@ -408,6 +425,113 @@ def classify(fp: dict, cfg: dict | None = None) -> tuple[str, float, list[str]]:
 
 
 # -------------------------------------------------------------- pipeline
+def compute_bot_likeness(trades: list[dict], weights: dict | None = None,
+                          now_ts: int | None = None) -> dict:
+    """0..1 bot-likeness score from existing trade history. Five
+    components, each in [0,1] before weighting:
+
+      hour_entropy         - shannon entropy of UTC hour-of-day
+                             distribution / log2(24). High = even
+                             24h activity = bot-like.
+      interval_regularity  - 1 - clip(interval_cv, 0, 1). High =
+                             regular cadence = bot-like.
+      stake_uniformity     - 1 - clip(notional_cv, 0, 1). High =
+                             identical stakes = bot-like.
+      crypto_share         - fraction of USD notional in the crypto
+                             category. Bots track BTC/ETH up/down
+                             markets 24/7.
+      trades_per_active_day- min(1, tpd / BOT_LIKENESS_TPD_ANCHOR).
+                             High volume / active day = bot-like.
+
+    Weighted sum -> bot_likeness in [0,1]. Returns the full
+    breakdown so the scout can persist the components for forensics
+    and the report can show *why* a wallet scored high or low.
+
+    Falls back to all-zero components when n_trades < 5 so brand-new
+    wallets are never flagged.
+    """
+    w = {**DEFAULT_BOT_LIKENESS_WEIGHTS, **(weights or {})}
+    if not trades or len(trades) < 5:
+        return {
+            "bot_likeness": 0.0,
+            "hour_entropy": 0.0, "interval_regularity": 0.0,
+            "stake_uniformity": 0.0, "crypto_share": 0.0,
+            "trades_per_active_day": 0.0,
+            "n_trades_used": len(trades) if trades else 0,
+        }
+
+    rows = sorted(trades, key=lambda t: int(t.get("timestamp") or 0))
+    # --- 1. hour entropy
+    hour_counts: dict[int, int] = defaultdict(int)
+    for t in rows:
+        ts = int(t.get("timestamp") or 0)
+        if ts <= 0:
+            continue
+        hour_counts[datetime.fromtimestamp(ts, tz=timezone.utc).hour] += 1
+    h_ent_norm = _shannon_entropy(hour_counts) / math.log2(24)
+    # --- 2. interval regularity
+    intervals = [int(b.get("timestamp") or 0) - int(a.get("timestamp") or 0)
+                 for a, b in zip(rows, rows[1:])]
+    intervals = [x for x in intervals if x > 0]
+    if len(intervals) >= 2:
+        mean_i = sum(intervals) / len(intervals)
+        var_i = sum((x - mean_i) ** 2 for x in intervals) / (len(intervals) - 1)
+        sd_i = math.sqrt(var_i)
+        cv_i = sd_i / mean_i if mean_i > 0 else 0.0
+        interval_regularity = max(0.0, 1.0 - min(1.0, cv_i))
+    else:
+        interval_regularity = 0.0
+    # --- 3. stake uniformity
+    notionals = [float(t.get("size") or 0.0) * float(t.get("price") or 0.0)
+                 for t in rows]
+    notionals = [n for n in notionals if n > 0]
+    if len(notionals) >= 2:
+        mean_n = sum(notionals) / len(notionals)
+        var_n = sum((n - mean_n) ** 2 for n in notionals) / (len(notionals) - 1)
+        sd_n = math.sqrt(var_n)
+        cv_n = sd_n / mean_n if mean_n > 0 else 0.0
+        stake_uniformity = max(0.0, 1.0 - min(1.0, cv_n))
+    else:
+        stake_uniformity = 0.0
+    # --- 4. crypto share (USD-weighted)
+    cat_w: dict[str, float] = defaultdict(float)
+    for t in rows:
+        cat = _category_of(t)
+        cat_w[cat] += float(t.get("size") or 0.0) * float(t.get("price") or 0.0)
+    total_w = sum(cat_w.values()) or 1.0
+    crypto_share = cat_w.get("crypto", 0.0) / total_w
+    # --- 5. trades-per-active-day
+    days = set()
+    for t in rows:
+        ts = int(t.get("timestamp") or 0)
+        if ts <= 0:
+            continue
+        days.add(datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat())
+    active_days = max(1, len(days))
+    tpd_norm = min(1.0, (len(rows) / active_days) / BOT_LIKENESS_TPD_ANCHOR)
+
+    score = (
+        w["hour_entropy"] * h_ent_norm
+        + w["interval_regularity"] * interval_regularity
+        + w["stake_uniformity"] * stake_uniformity
+        + w["crypto_share"] * crypto_share
+        + w["trades_per_active_day"] * tpd_norm
+    )
+    # Normalize by total weight so partial-weight configs still land in [0,1].
+    total_w_sum = sum(w.values()) or 1.0
+    bot_likeness = max(0.0, min(1.0, score / total_w_sum))
+
+    return {
+        "bot_likeness": bot_likeness,
+        "hour_entropy": h_ent_norm,
+        "interval_regularity": interval_regularity,
+        "stake_uniformity": stake_uniformity,
+        "crypto_share": crypto_share,
+        "trades_per_active_day": tpd_norm,
+        "n_trades_used": len(rows),
+    }
+
+
 def autopsy(wallet: str, ledger, polymarket_data=None,
             cfg: dict | None = None, refresh: bool = False) -> dict[str, Any]:
     """Pull (or reuse) the wallet's cached trade history, build the

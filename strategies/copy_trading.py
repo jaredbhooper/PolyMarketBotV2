@@ -325,6 +325,10 @@ class CopyTrading(Strategy):
         # rather than crashing the job at the runner's timeout.
         self.scout_time_budget_minutes = float(
             s.get("scout_time_budget_minutes", 15.0))
+        # bot-likeness weights. Stays as a dict, never coerced to None,
+        # so compute_bot_likeness picks up the defaults on missing keys.
+        self.bot_likeness_weights = dict(
+            (s.get("bot_likeness_weights") or {})) or None
 
     # --- per-market layer: no-op
     def relevant_markets(self, markets: list[Market]) -> list[Market]:
@@ -449,6 +453,13 @@ class CopyTrading(Strategy):
             except RuntimeError:
                 trades = ledger.get_wallet_trades(w)
             m = compute_metrics(trades)
+            # bot-likeness is informational - NOT a hard filter. Stored
+            # on every snapshot so master-report can bucket settled
+            # copy P&L by low/mid/high. See foundation.autopsy.
+            from foundation.autopsy import compute_bot_likeness
+            bl = compute_bot_likeness(trades, weights=self.bot_likeness_weights)
+            m["bot_likeness"] = bl["bot_likeness"]
+            m["bot_likeness_breakdown"] = bl
             ok, reason = passes_hard_filters(m, self.hard_filters)
             ledger.upsert_wallet(w, m)
             ledger.upsert_scout_snapshot(today, w, None, None,
