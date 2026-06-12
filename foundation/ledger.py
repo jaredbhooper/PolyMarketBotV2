@@ -428,6 +428,16 @@ CREATE INDEX IF NOT EXISTS idx_sharpline_status ON sharpline_orders(status);
 CREATE INDEX IF NOT EXISTS idx_logic_violations_pair ON logic_violations(pair_id, ts);
 CREATE INDEX IF NOT EXISTS idx_wx_verify_city_date ON wx_verification(city, resolve_date);
 
+-- v2.2 cv_state: tiny kv table for cross-cycle state the cv strategy
+-- needs (Kalshi category round-robin pointer, etc). MUST live in
+-- ledger.db (committed) so GitHub Actions runners pick up where the
+-- previous run left off; cache.db is gitignored and would lose the
+-- pointer between runs.
+CREATE TABLE IF NOT EXISTS cv_state (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+
 -- v2 CV-PROBE (quarantined research book). Probe positions paper-trade
 -- FUZZY pairs to empirically measure how often non-identical referees
 -- actually disagree. ENTIRELY separated from the main bankroll and
@@ -1455,6 +1465,26 @@ class Ledger:
                    GROUP BY category, agreement_outcome, divergence_direction
                    ORDER BY category, agreement_outcome, divergence_direction"""
             ).fetchall())
+
+    # --- cv_state kv (cross-cycle persistence) ---------------------------
+    def cv_state_get(self, key: str, default: str | None = None
+                       ) -> str | None:
+        """Read a value from the cv_state kv table. Returns `default`
+        when the key has never been set."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT value FROM cv_state WHERE key=?", (key,)).fetchone()
+            return row["value"] if row else default
+
+    def cv_state_set(self, key: str, value: str) -> None:
+        """Upsert a cv_state value. Used by the Kalshi category
+        round-robin to persist the pointer across cycle runs."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO cv_state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
 
     # --- copy-trading (strategy #4) ---------------------------------------
     def upsert_wallet(self, wallet: str, metrics: dict[str, Any]) -> None:

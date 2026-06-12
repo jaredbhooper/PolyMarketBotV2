@@ -139,7 +139,14 @@ strategies:
     execute_no: true
     min_hours_to_resolve: 1.0     # skip events resolving in less than this
     min_executable_shares: 5.0    # require at least this many fillable shares to log a full-walk gap
-    max_walks_per_cycle: 2000     # hard cap on expensive full-book walks per cycle
+    # v2.2: walks are ranked by snapshot profit_ps desc and we only walk
+    # the top N. Previous value 2000 walked everything; 200 captures the
+    # highest-leverage candidates and frees ~10 min of cycle wall-clock.
+    max_walks_per_cycle: 200
+    # v2.2: wall-clock budget on scan_arb as a backstop. Excess candidates
+    # are deferred (skipped_budget counter) instead of letting the job
+    # time out at 28 min.
+    scan_budget_minutes: 7.0
     # Multi-outcome extension (Prompt A). Writes arb_multi rows alongside
     # the existing arb_gaps. Fixed USD-notional stake per set.
     multi_mode_enabled: true
@@ -171,18 +178,23 @@ strategies:
     # to fire (or to be probe-eligible). A mismatched pair would corrupt
     # the experiment's headline statistic, so we err well above 0.5.
     min_match_confidence: 0.9
-    # v2 time budget: cycle.yml is 30 min; budget the cv scan portion
-    # explicitly so the expanded multi-category catalog doesn't overrun.
+    # v2 time budget: cycle.yml is 28 min. v2.2 fix: this deadline now
+    # bounds the Kalshi market-discovery phase too (it didn't before).
     cv_scan_budget_minutes: 8.0
-    # v2 category rotation order (advisory; the matcher classifies every
-    # bucket within the time budget regardless).
+    # v2.2 round-robin: scan ONE Kalshi category per cycle, advancing a
+    # pointer in cv_state. With */30 cron + 5 categories every category
+    # gets a fresh scan roughly every 2.5h, which is more than enough
+    # for daily-resolving markets. Set false to sweep all categories in
+    # one pass (useful for the manual `cv` CLI; still bounded by
+    # cv_scan_budget_minutes).
+    kalshi_round_robin: true
     category_rotation:
-      - weather
-      - sports
-      - crypto
-      - politics
-      - economics
-    kalshi_categories:            # Kalshi categories to scan (multi-category for v2)
+      - Climate and Weather
+      - Sports
+      - Financials
+      - Politics
+      - Economics
+    kalshi_categories:            # Full set the round-robin rotates through
       - Climate and Weather
       - Sports
       - Financials

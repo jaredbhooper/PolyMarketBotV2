@@ -102,3 +102,63 @@ def test_no_arb_when_sum_exceeds_one():
     assert det is not None
     assert det.locked_profit_per_share < 0
     assert not det.cleared_threshold
+
+
+# -------------------------------------------------------------- v2.2: scan_arb
+def _scoring_event(event_id: str, yes_asks: float) -> ArbEvent:
+    """Synthetic 2-leg event tuned so the gamma snapshot prices its YES
+    sum at ~yes_asks*2. Lower yes_asks <=> higher snapshot profit_ps,
+    so the priority sort places lower-asks events FIRST. Both legs
+    pass the walk_band pre-filter."""
+    legs = [_leg(f"{event_id}-A", yes_asks), _leg(f"{event_id}-B", yes_asks)]
+    return ArbEvent(
+        event_id=event_id, event_slug=f"slug-{event_id}",
+        event_title=f"Event {event_id}",
+        end_date_iso="2030-01-01T00:00:00Z",
+        neg_risk=True, legs=legs,
+        completeness_verified=True,
+        completeness_note="MECE ok",
+        books_fetched=True,
+    )
+
+
+def test_scan_arb_walks_top_max_walks_per_cycle_by_priority():
+    """8 walk candidates, cap=3. Highest-priority (smallest snapshot
+    sum) must be the only ones walked. skipped_cap counts the rest."""
+    cfg = {"strategies": {"bucket_arb": {
+        "safety_buffer": 0.005, "target_shares": 100.0,
+        "slippage_cents": 0.01, "min_executable_shares": 5.0,
+        "walk_band": 0.50,            # ensure every event is a walk candidate
+        "max_walks_per_cycle": 3,
+        "scan_budget_minutes": 60.0,  # disable budget for this test
+    }}}
+    s = BucketSumArb(cfg)
+    # Yes asks ascending -> snapshot profit_ps descending. Lower number
+    # means higher priority.
+    events = [_scoring_event(f"e{i}", 0.10 + 0.05 * i) for i in range(8)]
+    result = s.scan_arb(events, scanner=None, verbose=False)
+    assert result["counters"]["walked"] == 3
+    assert result["counters"]["walk_candidates"] == 8
+    assert result["counters"]["skipped_cap"] == 5
+    # The 3 winners must be the top 3 by lowest yes_asks (e0, e1, e2).
+    walked_ids = {det.event.event_id for det in result["detections"]}
+    assert walked_ids <= {"e0", "e1", "e2"}, walked_ids
+    assert walked_ids, walked_ids   # at least one fired
+
+
+def test_scan_arb_budget_defers_remaining_candidates(monkeypatch):
+    """zero-minute budget on 4 candidates -> walks none, all 4 counted
+    as skipped_budget so the diagnostic is honest about why."""
+    cfg = {"strategies": {"bucket_arb": {
+        "safety_buffer": 0.005, "target_shares": 100.0,
+        "slippage_cents": 0.01, "min_executable_shares": 5.0,
+        "walk_band": 0.50,
+        "max_walks_per_cycle": 1000,
+        "scan_budget_minutes": 0.0,
+    }}}
+    s = BucketSumArb(cfg)
+    events = [_scoring_event(f"e{i}", 0.10 + 0.05 * i) for i in range(4)]
+    result = s.scan_arb(events, scanner=None, verbose=False)
+    assert result["counters"]["walked"] == 0
+    assert result["counters"]["skipped_budget"] == 4
+    assert not result["detections"]

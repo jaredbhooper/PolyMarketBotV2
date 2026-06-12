@@ -273,6 +273,13 @@ def run_arb_cycle(strategy, scanner: Scanner, ledger: Ledger,
 
 def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
           tag: str | None = None) -> dict:
+    import time as _time
+    cycle_start = _time.time()
+    phase_timings: list[tuple[str, float]] = []
+
+    def _phase(name: str, start: float) -> None:
+        phase_timings.append((name, _time.time() - start))
+
     cfg = load_config(cfg_path)
     ledger = ledger_from_cfg(cfg)
     scanner = Scanner(cfg)
@@ -295,33 +302,41 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
     per_market_strategies: list[Strategy] = []
     for s in strategies:
         if _is_arb_strategy(s):
+            t0 = _time.time()
             with HealthSession(ledger, s.name) as h:
                 r = run_arb_cycle(s, scanner, ledger, verbose=verbose)
                 arb_results.append(r)
                 h.markets_scanned = (r.get("counters") or {}).get("scanned", 0)
                 h.fills = r.get("fired", 0)
+            _phase(s.name, t0)
         elif _is_cv_strategy(s):
+            t0 = _time.time()
             with HealthSession(ledger, s.name) as h:
                 r = run_cv_cycle(s, scanner, ledger, cfg, verbose=verbose)
                 cv_results.append(r)
                 h.markets_scanned = ((r.get("counters") or {}).get("polymarket_markets", 0)
                                        + (r.get("counters") or {}).get("kalshi_markets", 0))
                 h.fills = (r.get("counters") or {}).get("fired", 0)
+            _phase(s.name, t0)
         else:
             per_market_strategies.append(s)
     strategies = per_market_strategies
 
     if not strategies:
         # Pure arb / cross-venue cycle, no per-market work.
+        _print_phase_summary(phase_timings, cycle_start, verbose=verbose)
         return {
             "decisions": [], "scanned": 0, "filled": 0,
             "arb": arb_results, "cv": cv_results,
+            "phase_timings": phase_timings,
         }
 
     if verbose:
         print("\nScanning Polymarket (per-market) ...")
+    t_scan = _time.time()
     universe = scan_all(cfg, scanner, fetch_books=True,
                         tags=[tag] if tag else None)
+    _phase("scan_per_market", t_scan)
     if verbose:
         print(f"Scanned {len(universe)} markets (with order books).")
 
@@ -334,6 +349,7 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
     # one strategy does NOT abort the cycle for the others.
     pending: list[CycleDecision] = []
     for strat in strategies:
+        t_strat = _time.time()
         with HealthSession(ledger, strat.name) as h:
             # Some strategies (e.g. weather's adaptive layer) need a
             # cycle-scoped read handle to the ledger. Optional hook.
@@ -366,6 +382,7 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
                 decisions.append(d)
                 if d.decision == "PENDING_FILL":
                     pending.append(d)
+        _phase(strat.name, t_strat)
 
     # --- Phase 2: rank PENDING_FILL by post-fill edge desc, commit until cap.
     pending.sort(key=lambda d: (d.edge or 0.0), reverse=True)
@@ -406,6 +423,7 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
         print(f"\nCycle summary: {len(decisions)} considered, "
               f"{len(pending)} qualified, {len(fills)} filled "
               f"(cap {cap}, was open {open_at_start}).")
+    _print_phase_summary(phase_timings, cycle_start, verbose=verbose)
     return {
         "decisions": decisions,
         "scanned": len(universe),
@@ -413,7 +431,33 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
         "qualified": len(pending),
         "arb": arb_results,
         "cv": cv_results,
+        "phase_timings": phase_timings,
     }
+
+
+def _print_phase_summary(phase_timings: list[tuple[str, float]],
+                          cycle_start: float, verbose: bool = True) -> None:
+    """Print a phase->elapsed table at the end of a cycle so duration
+    regressions are visible at a glance from the Actions tab. Total
+    matches the cycle wall-clock; any difference is the cycle-bootstrap
+    overhead (config + ledger + scanner init + strategy load)."""
+    if not verbose:
+        return
+    import time as _time
+    total = _time.time() - cycle_start
+    tracked = sum(elapsed for _, elapsed in phase_timings)
+    print()
+    print(f"=== cycle phase timings ===")
+    print(f"  {'phase':<22s}  {'elapsed':>9s}  {'% of cycle':>10s}")
+    print(f"  {'-'*22}  {'-'*9}  {'-'*10}")
+    for name, elapsed in phase_timings:
+        pct = (elapsed / total * 100.0) if total > 0 else 0.0
+        print(f"  {name:<22s}  {elapsed:>7.1f}s  {pct:>9.1f}%")
+    overhead = max(0.0, total - tracked)
+    print(f"  {'(bootstrap/misc)':<22s}  {overhead:>7.1f}s  "
+          f"{(overhead/total*100.0 if total>0 else 0.0):>9.1f}%")
+    print(f"  {'-'*22}  {'-'*9}  {'-'*10}")
+    print(f"  {'TOTAL':<22s}  {total:>7.1f}s")
 
 
 def show_scanner_only(cfg_path: str = "config.yaml", limit: int = 60) -> None:

@@ -481,6 +481,33 @@ def test_close_cv_probe_no_divergence_direction_for_agreed():
         _drop(ledger, path)
 
 
+def test_cv_state_lives_in_ledger_db_not_cache_db():
+    """The Kalshi round-robin pointer + any future cross-cycle state
+    MUST live in ledger.db (committed) so it survives ephemeral runners.
+    Same reasoning as cv_probe_*: cache.db is gitignored and would lose
+    the pointer between runs, which would degrade the round-robin to
+    'always scan category[0]'."""
+    import sqlite3 as _sql
+    ledger, path = _ledger()
+    try:
+        lc = _sql.connect(ledger.ledger_path)
+        try:
+            assert lc.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='cv_state'").fetchone() is not None
+        finally:
+            lc.close()
+        cc = _sql.connect(ledger.cache_path)
+        try:
+            assert cc.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='cv_state'").fetchone() is None
+        finally:
+            cc.close()
+    finally:
+        _drop(ledger, path)
+
+
 def test_cv_probe_tables_live_in_ledger_db_not_cache_db():
     """v2.1 storage move: cv_probe_positions and cv_probe_legs must be
     created in ledger.db (committed) so the experiment record survives

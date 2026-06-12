@@ -423,6 +423,90 @@ def test_scan_cv_respects_time_budget(monkeypatch):
         pass
 
 
+# -------------------------------------------------------------- v2.2 cv round-robin
+def test_kalshi_round_robin_advances_pointer_each_cycle():
+    """With kalshi_round_robin=True, _pick_kalshi_categories must
+    advance the pointer in cv_state every call so each cycle scans the
+    NEXT configured category. After len(categories) calls the rotation
+    wraps. Persistence is the whole point -- cycle workflow runs are
+    ephemeral, so the pointer has to survive in ledger.db."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    ledger = Ledger(db_path)
+    rotation = ["Climate and Weather", "Sports", "Financials",
+                "Politics", "Economics"]
+    cfg = {"strategies": {"cross_venue_arb": {
+        "kalshi_categories": rotation,
+        "category_rotation": rotation,
+        "kalshi_round_robin": True,
+    }}}
+    strat = CrossVenueArb(cfg)
+    # Drive 7 calls (one cycle past one full wrap) and verify the order.
+    picks = [strat._pick_kalshi_categories(ledger)[0] for _ in range(7)]
+    assert picks == rotation + rotation[:2]
+    # Pointer must be persisted in cv_state.
+    assert ledger.cv_state_get("kalshi_rr_last") == rotation[1]
+    try:
+        os.unlink(db_path)
+    except OSError:
+        pass
+
+
+def test_kalshi_round_robin_off_returns_all_categories():
+    """When kalshi_round_robin=False (e.g. manual `cv` CLI), we want a
+    one-shot sweep of every category, still bounded by the budget."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    ledger = Ledger(db_path)
+    cfg = {"strategies": {"cross_venue_arb": {
+        "kalshi_categories": ["Climate and Weather", "Sports", "Crypto"],
+        "kalshi_round_robin": False,
+    }}}
+    strat = CrossVenueArb(cfg)
+    out = strat._pick_kalshi_categories(ledger)
+    assert out == ["Climate and Weather", "Sports", "Crypto"]
+    try:
+        os.unlink(db_path)
+    except OSError:
+        pass
+
+
+def test_scan_cv_budget_bounds_kalshi_fetch_phase(monkeypatch):
+    """v2.2 fix: a zero-minute budget must abort cleanly inside the
+    Kalshi fetch loop without ever invoking the per-category fetch (the
+    previous build started the timer AFTER Kalshi discovery, so a
+    multi-hour fetch could run unbounded). Synthesizes a Kalshi venue
+    that records every category-hint it was asked to fetch."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    ledger = Ledger(db_path)
+    cfg = {"strategies": {"cross_venue_arb": {
+        "kalshi_categories": ["Climate and Weather", "Sports"],
+        "kalshi_round_robin": False,
+        "cv_scan_budget_minutes": 0.0,
+    }}}
+    strat = CrossVenueArb(cfg)
+    fetched_categories: list[str | None] = []
+    class FakePoly:
+        def fetch_markets(self, category_hint=None): return []
+        def fetch_book_for(self, vm): return None
+    class FakeKal:
+        def fetch_markets(self, category_hint=None):
+            fetched_categories.append(category_hint)
+            return []
+        def fetch_book_for(self, vm): return None
+    import time as time_mod
+    base = time_mod.time()
+    monkeypatch.setattr(time_mod, "time", lambda: base + 60.0)
+    result = strat.scan_cv(FakePoly(), FakeKal(), ledger, verbose=False)
+    assert fetched_categories == [], fetched_categories
+    assert result["counters"]["kalshi_markets"] == 0
+    try:
+        os.unlink(db_path)
+    except OSError:
+        pass
+
+
 def test_kalshi_orderbook_normalization():
     """The Kalshi orderbook returns no_dollars = NO bid book ascending.
     The venue adapter should normalize to yes_asks = ascending price book

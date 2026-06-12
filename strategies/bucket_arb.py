@@ -150,7 +150,16 @@ class BucketSumArb(Strategy):
         # Minimum executable shares to bother logging a full-walk gap.
         self.min_executable_shares = float(s.get("min_executable_shares", 5.0))
         # Hard cap on how many full-book events we walk per cycle (safety).
-        self.max_walks_per_cycle = int(s.get("max_walks_per_cycle", 250))
+        # v2.2: lowered default 250 -> 200 and changed semantics: we now
+        # rank pre-filter candidates by snapshot profit_ps descending and
+        # walk only the top-N, so the bound is enforced on the most
+        # promising events instead of the first-arrived ones.
+        self.max_walks_per_cycle = int(s.get("max_walks_per_cycle", 200))
+        # v2.2: wall-clock budget on the scan_arb phase. With the cycle
+        # workflow's 28-min total, bucket_arb's slice is 7 min as a
+        # backstop in case max_walks_per_cycle is set too high or book
+        # fetches degrade. Excess events fall to skipped_budget.
+        self.scan_budget_minutes = float(s.get("scan_budget_minutes", 7.0))
         # ---------- Multi-outcome extension (Prompt A) -------------------
         # Distinct path that writes to arb_multi using a fixed-USD stake
         # notional, applies the explicit Polymarket fee schedule, and
@@ -290,18 +299,29 @@ class BucketSumArb(Strategy):
                   verbose: bool = False) -> dict[str, Any]:
         """Run the detector across the event universe.
 
-        For each event:
-          1. Verify MECE completeness (negRisk + all legs deployed).
-          2. Cheap pre-filter on Gamma bestAsk sums.
-          3. If pre-filter passes either side, fetch full books and walk.
-             Caller passes `scanner` to enable the lazy book fetch.
-          4. Emit ArbDetection per side detected.
+        Two passes (v2.2):
+          PASS 1 (cheap): for every MECE-verified event still in time
+            window, compute the gamma_prefilter and a snapshot profit
+            score. Either log a gamma_only gap (if neither side is
+            close) or queue a walk_candidate with priority =
+            max(yes_profit_ps, no_profit_ps).
+          PASS 2 (expensive): sort walk_candidates by priority desc and
+            walk the top `max_walks_per_cycle` (default 200), bounded
+            by a `scan_budget_minutes` (default 7) wall-clock deadline.
+            Anything over the cap or past the budget counts as
+            skipped_cap / skipped_budget so the diagnostic is honest
+            instead of silently truncating.
 
-        Returns a dict with `detections` (full-walk only), and counters
-        for diagnostics (scanned, complete, gamma-only sub, walked, etc).
+        This change matters because GitHub Actions cancelled the
+        previous build at the 25-minute job timeout while bucket_arb
+        was 14 minutes into 436 sequential CLOB walks. Best-first +
+        bounded means we always walk the highest-leverage candidates
+        first and exit cleanly if we run out of time.
         """
+        import time as _time
+
         out_detections: list[ArbDetection] = []
-        gamma_only_gaps: list[dict] = []   # for logging coarse distribution
+        gamma_only_gaps: list[dict] = []
 
         scanned = 0
         complete = 0
@@ -310,11 +330,15 @@ class BucketSumArb(Strategy):
         gamma_only_recorded = 0
         skipped_time = 0
         skipped_cap = 0
+        skipped_budget = 0
         prefilter_pass_yes = 0
         prefilter_pass_no = 0
-
+        # walk_candidates: list of (priority, walk_yes, walk_no, event).
+        # Priority = max(YES snapshot profit_ps, NO snapshot profit_ps).
+        walk_candidates: list[tuple[float, bool, bool, ArbEvent]] = []
         now = datetime.now(timezone.utc)
 
+        # --- PASS 1: pre-filter + score ----------------------------------
         for ev in events:
             scanned += 1
             if not ev.completeness_verified:
@@ -322,7 +346,6 @@ class BucketSumArb(Strategy):
                 continue
             complete += 1
 
-            # Skip events resolving too soon to act on.
             end = ev.end_date_iso
             if end:
                 try:
@@ -337,20 +360,24 @@ class BucketSumArb(Strategy):
                 except (ValueError, TypeError):
                     pass
 
-            walk_yes, walk_no, note = self.gamma_prefilter(ev)
+            walk_yes, walk_no, _ = self.gamma_prefilter(ev)
             if walk_yes:
                 prefilter_pass_yes += 1
             if walk_no:
                 prefilter_pass_no += 1
 
-            # If neither side is close to arb, log a gamma-only summary so
-            # we still have distribution data on the no-arb majority.
+            ys, _ = gamma_yes_sum(ev.legs)
+            ns, _ = gamma_no_sum(ev.legs)
+            yes_profit = (1.0 - ys - self.safety_buffer
+                          if ys is not None else float("-inf"))
+            no_profit = ((len(ev.legs) - 1.0) - ns - self.safety_buffer
+                         if ns is not None else float("-inf"))
+
+            # No close-to-arb side: log a gamma_only gap and move on.
             if not walk_yes and not walk_no:
-                ys, _ = gamma_yes_sum(ev.legs)
-                ns, _ = gamma_no_sum(ev.legs)
-                for side_name, snap_sum, payout in (
-                    ("YES", ys, 1.0),
-                    ("NO", ns, len(ev.legs) - 1.0),
+                for side_name, snap_sum, payout, profit_ps in (
+                    ("YES", ys, 1.0, yes_profit),
+                    ("NO", ns, len(ev.legs) - 1.0, no_profit),
                 ):
                     if snap_sum is None:
                         continue
@@ -358,10 +385,6 @@ class BucketSumArb(Strategy):
                         continue
                     if side_name == "NO" and not self.detect_no:
                         continue
-                    # Per-share profit on the snapshot, no slippage applied
-                    # because we didn't walk. Just records "this is how far
-                    # the snapshot is from arb".
-                    profit_ps = payout - snap_sum - self.safety_buffer
                     gamma_only_gaps.append({
                         "event": ev,
                         "side": side_name,
@@ -372,12 +395,23 @@ class BucketSumArb(Strategy):
                 gamma_only_recorded += 1
                 continue
 
+            # Pre-filter passed at least one side -> queue for walk.
+            priority = max(yes_profit if walk_yes else float("-inf"),
+                            no_profit if walk_no else float("-inf"))
+            walk_candidates.append((priority, walk_yes, walk_no, ev))
+
+        # --- PASS 2: walk the best-first up to the cap + budget ---------
+        walk_candidates.sort(key=lambda x: x[0], reverse=True)
+        deadline = _time.time() + self.scan_budget_minutes * 60.0
+        budget_hit = False
+        for prio, walk_yes, walk_no, ev in walk_candidates:
             if walked >= self.max_walks_per_cycle:
                 skipped_cap += 1
                 continue
-
-            # Full book walk needed. Caller must have provided a scanner so
-            # we can lazy-fetch the books now.
+            if _time.time() >= deadline:
+                budget_hit = True
+                skipped_budget += 1
+                continue
             if scanner is not None and not ev.books_fetched:
                 for leg in ev.legs:
                     if leg.yes_token_id and not leg.yes_asks:
@@ -400,10 +434,10 @@ class BucketSumArb(Strategy):
                 if det is not None:
                     out_detections.append(det)
 
-        # Collect events that were book-walked so the caller can also
-        # run the multi-arb detector (which writes to arb_multi) without
-        # re-fetching books. Walked events are exactly the ones that
-        # appear at least once in out_detections.
+        if verbose and budget_hit:
+            print(f"  bucket_arb: scan_budget_minutes={self.scan_budget_minutes:.1f} "
+                  f"reached; {skipped_budget} candidates deferred")
+
         walked_events_map: dict[str, ArbEvent] = {}
         for det in out_detections:
             walked_events_map[det.event.event_id] = det.event
@@ -420,8 +454,10 @@ class BucketSumArb(Strategy):
                 "gamma_only_recorded": gamma_only_recorded,
                 "skipped_time": skipped_time,
                 "skipped_cap": skipped_cap,
+                "skipped_budget": skipped_budget,
                 "prefilter_pass_yes": prefilter_pass_yes,
                 "prefilter_pass_no": prefilter_pass_no,
+                "walk_candidates": len(walk_candidates),
             },
         }
 

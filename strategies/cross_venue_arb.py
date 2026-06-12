@@ -202,13 +202,26 @@ class CrossVenueArb(Strategy):
         # v2: minimum match confidence for ANY action (certified or probe).
         # Tight by design - mismatched pairs corrupt the probe statistic.
         self.min_match_confidence = float(s.get("min_match_confidence", 0.9))
-        # v2: time budget for the entire cv scan (cycle.yml is 30 min;
+        # v2: time budget for the entire cv scan (cycle.yml is ~28 min;
         # cv lives alongside other strategies in cycle so budget it).
+        # v2.2: the deadline now bounds the Kalshi market-discovery phase
+        # too, not only the classify+walk phase, because Kalshi discovery
+        # over five categories was the cycle's biggest single phase and
+        # ran unbounded.
         self.cv_scan_budget_minutes = float(s.get("cv_scan_budget_minutes", 8.0))
-        # v2: category rotation. Each cycle picks ONE category by
-        # round-robin; persisted across cycles via the executor.
-        self.category_rotation = s.get("category_rotation") or [
-            "weather", "sports", "crypto", "politics", "economics"]
+        # v2.2: per-cycle Kalshi category round-robin. When true (the
+        # default), scan_cv fetches markets from ONE Kalshi category per
+        # cycle, advancing a pointer persisted in cv_state. With the
+        # */30 cron + 5 categories the rotation gives every category a
+        # fresh scan roughly every 2.5h. When false (manual `cv` CLI),
+        # the scanner sweeps ALL configured categories in one pass --
+        # still bounded by cv_scan_budget_minutes.
+        self.kalshi_round_robin = bool(s.get("kalshi_round_robin", True))
+        # Order of the round-robin pointer. Defaults to the configured
+        # kalshi_categories order so operators can re-order it without
+        # editing this file.
+        self.category_rotation = s.get("category_rotation") or list(
+            self.kalshi_categories)
 
     # --- strategy ABC no-ops ----------------------------------------------
     def relevant_markets(self, markets: list[Market]) -> list[Market]:
@@ -218,35 +231,86 @@ class CrossVenueArb(Strategy):
         return None
 
     # --- public scan ------------------------------------------------------
+    def _pick_kalshi_categories(self, ledger) -> list[str]:
+        """Return the Kalshi categories to scan THIS cycle.
+
+        When `kalshi_round_robin` is on, advance a pointer in cv_state
+        and return just the next category in the rotation. When off
+        (manual sweep), return every configured category. Always falls
+        back to `kalshi_categories[:1]` if the rotation list is empty
+        for some reason."""
+        rotation = self.category_rotation or self.kalshi_categories
+        if not rotation:
+            return []
+        if not self.kalshi_round_robin:
+            return list(self.kalshi_categories)
+        try:
+            last = ledger.cv_state_get("kalshi_rr_last")
+            last_idx = rotation.index(last) if last in rotation else -1
+        except Exception:
+            last_idx = -1
+        next_idx = (last_idx + 1) % len(rotation)
+        picked = rotation[next_idx]
+        try:
+            ledger.cv_state_set("kalshi_rr_last", picked)
+        except Exception:
+            pass
+        return [picked]
+
     def scan_cv(self, poly_venue: PolymarketVenue, kalshi_venue: KalshiVenue,
                   ledger, verbose: bool = True) -> dict[str, Any]:
         """Run the full cross-venue pass:
-          1. Fetch markets from both venues.
-          2. Bucket by (city, date, kind) and build candidate pairs.
-          3. Classify each pair via the rules-equivalence engine; persist
+          1. Start the wall-clock budget timer BEFORE either venue fetch
+             (v2.2 fix; the budget previously didn't cover discovery).
+          2. Fetch Polymarket markets; abort cleanly if already past the
+             deadline.
+          3. Fetch the Kalshi category for this cycle (round-robin
+             rotates through configured categories). The loop checks
+             the deadline between categories so partial coverage beats
+             a 25-minute cancel.
+          4. Bucket by (city, date, kind) and build candidate pairs.
+          5. Classify each pair via the rules-equivalence engine; persist
              in cv_pairs.
-          4. For each CERTIFIED / FUZZY pair, book-walk both directions
+          6. For each CERTIFIED / FUZZY pair, book-walk both directions
              (POLY_YES + KAL_NO; POLY_NO + KAL_YES) and log a cv_gaps row.
-          5. For each CERTIFIED gap that clears min_arb_profit (and
-             execute_fuzzy=True overrides), open a cv_positions row.
+          7. For each CERTIFIED gap that clears min_arb_profit, open a
+             cv_positions row.
 
         Returns a dict with counters + the detections list for the caller.
         """
+        import time as _time
+        deadline = _time.time() + self.cv_scan_budget_minutes * 60.0
+        budget_hit = False
+
+        def _budget_left() -> bool:
+            return _time.time() < deadline
+
         if verbose:
             print(f"\n=== {self.name} ===")
             print("Fetching Polymarket markets ...")
-        poly_markets = poly_venue.fetch_markets()
+        poly_markets = poly_venue.fetch_markets() if _budget_left() else []
         if verbose:
             print(f"  polymarket: {len(poly_markets)} markets")
-            print(f"Fetching Kalshi markets ({', '.join(self.kalshi_categories)}) ...")
+        if not _budget_left():
+            budget_hit = True
+            if verbose:
+                print("  cv scan: time budget reached before Kalshi fetch")
+
+        kalshi_cats = self._pick_kalshi_categories(ledger)
+        if verbose:
+            print(f"Fetching Kalshi markets ({', '.join(kalshi_cats)}) ...")
         kal_markets: list[VenueMarket] = []
-        for cat in self.kalshi_categories:
+        for cat in kalshi_cats:
+            if not _budget_left():
+                budget_hit = True
+                if verbose:
+                    print(f"  cv scan: time budget reached during Kalshi "
+                          f"fetch (next would have been {cat!r})")
+                break
             kal_markets.extend(kalshi_venue.fetch_markets(category_hint=cat))
         if verbose:
             print(f"  kalshi:     {len(kal_markets)} markets")
 
-        import time as _time
-        deadline = _time.time() + self.cv_scan_budget_minutes * 60.0
         # Bucket both sides (weather: city/date/kind path).
         poly_buckets = bucket_markets_by_key(poly_markets)
         kal_buckets = bucket_markets_by_key(kal_markets)

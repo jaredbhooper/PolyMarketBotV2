@@ -29,7 +29,13 @@ concurrency:
 jobs:
   cycle:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 28 minutes: tight enough to leave 2 min of headroom before the
+    # next 30-minute cron, loose enough that the v2.2 bucket_arb
+    # (7-min budget) + cv (8-min budget) + tail strategies fit.
+    # Bumping above 30 would create a permanent queue backup because
+    # the next scheduled run can't start until this one releases the
+    # concurrency group.
+    timeout-minutes: 28
     steps:
       - uses: actions/checkout@v4
         with:
