@@ -68,6 +68,7 @@ jobs:
           python main.py sharpline-post || true
           python main.py grade
           python main.py master-report
+          python main.py autopsy-top -n 20 || true
 
       - name: Prune cache + VACUUM both DBs
         # Snapshots and *_gaps tables in cache.db accumulate ~MB/cycle.
