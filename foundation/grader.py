@@ -481,10 +481,11 @@ def regrade_disputed_on_wu(cfg: dict, ledger: Ledger, today,
     Idempotent: a settlement that's already YES/NO isn't touched.
     Returns a dict with per-position settlement detail for the report.
     """
-    import sqlite3 as _sql
     settled_rows: list[dict] = []
-    with _sql.connect(ledger.db_path) as c:
-        c.row_factory = _sql.Row
+    # Read every DISPUTED + WU-present row through the ledger's own
+    # connection so we don't leak a stale read lock from a parallel
+    # sqlite3.connect handle that could defer the UPDATE commits below.
+    with ledger._conn() as c:
         disputed = list(c.execute(
             """SELECT s.id AS settlement_id, s.market_id, s.actual_value,
                       s.om_value, s.wu_value, s.wu_source, s.source_value,
@@ -519,7 +520,9 @@ def regrade_disputed_on_wu(cfg: dict, ledger: Ledger, today,
                 if "/daily/" in url else url
         new_source = f"wunderground {station}".strip()
 
-        # Apply the settlement update and close the linked trades.
+        # Apply the settlement update and close the linked trades. Use
+        # an explicit commit at the end of the with-block to make sure
+        # the UPDATEs land even if any later step in this row raises.
         with ledger._conn() as c:
             c.execute(
                 """UPDATE settlements
@@ -536,6 +539,7 @@ def regrade_disputed_on_wu(cfg: dict, ledger: Ledger, today,
                      FROM paper_trades
                     WHERE market_id=? AND status='OPEN'""",
                 (int(s["market_id"]),)).fetchall())
+            c.commit()
 
         for tr in open_trades:
             pnl = _settle_trade_pnl(tr["side"], float(tr["price_filled"]),
