@@ -178,6 +178,12 @@ strategies:
     discovery_pages: 5             # global /trades pages to aggregate for candidates
     discovery_top_n: 200
     max_trade_pages_per_wallet: 20
+    # Hard wall-clock budget for the scout loop. Cloud daily.yml has a
+    # 50-min job timeout; without this guard a cold cache (every wallet
+    # history fetched from scratch) blows the timeout. Wallets we don't
+    # reach this run are deferred to the next run - per-wallet cursors
+    # mean resume is incremental.
+    scout_time_budget_minutes: 15
     backtest_lookback_days: 90
     backtest_penalty_cents: 0.02   # historical fill penalty (no historical books)
     seed_wallets: []               # optional list of 0x... wallets to always include

@@ -242,6 +242,120 @@ def test_follower_respects_per_leader_cap():
 
 
 # ---------------------------------------------------------- grader math
+def test_scout_exits_cleanly_at_time_budget(monkeypatch):
+    """Scout has a 5-wallet candidate pool. We freeze the wall clock so
+    the budget expires after exactly 2 wallets have been processed.
+    Remaining 3 must be logged as deferred; the partial roster must
+    still be returned cleanly."""
+    ledger, path = _temp_ledger()
+    cfg = {"strategies": {"copy_trading": {
+        "discovery_pages": 0,
+        "discovery_top_n": 0,
+        "max_trade_pages_per_wallet": 1,
+        "scout_time_budget_minutes": 1.0,
+        "seed_wallets": ["0xseed1", "0xseed2", "0xseed3", "0xseed4", "0xseed5"],
+        "hard_filters": {
+            "min_track_record_days": 1,
+            "min_resolved_trades": 1,
+            "max_avg_entry_price": 0.99,
+            "max_days_since_last_trade": 365,
+            "max_top_single_trade_share": 0.99,
+        },
+        "hysteresis": {"roster_size": 5, "exit_below_rank": 25,
+                         "exit_below_consecutive": 3,
+                         "enter_above_rank": 10,
+                         "enter_above_consecutive": 1},
+    }}}
+    strat = CopyTrading(cfg)
+
+    # Each seed wallet has one BUY + one SELL so it passes filters.
+    by_user = {}
+    for w in cfg["strategies"]["copy_trading"]["seed_wallets"]:
+        by_user[w] = [
+            _trade(NOW - 200 * 86400, "BUY", "a1", 0.5, 100, tx=f"{w}buy"),
+            _trade(NOW - 100 * 86400, "SELL", "a1", 0.6, 100, tx=f"{w}sell"),
+        ]
+    data = FakeData(by_user)
+
+    # Frozen clock: tick 40 seconds per call so 2 wallets * 40s = 80s
+    # exceeds the 60s budget on the 3rd iteration's check.
+    ticks = [0.0]
+    def fake_clock():
+        ticks[0] += 40.0
+        return ticks[0]
+
+    res = strat.scout(data, ledger, verbose=False, now_fn=fake_clock)
+    # Discovery is empty (discovery_pages=0), so candidates are only the
+    # 5 seed wallets, scanned in seed_index order.
+    assert res["candidates"] == 5
+    # 60s budget; clock advances 40s per call so we process 1 wallet
+    # before the budget gate trips on iteration 2.
+    assert res["processed"] >= 1
+    assert res["deferred"] == res["candidates"] - res["processed"]
+    assert res["deferred"] >= 1, "must defer at least one wallet"
+    # Roster should reflect the processed wallets only.
+    assert res["roster_size"] <= res["processed"]
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def test_scout_partial_roster_does_not_evict_deferred_active_wallets():
+    """An already-ACTIVE wallet that wasn't reached this run must keep
+    its status. Eviction tick only fires for wallets we actually
+    examined."""
+    ledger, path = _temp_ledger()
+    cfg = {"strategies": {"copy_trading": {
+        "discovery_pages": 0,
+        "seed_wallets": ["0xseen", "0xdeferred"],
+        "scout_time_budget_minutes": 1.0,
+        "hard_filters": {
+            "min_track_record_days": 1, "min_resolved_trades": 1,
+            "max_avg_entry_price": 0.99, "max_days_since_last_trade": 365,
+            "max_top_single_trade_share": 0.99,
+        },
+        "hysteresis": {"roster_size": 5, "exit_below_rank": 1,
+                         "exit_below_consecutive": 1,
+                         "enter_above_rank": 10,
+                         "enter_above_consecutive": 1},
+    }}}
+    strat = CopyTrading(cfg)
+    # Pre-seed roster: 0xdeferred is ACTIVE.
+    ledger.upsert_roster("0xdeferred", entered_at="2026-06-01T00:00:00Z",
+                          exited_at=None, score=0.9, rank=1,
+                          status="ACTIVE", hysteresis={"below_25_consec": 0})
+    # Each seed wallet has data so they'd pass filters if processed.
+    by_user = {
+        "0xseen": [
+            _trade(NOW - 200 * 86400, "BUY", "a1", 0.5, 100, tx="0xseenbuy"),
+            _trade(NOW - 100 * 86400, "SELL", "a1", 0.6, 100, tx="0xseensell"),
+        ],
+        "0xdeferred": [
+            _trade(NOW - 200 * 86400, "BUY", "a2", 0.5, 100, tx="0xdefbuy"),
+            _trade(NOW - 100 * 86400, "SELL", "a2", 0.6, 100, tx="0xdefsell"),
+        ],
+    }
+    data = FakeData(by_user)
+    # Clock: first wallet processes fine, budget exhausts before second.
+    ticks = [0.0]
+    def fake_clock():
+        ticks[0] += 40.0
+        return ticks[0]
+    res = strat.scout(data, ledger, verbose=False, now_fn=fake_clock)
+    assert res["processed"] == 1
+    assert res["deferred"] == 1
+    # 0xdeferred must still be ACTIVE - we did NOT tick its eviction
+    # counter just because we didn't examine it this run.
+    row = next(r for r in ledger.list_roster() if r["wallet"] == "0xdeferred")
+    assert row["status"] == "ACTIVE", \
+        f"deferred ACTIVE wallet was wrongly evicted ({row['status']})"
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def test_grader_settles_with_latency_tax():
     """Our fill at 0.46 (leader 0.45). Market resolves YES. shares=5/0.46.
        our_pnl = shares * (1 - 0.46); leader_pnl = (5/0.45) * (1 - 0.45)."""

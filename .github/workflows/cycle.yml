@@ -45,6 +45,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # cache.db is gitignored + rebuildable. Persist it across runs via
+      # the actions cache so we don't restart cold every cycle (the
+      # scout / cv classifier / wallet history fetches would blow the
+      # job timeout otherwise). Eviction by GitHub's LRU is harmless -
+      # the next run rebuilds and re-saves.
+      - name: Restore cache.db
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: cache.db
+          key: polymarketbot-cache-${{ github.run_id }}
+          restore-keys: |
+            polymarketbot-cache-
+
       - name: Run cycle
         env:
           PYTHONUNBUFFERED: "1"
@@ -86,3 +100,12 @@ jobs:
           git commit -m "cycle $(date -u +%Y-%m-%dT%H:%MZ)"
           git pull --rebase origin main || true
           git push origin HEAD:main
+
+      # Always save the cache, even if a step above failed - the partial
+      # cache state still helps the next run avoid a cold restart.
+      - name: Save cache.db
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cache.db
+          key: polymarketbot-cache-${{ github.run_id }}

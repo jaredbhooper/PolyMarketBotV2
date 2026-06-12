@@ -38,6 +38,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Persist cache.db across runs - see cycle.yml for the rationale.
+      - name: Restore cache.db
+        uses: actions/cache/restore@v4
+        with:
+          path: cache.db
+          key: polymarketbot-cache-${{ github.run_id }}
+          restore-keys: |
+            polymarketbot-cache-
+
       - name: Fast strategies (copy follower + sharpline fill cycle)
         env:
           PYTHONUNBUFFERED: "1"
@@ -81,3 +90,10 @@ jobs:
           git commit -m "fast $(date -u +%Y-%m-%dT%H:%MZ)"
           git pull --rebase origin main || true
           git push origin HEAD:main
+
+      - name: Save cache.db
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cache.db
+          key: polymarketbot-cache-${{ github.run_id }}

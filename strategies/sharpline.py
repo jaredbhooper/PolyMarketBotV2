@@ -218,7 +218,17 @@ class Sharpline(Strategy):
 
         # For each MATCHED pair, compute fair prob (vig-removed two-way
         # market) and decide whether to POST a paper limit order.
+        # Cap enforcement: never exceed `max_resting_orders` total RESTING
+        # orders across all leagues. Daily.yml runs sharpline-post once
+        # per day, so this prevents unbounded accumulation on a long
+        # sport season.
+        try:
+            existing_resting = len(ledger.list_sharpline_orders("RESTING"))
+        except Exception:
+            existing_resting = 0
+        slots_free = max(0, self.params.max_resting_orders - existing_resting)
         posted = 0
+        skipped_cap = 0
         for m in matched:
             raw = bm_by_id.get(m["bookmaker_event_id"])
             if raw is not None:
@@ -237,6 +247,9 @@ class Sharpline(Strategy):
             edge = (fair - yes_ask) / max(yes_ask, 1e-9)
             if edge < self.params.edge_min:
                 continue
+            if posted >= slots_free:
+                skipped_cap += 1
+                continue
             ledger.record_sharpline_order({
                 "match_id": 0,        # set later when joined to match row
                 "poly_market_id": poly_market.market_id,
@@ -252,10 +265,12 @@ class Sharpline(Strategy):
             posted += 1
         if verbose:
             print(f"  sharpline: matched={len(matched)} ambig={len(ambiguous)} "
-                  f"unmatched={len(unmatched)} posted={posted}")
+                  f"unmatched={len(unmatched)} posted={posted} "
+                  f"skipped_cap={skipped_cap}")
         return {
             "bookmaker_events": len(bm_events),
             "matched": len(matched), "ambiguous": len(ambiguous),
+            "skipped_cap": skipped_cap,
             "unmatched": len(unmatched), "posted": posted,
             "budget": budget, "observe_mode": False,
         }

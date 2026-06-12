@@ -595,9 +595,11 @@ def _run_scout() -> int:
     for s in strategies:
         if _is_copy_strategy(s):
             res = s.scout(data, ledger, verbose=True)
-            print("scout:", res["candidates"], "candidates ->",
-                  res["survivors"], "filtered ->",
-                  res["roster_size"], "active roster")
+            print(f"scout: {res['candidates']} candidates -> "
+                  f"processed {res.get('processed', res.get('survivors',0)+res.get('excluded',0))}, "
+                  f"survivors {res['survivors']}, "
+                  f"deferred {res.get('deferred', 0)}, "
+                  f"active roster {res['roster_size']}")
             for r in res["roster"][:10]:
                 print(f"  ACTIVE rank={r['rank']} score={r['score']} {r['wallet']}")
             return 0

@@ -125,13 +125,26 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
     strategies = _load_strategies(cfg)
     today = datetime.now(timezone.utc).date()
 
+    # Hard cap on how many resolutions any single grade run processes.
+    # Each settlement does ~1 HTTP call (Wunderground / Open-Meteo /
+    # Gamma) so the per-call latency drives runtime. With a per-run
+    # cap, the grader is bounded; the next daily run picks up where
+    # this one stopped.
+    grade_cap = int((cfg.get("grader") or {}).get("max_settlements_per_run", 500))
+
     settled = 0
     skipped = 0
     open_rows = ledger.open_positions()
     if verbose:
-        print(f"Grader: {len(open_rows)} open positions to evaluate.")
+        print(f"Grader: {len(open_rows)} open positions to evaluate "
+              f"(cap {grade_cap} per run).")
 
     for trade in open_rows:
+        if settled >= grade_cap:
+            if verbose:
+                print(f"  grade cap {grade_cap} reached; deferring remaining "
+                      f"{len(open_rows) - settled - skipped} positions")
+            break
         market_row = ledger.get_market(int(trade["market_id"]))
         if not market_row:
             continue

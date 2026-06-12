@@ -317,6 +317,14 @@ class CopyTrading(Strategy):
         self.backtest_penalty_cents = float(s.get("backtest_penalty_cents", 0.02))
         # Wallet trade pull cap
         self.max_trade_pages_per_wallet = int(s.get("max_trade_pages_per_wallet", 20))
+        # Hard time budget for the scout loop. Cloud daily.yml has a
+        # 50-min job timeout; the scout's wallet-history fetches are the
+        # dominant cost on a cold cache (200 wallets * ~4s = 13 min
+        # minimum, plus DB writes). We bound this at 15 min by default
+        # so even a cold cache exits cleanly with a partial roster
+        # rather than crashing the job at the runner's timeout.
+        self.scout_time_budget_minutes = float(
+            s.get("scout_time_budget_minutes", 15.0))
 
     # --- per-market layer: no-op
     def relevant_markets(self, markets: list[Market]) -> list[Market]:
@@ -373,17 +381,69 @@ class CopyTrading(Strategy):
             ledger.set_wallet_cursor(wallet, max(int(r.get("timestamp") or 0) for r in new_rows))
         return ledger.get_wallet_trades(wallet)
 
-    def scout(self, data: PolymarketData, ledger, verbose: bool = False
-              ) -> dict[str, Any]:
+    def _wallet_priority_key(self, wallet: str, ledger,
+                              seed_index: dict[str, int]) -> tuple:
+        """Lower tuple sorts first. Priority order:
+          1. Seed wallets (config-supplied) - operator wants these.
+          2. Wallets with cached metrics already - cheap refresh.
+          3. Everything else - cold candidates.
+        Within each tier, last-scouted-ascending so the oldest data
+        is refreshed first.
+        """
+        if wallet in seed_index:
+            return (0, seed_index[wallet])
+        try:
+            row = ledger.get_bankroll_row.__self__.get_wallet_trades  # type: ignore
+            # We don't have a get_wallet helper; cheap check via cursor.
+            has_cursor = ledger.get_wallet_cursor(wallet) is not None
+        except Exception:
+            has_cursor = False
+        return (1 if has_cursor else 2, wallet)
+
+    def scout(self, data: PolymarketData, ledger, verbose: bool = False,
+              now_fn=None) -> dict[str, Any]:
         """Daily scout: discover candidates, pull history, compute
-        metrics, filter, score, roster update."""
+        metrics, filter, score, roster update.
+
+        Exits cleanly when the wall-clock budget
+        (`scout_time_budget_minutes`) is exhausted. Wallets that
+        weren't processed this run are logged as `deferred` and will
+        be picked up by the next run - per-wallet progress is
+        persisted via `wallet_cursors`, so resumption is incremental.
+
+        now_fn is a clock-injection seam for tests; defaults to
+        `time.time`."""
+        clock = now_fn or time.time
+        deadline = clock() + self.scout_time_budget_minutes * 60.0
         today = datetime.now(timezone.utc).date().isoformat()
         candidates = self.discover_candidates(data)
+        # Priority order: seeds first, then warm-cache wallets, then cold.
+        seed_index = {w.lower(): i for i, w in enumerate(self.seed_wallets)}
+        candidates_sorted = sorted(
+            candidates,
+            key=lambda w: self._wallet_priority_key(w, ledger, seed_index),
+        )
         if verbose:
-            print(f"  scout: {len(candidates)} candidate wallets")
+            print(f"  scout: {len(candidates_sorted)} candidate wallets "
+                  f"(budget {self.scout_time_budget_minutes:.0f} min)")
         survivors: list[tuple[str, float, dict]] = []
+        processed_wallets: set[str] = set()
         excluded = 0
-        for w in candidates:
+        processed = 0
+        deferred = 0
+        for w in candidates_sorted:
+            # Budget gate: check BEFORE doing the expensive
+            # pull_wallet_history call so a single in-flight wallet can't
+            # blow the budget by an unbounded amount. The work already
+            # written to the ledger is fully consistent at this point
+            # (each wallet's cursor + trades + scout_snapshot commits as
+            # one unit).
+            if clock() >= deadline:
+                deferred = len(candidates_sorted) - processed
+                if verbose:
+                    print(f"  scout: time budget reached after {processed} "
+                          f"wallets; deferring {deferred} to next run")
+                break
             try:
                 trades = self.pull_wallet_history(data, w, ledger)
             except RuntimeError:
@@ -393,6 +453,8 @@ class CopyTrading(Strategy):
             ledger.upsert_wallet(w, m)
             ledger.upsert_scout_snapshot(today, w, None, None,
                                          passed=ok, reason=reason, metrics=m)
+            processed += 1
+            processed_wallets.add(w)
             if not ok:
                 excluded += 1
                 continue
@@ -404,29 +466,50 @@ class CopyTrading(Strategy):
             ledger.upsert_scout_snapshot(today, w, rank, sc,
                                          passed=True, reason=None, metrics=m)
 
-        # Roster update with hysteresis.
-        new_roster = self._update_roster(ledger, survivors)
+        # Roster update with hysteresis. Pass the set of wallets we
+        # actually got to this run so _update_roster knows which
+        # already-active leaders to LEAVE ALONE (not seen != ranked
+        # low). Both survivors AND filter-excluded wallets count as
+        # "seen this run" - they were processed; we just didn't promote
+        # the excluded ones. Deferred wallets are NOT in this set.
+        processed_set = set(processed_wallets)
+        new_roster = self._update_roster(
+            ledger, survivors, processed_wallets=processed_set)
         if verbose:
-            print(f"  filters passed: {len(survivors)}   excluded: {excluded}")
-            print(f"  roster size: {len(new_roster)}")
+            print(f"  scout: processed={processed} survivors={len(survivors)} "
+                  f"excluded={excluded} deferred={deferred} "
+                  f"roster_size={len(new_roster)}")
         return {
             "candidates": len(candidates),
+            "processed": processed,
+            "deferred": deferred,
             "survivors": len(survivors),
             "excluded": excluded,
             "roster_size": len(new_roster),
             "roster": new_roster,
         }
 
-    def _update_roster(self, ledger, ranked: list[tuple[str, float, dict]]
+    def _update_roster(self, ledger, ranked: list[tuple[str, float, dict]],
+                         processed_wallets: set[str] | None = None
                          ) -> list[dict]:
+        """Apply hysteresis to evolve the roster.
+
+        processed_wallets: the set of wallets we actually scouted this run.
+        When the scout exits at its time budget, wallets we didn't reach
+        are NOT penalized via the below-rank counter - their hysteresis
+        state is preserved unchanged. Only wallets we examined AND ranked
+        below `exit_below_rank` tick the eviction counter.
+        """
         hy = self.hysteresis
         roster_size = int(hy["roster_size"])
         rank_by_wallet = {w: r for r, (w, _, _) in enumerate(ranked, start=1)}
-        all_wallets = set(rank_by_wallet)
         current = {row["wallet"]: row for row in ledger.list_roster()}
-        # Update hysteresis counters for everyone in current roster.
         for w, row in current.items():
             state = json.loads(row["hysteresis_state_json"] or "{}")
+            if processed_wallets is not None and w not in processed_wallets:
+                # Deferred this run - DO NOT tick the eviction counter.
+                # Leave the wallet's state and status exactly as they were.
+                continue
             rank = rank_by_wallet.get(w, 10**9)
             below = state.get("below_25_consec", 0)
             below = below + 1 if rank > int(hy["exit_below_rank"]) else 0

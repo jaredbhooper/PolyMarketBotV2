@@ -23,7 +23,10 @@ concurrency:
 jobs:
   daily:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 50 min headroom for cold-cache days. The scout has its own internal
+    # budget (scout_time_budget_minutes, default 15) so even on a fresh
+    # cache it exits cleanly with a partial roster rather than hanging.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,6 +41,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # Persist cache.db across runs. Without this, daily.yml re-fetches
+      # every candidate wallet's full /trades history from scratch on
+      # every run - that blew the 30-min job timeout last night.
+      - name: Restore cache.db
+        uses: actions/cache/restore@v4
+        with:
+          path: cache.db
+          key: polymarketbot-cache-${{ github.run_id }}
+          restore-keys: |
+            polymarketbot-cache-
 
       - name: Scout + sharpline POST + grade + master report
         env:
@@ -85,3 +99,10 @@ jobs:
           git commit -m "daily $(date -u +%Y-%m-%d)"
           git pull --rebase origin main || true
           git push origin HEAD:main
+
+      - name: Save cache.db
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cache.db
+          key: polymarketbot-cache-${{ github.run_id }}
