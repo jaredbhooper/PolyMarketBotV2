@@ -505,11 +505,30 @@ def print_weather_v2_shadow(cfg: dict, ledger: Ledger) -> None:
     print(f"  promotion gate: enabled={bool(v2cfg.get('promotion_enabled', False))}  "
           f"min_n={int(v2cfg.get('promotion_min_n', 75))}")
 
+    # Open + total counters so the operator can see the shadow IS
+    # scanning even before any market resolves.
+    import sqlite3 as _sql
+    with _sql.connect(ledger.ledger_path) as c:
+        c.row_factory = _sql.Row
+        agg = c.execute(
+            """SELECT COUNT(*) AS n_total,
+                      SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) AS n_open,
+                      SUM(CASE WHEN champ_side IS NOT NULL
+                                AND champ_side != 'NONE' THEN 1 ELSE 0 END) AS champ_trades,
+                      SUM(CASE WHEN chal_side IS NOT NULL
+                                AND chal_side != 'NONE' THEN 1 ELSE 0 END) AS chal_trades
+                 FROM shadow_trades""").fetchone()
+    print(f"  shadow rows: {int(agg['n_total'] or 0)} total  "
+          f"({int(agg['n_open'] or 0)} OPEN, awaiting resolution); "
+          f"champion would-trade: {int(agg['champ_trades'] or 0)}, "
+          f"challenger would-trade: {int(agg['chal_trades'] or 0)}")
+
     overall = ledger.shadow_overall_stats()
     n_overall = int(overall["n"]) if overall and overall["n"] is not None else 0
     if n_overall == 0:
         print()
-        print("  (no settled shadow trades yet)")
+        print("  (no settled shadow trades yet -- table populates once today's "
+              "markets resolve and grade fires)")
         return
 
     rows = ledger.shadow_stats_by_city()

@@ -306,6 +306,12 @@ class CrossVenueArb(Strategy):
         kalshi_cats = self._pick_kalshi_categories(ledger)
         if verbose:
             print(f"Fetching Kalshi markets ({', '.join(kalshi_cats)}) ...")
+        # Build a Deadline reflecting the EARLIER of master + local cv
+        # budget so the Kalshi venue can break out of its own per-series
+        # / per-event loops cleanly. v2.3 fix for cycle 27443485735
+        # where a single Sports category fetch ran 22 min uninterrupted.
+        from foundation.deadline import Deadline as _Deadline
+        venue_deadline = _Deadline(deadline_ts)
         kal_markets: list[VenueMarket] = []
         for cat in kalshi_cats:
             if not _budget_left():
@@ -314,7 +320,16 @@ class CrossVenueArb(Strategy):
                     print(f"  cv scan: time budget reached during Kalshi "
                           f"fetch (next would have been {cat!r})")
                 break
-            kal_markets.extend(kalshi_venue.fetch_markets(category_hint=cat))
+            try:
+                kal_markets.extend(kalshi_venue.fetch_markets(
+                    category_hint=cat, deadline=venue_deadline,
+                    verbose=verbose))
+            except TypeError:
+                # Older venue adapters (and the test fakes) don't accept
+                # `deadline`. Fall back to the unbounded path -- the
+                # outer per-category check still bounds us.
+                kal_markets.extend(kalshi_venue.fetch_markets(
+                    category_hint=cat))
         if verbose:
             print(f"  kalshi:     {len(kal_markets)} markets")
 

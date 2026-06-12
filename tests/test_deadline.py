@@ -152,6 +152,42 @@ def test_scan_all_stops_between_tags_when_deadline_expired(capsys):
     assert "skipping remaining tags" in captured
 
 
+def test_kalshi_fetch_markets_respects_deadline(monkeypatch):
+    """v2.3 fix: KalshiVenue.fetch_markets must check the deadline
+    between series AND between events. A single category with N series
+    was previously able to hold the lock for 20+ minutes, killing
+    cycle 27443485735 on Sports discovery alone."""
+    from foundation.venues.kalshi import KalshiVenue
+    v = KalshiVenue()
+    # Stub the three HTTP helpers so no real network call fires.
+    fake_series = [{"ticker": f"S{i}", "frequency": "daily",
+                     "settlement_sources": [], "fee_multiplier": 1.0,
+                     "fee_type": "quadratic"} for i in range(5)]
+    fake_events = [{"event_ticker": f"E{i}", "title": "ev"}
+                   for i in range(3)]
+    fake_markets = [{"ticker": f"M{i}", "title": "m",
+                      "status": "active",
+                      "yes_sub_title": "X", "no_sub_title": "Y",
+                      "rules_primary": "", "rules_secondary": "",
+                      "close_time": "2026-06-13T00:00:00Z"} for i in range(2)]
+    monkeypatch.setattr(v, "load_series_index",
+                          lambda category: fake_series)
+    monkeypatch.setattr(v, "fetch_events_for_series",
+                          lambda ticker: fake_events)
+    monkeypatch.setattr(v, "fetch_markets_for_event",
+                          lambda et: fake_markets)
+    # Already-expired deadline: should return zero markets without
+    # iterating any series.
+    out_zero = v.fetch_markets(category_hint="Sports",
+                                  deadline=Deadline.in_minutes(0.0))
+    assert out_zero == []
+    # Open deadline: should iterate everything (5 series * 3 events *
+    # 2 markets = 30 markets).
+    out_full = v.fetch_markets(category_hint="Sports",
+                                  deadline=Deadline.none())
+    assert len(out_full) == 30
+
+
 def test_scan_all_runs_when_no_deadline():
     """deadline=None must NOT bound scan_all (manual CLI usage)."""
     from main import scan_all

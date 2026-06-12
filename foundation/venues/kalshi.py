@@ -167,18 +167,35 @@ class KalshiVenue(Venue):
     # ------------------------------------------------------------ public
     def fetch_markets(self, category_hint: str | None = None,
                        verbose: bool = False,
-                       fetch_books: bool = False) -> list[VenueMarket]:
+                       fetch_books: bool = False,
+                       deadline=None) -> list[VenueMarket]:
         """Pull every open market in the target categories. By default
         skips per-ticker orderbook fetch - the matcher only needs
         title/leg/close/source to bucket candidates. Books are fetched
-        lazily by `fetch_book_for` after classification."""
+        lazily by `fetch_book_for` after classification.
+
+        v2.3: deadline can be a foundation.deadline.Deadline. The
+        venue checks it BETWEEN every series and every event so a
+        single huge Kalshi category (Sports has hundreds of series x
+        thousands of events) returns whatever it managed to fetch
+        instead of holding the lock for 20+ minutes. Cycle 27443485735
+        cancelled on Sports discovery alone (22 min uninterrupted)."""
+        from foundation.deadline import Deadline as _Deadline
+        dl = _Deadline.coerce(deadline)
         out: list[VenueMarket] = []
         target_categories = [category_hint] if category_hint else self.categories
+        truncated_series = 0
+        truncated_events = 0
         for cat in target_categories:
+            if dl.expired():
+                break
             series = self.load_series_index(cat)
             if verbose:
                 print(f"    kalshi: {cat}: {len(series)} series")
             for ser in series:
+                if dl.expired():
+                    truncated_series += 1
+                    continue
                 if ser.get("frequency") != "daily" and cat == "Climate and Weather":
                     # First-cut focus: daily weather only on Kalshi, since
                     # that's where the cross-venue overlap actually lives.
@@ -191,6 +208,9 @@ class KalshiVenue(Venue):
                 fee_type = ser.get("fee_type") or "quadratic"
                 events = self.fetch_events_for_series(ser_ticker)
                 for ev in events:
+                    if dl.expired():
+                        truncated_events += 1
+                        continue
                     et = ev["event_ticker"]
                     markets = self.fetch_markets_for_event(et)
                     for m in markets:
@@ -241,6 +261,10 @@ class KalshiVenue(Venue):
                                 "expiration_time": m.get("expiration_time"),
                             },
                         ))
+        if verbose and (truncated_series or truncated_events):
+            print(f"    kalshi: deadline truncated "
+                  f"{truncated_series} series, {truncated_events} events; "
+                  f"returning {len(out)} markets")
         return out
 
     def fetch_book_for(self, vm: VenueMarket) -> None:
