@@ -481,6 +481,153 @@ def test_close_cv_probe_no_divergence_direction_for_agreed():
         _drop(ledger, path)
 
 
+def test_cv_probe_tables_live_in_ledger_db_not_cache_db():
+    """v2.1 storage move: cv_probe_positions and cv_probe_legs must be
+    created in ledger.db (committed) so the experiment record survives
+    cache rebuilds. Older builds put them in cache.db (gitignored), which
+    meant GitHub Actions runners destroyed every probe row at the end
+    of each run. Asserts:
+      - both tables exist in ledger.db on a fresh init
+      - neither table exists in cache.db
+    """
+    import sqlite3 as _sql
+    ledger, path = _ledger()
+    try:
+        # ledger.db: both probe tables present.
+        lc = _sql.connect(ledger.ledger_path)
+        try:
+            ledger_tables = {r[0] for r in lc.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name LIKE 'cv_probe%'")}
+        finally:
+            lc.close()
+        assert "cv_probe_positions" in ledger_tables, ledger_tables
+        assert "cv_probe_legs" in ledger_tables, ledger_tables
+
+        # cache.db: probe tables MUST NOT be created here (the v2.1 move
+        # eliminates them from CACHE_SCHEMA).
+        cc = _sql.connect(ledger.cache_path)
+        try:
+            cache_tables = {r[0] for r in cc.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name LIKE 'cv_probe%'")}
+        finally:
+            cc.close()
+        assert cache_tables == set(), (
+            f"cv_probe tables must not exist in cache.db, found: {cache_tables}")
+    finally:
+        _drop(ledger, path)
+
+
+def test_cv_probe_cache_to_ledger_migration_moves_rows():
+    """Simulate the old build: cache.db has cv_probe_positions +
+    cv_probe_legs rows that DO NOT exist in ledger.db. After construction
+    those rows must land in ledger.db (preserving ids), and the cache
+    copies must be dropped."""
+    import sqlite3 as _sql
+    import tempfile
+    fd1, lpath = tempfile.mkstemp(suffix="-ledger.db"); os.close(fd1)
+    fd2, cpath = tempfile.mkstemp(suffix="-cache.db"); os.close(fd2)
+    try:
+        # Pre-create cache.db with the OLD schema location so the
+        # migration has rows to move.
+        cc = _sql.connect(cpath)
+        try:
+            cc.executescript("""
+                CREATE TABLE IF NOT EXISTS cv_probe_positions (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  ts TEXT NOT NULL,
+                  pair_id INTEGER NOT NULL,
+                  category TEXT NOT NULL,
+                  match_confidence REAL NOT NULL,
+                  direction TEXT NOT NULL,
+                  shares REAL NOT NULL,
+                  total_cost REAL NOT NULL,
+                  expected_payout REAL NOT NULL,
+                  net_gap_per_share REAL NOT NULL,
+                  divergence_risk_note TEXT,
+                  status TEXT NOT NULL DEFAULT 'OPEN',
+                  agreement_outcome TEXT,
+                  divergence_direction TEXT,
+                  pnl REAL,
+                  closed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS cv_probe_legs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  position_id INTEGER NOT NULL,
+                  venue TEXT NOT NULL,
+                  venue_market_id TEXT NOT NULL,
+                  side TEXT NOT NULL,
+                  vwap REAL NOT NULL,
+                  price_filled REAL NOT NULL,
+                  fee_per_share REAL NOT NULL,
+                  shares REAL NOT NULL,
+                  cost REAL NOT NULL,
+                  outcome TEXT,
+                  payout REAL,
+                  levels_consumed_json TEXT
+                );
+            """)
+            cc.execute(
+                """INSERT INTO cv_probe_positions
+                   (id, ts, pair_id, category, match_confidence, direction,
+                    shares, total_cost, expected_payout, net_gap_per_share,
+                    divergence_risk_note, status, agreement_outcome,
+                    divergence_direction, pnl, closed_at)
+                   VALUES (101, '2026-06-12T00:00:00Z', 7, 'sports', 0.95,
+                           'POLY_YES_KAL_NO', 5.0, 4.5, 5.0, 0.05,
+                           'note', 'SETTLED', 'AGREED', NULL, 0.50,
+                           '2026-06-12T01:00:00Z')""")
+            cc.execute(
+                """INSERT INTO cv_probe_legs
+                   (id, position_id, venue, venue_market_id, side, vwap,
+                    price_filled, fee_per_share, shares, cost,
+                    outcome, payout, levels_consumed_json)
+                   VALUES (201, 101, 'polymarket', 'P-7', 'YES', 0.45,
+                           0.46, 0.01, 5.0, 2.30, 'YES', 5.0, '[]')""")
+            cc.commit()
+        finally:
+            cc.close()
+
+        # Construct Ledger with the prepared cache.db; it should:
+        #   1. create ledger.db with cv_probe tables in LEDGER_SCHEMA
+        #   2. copy rows from cache.db -> ledger.db
+        #   3. drop cache.db copies of cv_probe tables
+        from foundation.ledger import Ledger
+        Ledger(lpath, cpath)
+
+        # ledger.db now has the migrated rows with preserved ids.
+        lc = _sql.connect(lpath); lc.row_factory = _sql.Row
+        try:
+            pos = lc.execute(
+                "SELECT id, pair_id, category, agreement_outcome, pnl "
+                "FROM cv_probe_positions").fetchall()
+            legs = lc.execute(
+                "SELECT id, position_id, venue FROM cv_probe_legs").fetchall()
+        finally:
+            lc.close()
+        assert len(pos) == 1 and int(pos[0]["id"]) == 101
+        assert pos[0]["category"] == "sports"
+        assert pos[0]["agreement_outcome"] == "AGREED"
+        assert len(legs) == 1 and int(legs[0]["position_id"]) == 101
+
+        # cache.db copies must be GONE.
+        cc = _sql.connect(cpath)
+        try:
+            still_there = {r[0] for r in cc.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name LIKE 'cv_probe%'")}
+        finally:
+            cc.close()
+        assert still_there == set(), still_there
+    finally:
+        for p in (lpath, cpath):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
 def test_settled_stats_splits_both_paid_and_neither_paid():
     """cv_probe_settled_stats emits a row per (category, agreement,
     divergence_direction), so a category with 1 BOTH_PAID + 2 NEITHER_PAID

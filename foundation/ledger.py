@@ -427,6 +427,53 @@ CREATE INDEX IF NOT EXISTS idx_health_strategy_ts ON health_log(strategy, ts);
 CREATE INDEX IF NOT EXISTS idx_sharpline_status ON sharpline_orders(status);
 CREATE INDEX IF NOT EXISTS idx_logic_violations_pair ON logic_violations(pair_id, ts);
 CREATE INDEX IF NOT EXISTS idx_wx_verify_city_date ON wx_verification(city, resolve_date);
+
+-- v2 CV-PROBE (quarantined research book). Probe positions paper-trade
+-- FUZZY pairs to empirically measure how often non-identical referees
+-- actually disagree. ENTIRELY separated from the main bankroll and
+-- main scoreboard. These tables live in ledger.db (committed) so the
+-- experiment record survives cache rebuilds; older builds put them in
+-- CACHE_SCHEMA, and the _migrate_cv_probe_to_ledger step on init
+-- moves any cache-resident rows over the first time this code runs.
+CREATE TABLE IF NOT EXISTS cv_probe_positions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  pair_id INTEGER NOT NULL,
+  category TEXT NOT NULL,
+  match_confidence REAL NOT NULL,
+  direction TEXT NOT NULL,
+  shares REAL NOT NULL,
+  total_cost REAL NOT NULL,
+  expected_payout REAL NOT NULL,
+  net_gap_per_share REAL NOT NULL,
+  divergence_risk_note TEXT,
+  status TEXT NOT NULL DEFAULT 'OPEN',
+  agreement_outcome TEXT,              -- AGREED/DIVERGED/VOID_MISMATCH/BOTH_VOID
+  divergence_direction TEXT,           -- BOTH_PAID / NEITHER_PAID / NULL
+  pnl REAL,
+  closed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS cv_probe_legs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  position_id INTEGER NOT NULL,
+  venue TEXT NOT NULL,
+  venue_market_id TEXT NOT NULL,
+  side TEXT NOT NULL,
+  vwap REAL NOT NULL,
+  price_filled REAL NOT NULL,
+  fee_per_share REAL NOT NULL,
+  shares REAL NOT NULL,
+  cost REAL NOT NULL,
+  outcome TEXT,                        -- YES/NO/VOID at the leg's own venue
+  payout REAL,
+  levels_consumed_json TEXT,
+  FOREIGN KEY(position_id) REFERENCES cv_probe_positions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cv_probe_positions_status ON cv_probe_positions(status, ts);
+CREATE INDEX IF NOT EXISTS idx_cv_probe_positions_pair ON cv_probe_positions(pair_id);
+CREATE INDEX IF NOT EXISTS idx_cv_probe_legs_pos ON cv_probe_legs(position_id);
 """
 
 # ============================================================ CACHE_SCHEMA
@@ -491,50 +538,10 @@ CREATE TABLE IF NOT EXISTS cv_pairs (
   UNIQUE(poly_market_id, kalshi_ticker)
 );
 
--- v2 CV-PROBE (quarantined research book). Probe positions paper-trade
--- FUZZY pairs to empirically measure how often non-identical referees
--- actually disagree. ENTIRELY separated from main bankroll + main
--- scoreboard. cv_probe_positions lives in ledger.db (committed) so the
--- experiment record survives cache rebuilds.
-CREATE TABLE IF NOT EXISTS cv_probe_positions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts TEXT NOT NULL,
-  pair_id INTEGER NOT NULL,
-  category TEXT NOT NULL,
-  match_confidence REAL NOT NULL,
-  direction TEXT NOT NULL,
-  shares REAL NOT NULL,
-  total_cost REAL NOT NULL,
-  expected_payout REAL NOT NULL,
-  net_gap_per_share REAL NOT NULL,
-  divergence_risk_note TEXT,
-  status TEXT NOT NULL DEFAULT 'OPEN',
-  agreement_outcome TEXT,              -- AGREED/DIVERGED/VOID_MISMATCH/BOTH_VOID
-  divergence_direction TEXT,           -- BOTH_PAID / NEITHER_PAID / NULL (only set when agreement_outcome=DIVERGED)
-  pnl REAL,
-  closed_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS cv_probe_legs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  position_id INTEGER NOT NULL,
-  venue TEXT NOT NULL,
-  venue_market_id TEXT NOT NULL,
-  side TEXT NOT NULL,
-  vwap REAL NOT NULL,
-  price_filled REAL NOT NULL,
-  fee_per_share REAL NOT NULL,
-  shares REAL NOT NULL,
-  cost REAL NOT NULL,
-  outcome TEXT,                        -- YES/NO/VOID at the leg's own venue
-  payout REAL,
-  levels_consumed_json TEXT,
-  FOREIGN KEY(position_id) REFERENCES cv_probe_positions(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_cv_probe_positions_status ON cv_probe_positions(status, ts);
-CREATE INDEX IF NOT EXISTS idx_cv_probe_positions_pair ON cv_probe_positions(pair_id);
-CREATE INDEX IF NOT EXISTS idx_cv_probe_legs_pos ON cv_probe_legs(position_id);
+-- cv_probe_positions / cv_probe_legs moved to LEDGER_SCHEMA so the
+-- experiment record survives cache rebuilds. The init step in
+-- Ledger.__init__ copies any leftover rows from cache.db -> ledger.db
+-- on the first run after this change, then drops the cache copies.
 
 CREATE TABLE IF NOT EXISTS cv_gaps (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -672,15 +679,31 @@ class Ledger:
             cc.commit()
         finally:
             cc.close()
+        # Cross-DB step: cv_probe tables moved from cache.db -> ledger.db
+        # in v2.1. Copy any leftover rows now (no-op on fresh DBs and on
+        # DBs that have already been migrated). Done AFTER both schemas
+        # are in place because the helper opens self._conn() which
+        # ATTACHes cache.db.
+        try:
+            self._migrate_cv_probe_to_ledger()
+        except sqlite3.OperationalError:
+            # If anything in the move fails (e.g. corrupt cache copy),
+            # don't block startup -- the experiment record is preserved
+            # in cache.db until a future run resolves the issue.
+            pass
 
     @staticmethod
     def _migrate(c: sqlite3.Connection) -> None:
-        """Forward-only column additions for older DBs. SQLite has no
+        """Forward-only column additions for ledger.db. SQLite has no
         ALTER TABLE ... IF NOT EXISTS, so check PRAGMA first."""
         for table, col, type_ in [
             ("settlements", "wu_value", "REAL"),
             ("settlements", "wu_source", "TEXT"),
             ("settlements", "om_value", "REAL"),
+            # v2 cv_probe split: when agreement_outcome=DIVERGED, distinguish
+            # BOTH_PAID (windfall) vs NEITHER_PAID (catastrophe). NULL for
+            # AGREED/VOID_*/OPEN rows.
+            ("cv_probe_positions", "divergence_direction", "TEXT"),
         ]:
             cols = [r[1] for r in c.execute(
                 f"PRAGMA table_info({table})").fetchall()]
@@ -693,17 +716,68 @@ class Ledger:
         for table, col, type_ in [
             ("cv_pairs", "category", "TEXT"),
             ("cv_pairs", "confidence", "REAL"),
-            # v2 cv_probe split: when agreement_outcome=DIVERGED, distinguish
-            # the windfall direction (both legs paid) from the catastrophe
-            # direction (neither leg paid). NULL for AGREED/VOID_*/OPEN rows.
-            # (cv_probe_positions lives in CACHE_SCHEMA today; if it later
-            # moves to ledger.db, also add this column to _migrate above.)
-            ("cv_probe_positions", "divergence_direction", "TEXT"),
         ]:
             cols = [r[1] for r in c.execute(
                 f"PRAGMA table_info({table})").fetchall()]
             if col not in cols:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {type_}")
+
+    def _migrate_cv_probe_to_ledger(self) -> int:
+        """Idempotent: if cache.db contains cv_probe_positions /
+        cv_probe_legs rows (from the older build where those tables
+        lived in CACHE_SCHEMA), copy them into ledger.db preserving the
+        primary keys, then drop the cache copies. Returns the number
+        of probe positions copied (0 in steady state).
+
+          - Steady state: cache has no cv_probe tables -> no-op return 0.
+          - Older build with rows: copy positions + legs preserving id,
+            then DROP from cache. INSERT OR IGNORE keeps re-runs safe.
+          - Older-still build whose cv_probe_positions lacks
+            divergence_direction (pre v2.0 migration): we read the
+            cache schema first and substitute NULL for missing columns
+            so the SELECT never references a column that doesn't exist.
+        """
+        copied = 0
+        with self._conn() as c:
+            has_cache_tables = bool(c.execute(
+                "SELECT 1 FROM cache.sqlite_master "
+                "WHERE type='table' AND name='cv_probe_positions' LIMIT 1"
+            ).fetchone())
+            if not has_cache_tables:
+                return 0
+            cache_cols = {r[1] for r in c.execute(
+                "PRAGMA cache.table_info(cv_probe_positions)").fetchall()}
+
+            def _pick(col: str) -> str:
+                return col if col in cache_cols else "NULL"
+
+            pos_sql = f"""
+                INSERT OR IGNORE INTO cv_probe_positions
+                  (id, ts, pair_id, category, match_confidence, direction,
+                   shares, total_cost, expected_payout, net_gap_per_share,
+                   divergence_risk_note, status, agreement_outcome,
+                   divergence_direction, pnl, closed_at)
+                SELECT id, ts, pair_id, category, match_confidence, direction,
+                       shares, total_cost, expected_payout, net_gap_per_share,
+                       divergence_risk_note, status, agreement_outcome,
+                       {_pick('divergence_direction')}, pnl, closed_at
+                  FROM cache.cv_probe_positions
+            """
+            cur = c.execute(pos_sql)
+            copied = cur.rowcount or 0
+            c.execute("""
+                INSERT OR IGNORE INTO cv_probe_legs
+                  (id, position_id, venue, venue_market_id, side, vwap,
+                   price_filled, fee_per_share, shares, cost,
+                   outcome, payout, levels_consumed_json)
+                SELECT id, position_id, venue, venue_market_id, side, vwap,
+                       price_filled, fee_per_share, shares, cost,
+                       outcome, payout, levels_consumed_json
+                  FROM cache.cv_probe_legs
+            """)
+            c.execute("DROP TABLE IF EXISTS cache.cv_probe_legs")
+            c.execute("DROP TABLE IF EXISTS cache.cv_probe_positions")
+        return copied
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
