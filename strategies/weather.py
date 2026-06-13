@@ -236,6 +236,40 @@ def _parse_local_time(t: str, tz: str) -> datetime:
     return datetime.fromisoformat(t).replace(tzinfo=ZoneInfo(tz))
 
 
+def local_day_has_ended(date_iso: str, tz: str,
+                        settled_at: str | None = None) -> bool:
+    """True when the named local calendar day is fully over.
+
+    Polymarket weather markets resolve on the station's LOCAL calendar
+    day, NOT on UTC. A market with resolve_date == today UTC may already
+    be settle-able (Asia/Pacific stations) or still mid-afternoon
+    (Americas). The grader gates on UTC date for cheap pre-filtering;
+    the strategy is the authority that knows the timezone, so this is
+    where the local check lives.
+
+    `settled_at` is an ISO timestamp ("now" from the grader's POV). When
+    omitted, datetime.now(utc) is used. Tests pass an explicit value so
+    the contract is deterministic.
+    """
+    try:
+        z = ZoneInfo(tz)
+        d = datetime.fromisoformat(date_iso).date()
+    except (ValueError, TypeError):
+        return False
+    end_local = datetime(d.year, d.month, d.day, 23, 59, 59,
+                         tzinfo=z) + timedelta(seconds=1)  # exclusive end
+    if settled_at:
+        try:
+            now = datetime.fromisoformat(settled_at.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            now = datetime.now(timezone.utc)
+    else:
+        now = datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now >= end_local
+
+
 def member_extreme_in_window(fc: EnsembleForecast, member_key: str,
                              start: datetime, end: datetime,
                              kind: str = "max") -> float | None:
@@ -670,43 +704,46 @@ class WeatherStrategy(Strategy):
         Returns:
           {
             "outcome": "YES" | "NO" | "DISPUTED",
-            "actual_value": Open-Meteo max in market unit,
-            "wu_value": Wunderground max in market unit (or None),
-            "source_value": "open-meteo archive <station>",
+            "actual_value": truth value in market unit (WU when present),
+            "wu_value": Wunderground reading in market unit (or None),
+            "om_value": Open-Meteo archive reading in market unit (or None),
+            "source_value": "wunderground <station>" or fallback note,
             "wu_source": WU history page URL (or error note),
             "unit", "rounded_val", "wu_rounded_val", "disagreement",
           }
 
+        Returns `None` (the grader treats this as "leave OPEN, retry next
+        run") when:
+          - the station's LOCAL calendar day for resolve_date hasn't
+            ended yet (grader is called with UTC date, but settlement
+            authority is local-day -- Wellington at 03:00 NZ is graded
+            for "yesterday" UTC), OR
+          - the local day HAS ended but neither WU nor OM has a reading
+            yet (transient: WU usually publishes within 3-4h; OM archive
+            typically lags ~2 days). The next grade will retry.
+
         Outcome rules:
-          - WU and Open-Meteo round to same integer  -> YES/NO via that integer
-          - |wu_round - om_round| >= dispute_threshold (default 1) -> DISPUTED;
-            the trade stays OPEN until a human reads the settlement row
-          - WU unavailable -> grade on Open-Meteo alone; source notes it
+          - WU has data -> grade on WU's rounded integer. OM disagreement
+            (>= dispute_threshold) is logged as `dispute_note` but does
+            NOT block settlement (WU is authoritative).
+          - WU unavailable but OM is -> grade on OM, note WU error in
+            source_value.
         """
         city = _match_city(market, self.cities)
         if city is None or market.resolve_date is None:
             return None
-        kind = market.extras.get("kind") or "max"
-        if kind == "min":
-            om_c = self.client.archive_min_temp_c(
-                city.lat, city.lon, market.resolve_date, city.timezone,
-            )
-        else:
-            om_c = self.client.archive_max_temp_c(
-                city.lat, city.lon, market.resolve_date, city.timezone,
-            )
-        if om_c is None:
+        # Defer to the airport's LOCAL calendar day. A market does not
+        # resolve mid-afternoon-local just because UTC has rolled over.
+        if not local_day_has_ended(market.resolve_date, city.timezone,
+                                    settled_at):
             return None
+        kind = market.extras.get("kind") or "max"
         unit = market.extras.get("parsed_unit") or "C"
         bound = market.extras.get("parsed_bound") or "eq"
         lo = market.extras.get("lo")
         hi = market.extras.get("hi")
-        # Both values held in the market's display unit.
-        om_val = c_to_f(om_c) if unit == "F" else float(om_c)
-        # Round-half-up (matches market language and the probability model).
-        om_rounded = math.floor(om_val + 0.5)
 
-        # --- Wunderground cross-check (this is the actual resolution source)
+        # --- Wunderground (authoritative) ---
         wu_val: float | None = None
         wu_rounded: int | None = None
         wu_source = ""
@@ -727,21 +764,34 @@ class WeatherStrategy(Strategy):
         else:
             wu_error = f"unparseable station URL: {wu_url!r}"
 
-        # --- WU is authoritative (Polymarket settles on Wunderground).
-        # When WU is present for a finalized day, grade on WU regardless
-        # of OM. OM stays in the settlement row + wx_verification as a
-        # logged cross-check for the dispute-forensics aggregator and
-        # the OM<->WU wedge investigation. We only emit DISPUTED when WU
-        # is missing AND we have no other authoritative source -- in
-        # practice that branch never fires because OM is always
-        # available, so a missing-WU resolve falls through to the OM
-        # fallback at the bottom of this function.
+        # --- Open-Meteo archive (cross-check; may not be backfilled
+        # yet on fresh days). NOT a hard requirement -- we no longer
+        # bail when OM is missing if WU has the data.
+        if kind == "min":
+            om_c = self.client.archive_min_temp_c(
+                city.lat, city.lon, market.resolve_date, city.timezone,
+            )
+        else:
+            om_c = self.client.archive_max_temp_c(
+                city.lat, city.lon, market.resolve_date, city.timezone,
+            )
+        om_val: float | None = None
+        om_rounded: int | None = None
+        if om_c is not None:
+            om_val = c_to_f(om_c) if unit == "F" else float(om_c)
+            om_rounded = math.floor(om_val + 0.5)
+
+        # Neither source has data yet -- defer. The local day is over
+        # but obs/archive haven't propagated. Next grade run retries.
+        if wu_val is None and om_val is None:
+            return None
+
         disagreement = None
-        if wu_rounded is not None and wu_val is not None:
+        if wu_rounded is not None and om_rounded is not None:
             disagreement = abs(om_rounded - wu_rounded)
 
-        # --- grade. Prefer WU's rounded integer when available, since WU IS
-        # the resolution source; fall back to OM when WU was unavailable.
+        # --- grade. Prefer WU's rounded integer when available, since WU
+        # IS the resolution source; fall back to OM when WU was unavailable.
         verdict_val = wu_rounded if wu_rounded is not None else om_rounded
         if bound == "le":
             won = verdict_val <= (hi if hi is not None else verdict_val)
@@ -755,8 +805,6 @@ class WeatherStrategy(Strategy):
                 and (hi is None or verdict_val <= hi)
             )
 
-        # actual_value is the TRUTH used for grading & bias correction.
-        # Prefer Wunderground (the real resolution source); fall back to OM.
         if wu_val is not None:
             truth_val = wu_val
             source_value = f"wunderground {city.station_name}"
@@ -764,10 +812,6 @@ class WeatherStrategy(Strategy):
             truth_val = float(om_val)
             source_value = (f"open-meteo archive {city.station_name} "
                             f"(wu unavailable: {wu_error})")
-        # Forensic cross-check: if OM disagreed with WU by >=
-        # dispute_threshold, log it as a note instead of as a position
-        # state. The aggregator + the wx-verify forensics view reads
-        # om_value vs wu_value directly.
         dispute_note = ""
         if disagreement is not None and disagreement >= self.dispute_threshold:
             dispute_note = (
@@ -777,15 +821,15 @@ class WeatherStrategy(Strategy):
             )
         return {
             "outcome": "YES" if won else "NO",
-            "actual_value": float(truth_val),       # truth target (WU when present)
-            "om_value": float(om_val),              # logged cross-check
-            "actual_value_c": float(om_c),
+            "actual_value": float(truth_val),         # truth target (WU when present)
+            "om_value": float(om_val) if om_val is not None else None,
+            "actual_value_c": float(om_c) if om_c is not None else None,
             "wu_value": wu_val,
             "source_value": source_value,
             "wu_source": wu_source,
             "unit": unit,
             "kind": kind,
-            "rounded_val": float(om_rounded),
+            "rounded_val": float(om_rounded) if om_rounded is not None else None,
             "wu_rounded_val": float(wu_rounded) if wu_rounded is not None else None,
             "disagreement": disagreement,
             "dispute_note": dispute_note,

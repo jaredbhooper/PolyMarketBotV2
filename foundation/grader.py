@@ -321,12 +321,18 @@ def grade(cfg_path: str = "config.yaml", lookback_days: int = 14,
         if not market_row:
             continue
         rd = market_row["resolve_date"]
-        # Only settle markets whose resolve_date has passed.
+        # Cheap UTC pre-filter: anything with resolve_date strictly in
+        # the future by UTC reckoning can't possibly be settle-able yet.
+        # For resolve_date == today UTC we DO try resolution -- the
+        # strategy's resolve() owns the authoritative local-day check
+        # (e.g. Wellington/Tokyo/Seoul finish hours before UTC midnight
+        # rolls over). resolve() returns None when the local day is
+        # still in progress and the grader treats that as "leave OPEN".
         try:
             r_date = datetime.fromisoformat((rd or "").split("T")[0]).date()
         except (ValueError, AttributeError, TypeError):
             r_date = None
-        if r_date is None or r_date >= today:
+        if r_date is None or r_date > today:
             continue
 
         strat = strategies.get(trade["strategy"])

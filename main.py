@@ -1010,15 +1010,18 @@ def _run_wx_change_watch() -> int:
     fc_cfg = (cfg.get("forecast_change") or {})
     deadline_min = float(fc_cfg.get("watch_deadline_minutes", 2.5))
     guard_min = float(fc_cfg.get("trigger_guard_minutes", 60.0))
+    throttle_s = float(fc_cfg.get("throttle_seconds", 0.5))
     weather_cfg = (cfg.get("strategies") or {}).get("weather") or {}
     forecast_days = int(weather_cfg.get("forecast_days", 3))
     deadline = Deadline.in_minutes(deadline_min)
     client = ForecastClient()
     print(f"wx-change-watch: {len(cities)} cities, "
-          f"deadline={deadline_min:.1f}m, guard={guard_min:.0f}m")
+          f"deadline={deadline_min:.1f}m, guard={guard_min:.0f}m, "
+          f"throttle={throttle_s:.2f}s")
     changes = detect_and_record(ledger, cities, client,
                                   forecast_days=forecast_days,
-                                  deadline=deadline, verbose=True)
+                                  deadline=deadline, verbose=True,
+                                  throttle_seconds=throttle_s)
     print(f"wx-change-watch: {len(changes)} city hash changes")
     triggered: list[str] = []
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from datetime import datetime, timezone
 
 from strategies.weather import ForecastClient, family_of
@@ -140,12 +141,18 @@ def minutes_since_forecast_change(ledger, city: str,
 def detect_and_record(ledger, cities, client: ForecastClient,
                       forecast_days: int = 3,
                       deadline=None,
-                      verbose: bool = False) -> list[dict]:
+                      verbose: bool = False,
+                      throttle_seconds: float = 0.5) -> list[dict]:
     """Fetch ensemble per city, hash the lightweight summary, compare
     against the stored hash. Records a CHANGE for every city whose hash
     flipped since the last watch. The first observation for a city is
     seeded silently (no change event) so we don't paper-trigger on
     cold-start.
+
+    `throttle_seconds` sleeps between cities to stay under the Open-Meteo
+    free-tier 600-req/min cap. Serial 47-city calls without throttle
+    burst at ~25 req/s and trip an HTTP 429 ~12 cities in; 0.5s spacing
+    fits the budget while still completing in ~24s.
 
     Returns the list of recorded changes:
       [{"city", "old_hash", "new_hash", "change_ts"}, ...]
@@ -153,12 +160,14 @@ def detect_and_record(ledger, cities, client: ForecastClient,
     from foundation.deadline import Deadline
     deadline = Deadline.coerce(deadline)
     changes: list[dict] = []
-    for c in cities:
+    for i, c in enumerate(cities):
         if deadline.expired():
             if verbose:
                 print(f"  wx-change-watch: deadline reached, "
                       f"skipping rest (next: {c.city})")
             break
+        if i > 0 and throttle_seconds > 0:
+            time.sleep(throttle_seconds)
         try:
             fc = client.ensemble(c.lat, c.lon,
                                  forecast_days=forecast_days)
