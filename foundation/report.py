@@ -165,6 +165,16 @@ def print_master_report(cfg_path: str = "config.yaml") -> None:
     except Exception as exc:
         print(f"  WEATHER v2 shadow render failed: {exc}")
 
+    # ---- EDGE FRESHNESS section (v2.4) ---------------------------------
+    # Expectancy + hit rate bucketed by minutes since the last forecast
+    # change. Probes whether the fast-cycle change watcher actually
+    # locates higher-edge entry windows.
+    try:
+        print()
+        print_edge_freshness(cfg, ledger)
+    except Exception as exc:
+        print(f"  EDGE FRESHNESS render failed: {exc}")
+
     # ---- Today equity snapshot (if not already there) ------------------
     for r in snapshot:
         s = r["strategy"]
@@ -488,6 +498,151 @@ def print_cv_probe_report(cfg: dict, ledger: Ledger) -> None:
               f"{n_vm:>4d} {n_bv:>4d} {div_rate*100:>7.1f}% "
               f"${agr_avg_gap:>7.3f} {breakeven*100:>8.1f}% "
               f"${sum_pnl:>+9.2f}  {verdict}")
+    print()
+
+
+def print_edge_freshness(cfg: dict, ledger: Ledger) -> None:
+    """EDGE FRESHNESS table.
+
+    Bucket weather trades (live paper + shadow champion) by the
+    `minutes_since_forecast_change` recorded at entry and report
+    expectancy + hit rate per bucket. If forecast-change watching is
+    paying off, the 0-15 minute bucket -- trades opened immediately
+    after a model update -- should outperform the 60+ minute bucket
+    where the same forecast has been priced in for an hour.
+
+    Three rows: 0-15, 15-60, 60+. Plus a NULL row for trades opened
+    before the watcher saw a change for that city (cold-start / pre-
+    watcher data) so we can see the migration progress at a glance.
+    """
+    import sqlite3 as _sql
+    BUCKETS = [
+        ("0-15m",  0.0,  15.0),
+        ("15-60m", 15.0, 60.0),
+        ("60+m",   60.0, None),
+    ]
+    print("=== EDGE FRESHNESS (weather trades bucketed by minutes since "
+          "last forecast change) ===")
+
+    def _agg(c, sql: str, params: tuple) -> dict:
+        row = c.execute(sql, params).fetchone()
+        n = int(row["n"] or 0)
+        wins = int(row["wins"] or 0)
+        pnl = float(row["pnl"] or 0.0)
+        stake = float(row["stake"] or 0.0)
+        expectancy = (pnl / stake) if stake > 0 else 0.0
+        hit_rate = (wins / n) if n > 0 else 0.0
+        return {"n": n, "wins": wins, "pnl": pnl, "stake": stake,
+                "expectancy": expectancy, "hit_rate": hit_rate}
+
+    with _sql.connect(ledger.ledger_path) as c:
+        c.row_factory = _sql.Row
+        # ---- live paper -------------------------------------------------
+        live_rows = []
+        for label, lo, hi in BUCKETS:
+            if hi is None:
+                sql = (
+                    "SELECT COUNT(*) AS n, "
+                    "  COALESCE(SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END),0) wins, "
+                    "  COALESCE(SUM(pnl),0) pnl, COALESCE(SUM(stake),0) stake "
+                    "  FROM paper_trades "
+                    " WHERE strategy='weather' "
+                    "   AND status IN ('WIN','LOSS','VOID') "
+                    "   AND minutes_since_forecast_change IS NOT NULL "
+                    "   AND minutes_since_forecast_change >= ?")
+                live_rows.append((label, _agg(c, sql, (lo,))))
+            else:
+                sql = (
+                    "SELECT COUNT(*) AS n, "
+                    "  COALESCE(SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END),0) wins, "
+                    "  COALESCE(SUM(pnl),0) pnl, COALESCE(SUM(stake),0) stake "
+                    "  FROM paper_trades "
+                    " WHERE strategy='weather' "
+                    "   AND status IN ('WIN','LOSS','VOID') "
+                    "   AND minutes_since_forecast_change >= ? "
+                    "   AND minutes_since_forecast_change <  ?")
+                live_rows.append((label, _agg(c, sql, (lo, hi))))
+        null_sql_live = (
+            "SELECT COUNT(*) AS n, "
+            "  COALESCE(SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END),0) wins, "
+            "  COALESCE(SUM(pnl),0) pnl, COALESCE(SUM(stake),0) stake "
+            "  FROM paper_trades "
+            " WHERE strategy='weather' "
+            "   AND status IN ('WIN','LOSS','VOID') "
+            "   AND minutes_since_forecast_change IS NULL")
+        live_null = _agg(c, null_sql_live, ())
+
+        # ---- shadow champion (the production-equivalent side of the
+        # shadow book; never touches the bankroll) -----------------------
+        shadow_rows = []
+        for label, lo, hi in BUCKETS:
+            if hi is None:
+                sql = (
+                    "SELECT COUNT(*) AS n, "
+                    "  COALESCE(SUM(CASE WHEN champ_pnl > 0 THEN 1 "
+                    "                    WHEN champ_pnl <= 0 AND champ_pnl IS NOT NULL THEN 0 "
+                    "                    ELSE 0 END),0) wins, "
+                    "  COALESCE(SUM(champ_pnl),0) pnl, "
+                    "  COALESCE(SUM(champ_stake),0) stake "
+                    "  FROM shadow_trades "
+                    " WHERE status IN ('WIN','LOSS','VOID') "
+                    "   AND champ_side IS NOT NULL AND champ_side != 'NONE' "
+                    "   AND minutes_since_forecast_change IS NOT NULL "
+                    "   AND minutes_since_forecast_change >= ?")
+                shadow_rows.append((label, _agg(c, sql, (lo,))))
+            else:
+                sql = (
+                    "SELECT COUNT(*) AS n, "
+                    "  COALESCE(SUM(CASE WHEN champ_pnl > 0 THEN 1 ELSE 0 END),0) wins, "
+                    "  COALESCE(SUM(champ_pnl),0) pnl, "
+                    "  COALESCE(SUM(champ_stake),0) stake "
+                    "  FROM shadow_trades "
+                    " WHERE status IN ('WIN','LOSS','VOID') "
+                    "   AND champ_side IS NOT NULL AND champ_side != 'NONE' "
+                    "   AND minutes_since_forecast_change >= ? "
+                    "   AND minutes_since_forecast_change <  ?")
+                shadow_rows.append((label, _agg(c, sql, (lo, hi))))
+        null_sql_shadow = (
+            "SELECT COUNT(*) AS n, "
+            "  COALESCE(SUM(CASE WHEN champ_pnl > 0 THEN 1 ELSE 0 END),0) wins, "
+            "  COALESCE(SUM(champ_pnl),0) pnl, "
+            "  COALESCE(SUM(champ_stake),0) stake "
+            "  FROM shadow_trades "
+            " WHERE status IN ('WIN','LOSS','VOID') "
+            "   AND champ_side IS NOT NULL AND champ_side != 'NONE' "
+            "   AND minutes_since_forecast_change IS NULL")
+        shadow_null = _agg(c, null_sql_shadow, ())
+
+    print()
+    print(f"  {'bucket':<8s} {'book':<8s} {'n':>5s} {'wins':>5s} "
+          f"{'hit_rate':>9s} {'pnl':>9s} {'stake':>9s} {'expectancy':>11s}")
+    print(f"  {'-'*8} {'-'*8} {'-'*5} {'-'*5} {'-'*9} {'-'*9} {'-'*9} {'-'*11}")
+    for label, agg in live_rows:
+        print(f"  {label:<8s} {'live':<8s} {agg['n']:>5d} {agg['wins']:>5d} "
+              f"{agg['hit_rate']*100:>8.1f}% ${agg['pnl']:>+7.2f} "
+              f"${agg['stake']:>7.2f} {agg['expectancy']*100:>+9.2f}%")
+    print(f"  {'NULL':<8s} {'live':<8s} {live_null['n']:>5d} "
+          f"{live_null['wins']:>5d} "
+          f"{live_null['hit_rate']*100:>8.1f}% ${live_null['pnl']:>+7.2f} "
+          f"${live_null['stake']:>7.2f} "
+          f"{live_null['expectancy']*100:>+9.2f}%")
+    print(f"  {'-'*8} {'-'*8} {'-'*5} {'-'*5} {'-'*9} {'-'*9} {'-'*9} {'-'*11}")
+    for label, agg in shadow_rows:
+        print(f"  {label:<8s} {'shadow':<8s} {agg['n']:>5d} {agg['wins']:>5d} "
+              f"{agg['hit_rate']*100:>8.1f}% ${agg['pnl']:>+7.2f} "
+              f"${agg['stake']:>7.2f} {agg['expectancy']*100:>+9.2f}%")
+    print(f"  {'NULL':<8s} {'shadow':<8s} {shadow_null['n']:>5d} "
+          f"{shadow_null['wins']:>5d} "
+          f"{shadow_null['hit_rate']*100:>8.1f}% ${shadow_null['pnl']:>+7.2f} "
+          f"${shadow_null['stake']:>7.2f} "
+          f"{shadow_null['expectancy']*100:>+9.2f}%")
+
+    total_live = sum(a["n"] for _, a in live_rows) + live_null["n"]
+    total_shadow = sum(a["n"] for _, a in shadow_rows) + shadow_null["n"]
+    if total_live == 0 and total_shadow == 0:
+        print()
+        print("  (no settled weather trades yet -- table populates once "
+              "today's markets resolve and grade fires)")
     print()
 
 

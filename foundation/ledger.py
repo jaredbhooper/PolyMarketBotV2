@@ -753,6 +753,12 @@ class Ledger:
             # BOTH_PAID (windfall) vs NEITHER_PAID (catastrophe). NULL for
             # AGREED/VOID_*/OPEN rows.
             ("cv_probe_positions", "divergence_direction", "TEXT"),
+            # Forecast-change watcher: wall-clock minutes between the
+            # last recorded hash flip for this trade's city and the
+            # moment the trade was logged. NULL for non-weather strategies
+            # and for weather trades opened before the watcher existed.
+            ("paper_trades", "minutes_since_forecast_change", "REAL"),
+            ("shadow_trades", "minutes_since_forecast_change", "REAL"),
         ]:
             cols = [r[1] for r in c.execute(
                 f"PRAGMA table_info({table})").fetchall()]
@@ -961,16 +967,20 @@ class Ledger:
     def record_trade(self, market_id: int, strategy: str, side: str,
                      price_filled: float, stake: float, shares: float,
                      p_model_at_entry: float, edge_at_entry: float,
-                     levels_consumed: list[dict]) -> int:
+                     levels_consumed: list[dict],
+                     minutes_since_forecast_change: float | None = None,
+                     ) -> int:
         with self._conn() as c:
             cur = c.execute(
                 """INSERT INTO paper_trades (market_id, strategy, ts, side,
                     price_filled, stake, shares, p_model_at_entry,
-                    edge_at_entry, levels_consumed_json, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
+                    edge_at_entry, levels_consumed_json, status,
+                    minutes_since_forecast_change)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)""",
                 (market_id, strategy, utcnow_iso(), side, price_filled,
                  stake, shares, p_model_at_entry, edge_at_entry,
-                 json.dumps(levels_consumed)),
+                 json.dumps(levels_consumed),
+                 minutes_since_forecast_change),
             )
             return int(cur.lastrowid)
 
@@ -1523,7 +1533,8 @@ class Ledger:
                               champ_p=?, champ_side=?, champ_edge=?,
                               champ_price_filled=?, champ_stake=?, champ_shares=?,
                               chal_p=?, chal_side=?, chal_edge=?,
-                              chal_price_filled=?, chal_stake=?, chal_shares=?
+                              chal_price_filled=?, chal_stake=?, chal_shares=?,
+                              minutes_since_forecast_change=?
                         WHERE id=?""",
                     (
                         row.get("ts") or utcnow_iso(),
@@ -1541,6 +1552,7 @@ class Ledger:
                         row.get("chal_price_filled"),
                         row.get("chal_stake"),
                         row.get("chal_shares"),
+                        row.get("minutes_since_forecast_change"),
                         int(existing["id"]),
                     ),
                 )
@@ -1552,8 +1564,8 @@ class Ledger:
                        champ_price_filled, champ_stake, champ_shares,
                        chal_p, chal_side, chal_edge,
                        chal_price_filled, chal_stake, chal_shares,
-                       status)
-                   VALUES (?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, 'OPEN')""",
+                       status, minutes_since_forecast_change)
+                   VALUES (?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, 'OPEN', ?)""",
                 (
                     row.get("ts") or utcnow_iso(),
                     int(row["market_id"]),
@@ -1571,6 +1583,7 @@ class Ledger:
                     row.get("chal_price_filled"),
                     row.get("chal_stake"),
                     row.get("chal_shares"),
+                    row.get("minutes_since_forecast_change"),
                 ),
             )
             return int(cur.lastrowid)

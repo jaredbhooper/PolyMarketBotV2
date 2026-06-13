@@ -485,6 +485,9 @@ def cycle(cfg_path: str = "config.yaml", verbose: bool = True,
                             "market_id": mid,
                             "city": (est.metadata or {}).get("city"),
                             "resolve_date": m.resolve_date,
+                            "minutes_since_forecast_change": (
+                                (est.metadata or {}).get(
+                                    "minutes_since_forecast_change")),
                             "champ_p": float(est.p_final),
                             "champ_side": (d.side if champ_would_fire
                                               else "NONE"),
@@ -710,6 +713,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("wx-verify", help="print the WX-VERIFY skill + dispute-forensics report")
     sub.add_parser("wx-regrade-disputed",
                     help="re-settle DISPUTED weather positions on WU (Wunderground is authoritative)")
+    sub.add_parser("wx-change-watch",
+                    help="fetch lightweight forecast hash per city; record hash flips + arm per-city scan triggers (fast.yml)")
     aut = sub.add_parser("autopsy", help="behavioral fingerprint + archetype for a single wallet")
     aut.add_argument("wallet")
     aut.add_argument("--refresh", action="store_true",
@@ -844,6 +849,8 @@ def main(argv: list[str] | None = None) -> int:
         ledger = ledger_from_cfg(cfg)
         _print_wx_verify(cfg, ledger)
         return 0
+    if args.cmd == "wx-change-watch":
+        return _run_wx_change_watch()
     if args.cmd == "wx-regrade-disputed":
         from foundation.grader import regrade_disputed_on_wu
         from datetime import datetime, timezone
@@ -975,6 +982,67 @@ def _run_copy_backtest() -> int:
                       f"{r['estimate_marker']}")
             return 0
     print("No copy_trading strategy active.")
+    return 0
+
+
+def _run_wx_change_watch() -> int:
+    """Lightweight forecast-hash watcher (runs in fast.yml every 5 min).
+
+    Iterates the configured weather cities, hashes the per-family hourly
+    mean (snapped to 0.5 C) over the next 48 h, and records a CHANGE in
+    cv_state when the hash differs from the previously stored value for
+    that city. Arms a workflow_dispatch trigger for each newly-changed
+    city subject to the per-city 1/hr guard (see foundation.forecast_change).
+    Prints `TRIGGER_CITIES=<csv>` on the last line when one or more
+    cities cleared the guard -- the fast.yml job parses that and fires
+    `gh workflow run cycle.yml -f tag=<city>` per entry.
+    """
+    import os
+    from datetime import datetime, timezone
+    from foundation.deadline import Deadline
+    from foundation.forecast_change import (detect_and_record,
+                                              should_trigger_scan,
+                                              mark_scan_at)
+    from strategies.weather import ForecastClient, _load_cities
+    cfg = load_config()
+    ledger = ledger_from_cfg(cfg)
+    cities = _load_cities(cfg)
+    fc_cfg = (cfg.get("forecast_change") or {})
+    deadline_min = float(fc_cfg.get("watch_deadline_minutes", 2.5))
+    guard_min = float(fc_cfg.get("trigger_guard_minutes", 60.0))
+    weather_cfg = (cfg.get("strategies") or {}).get("weather") or {}
+    forecast_days = int(weather_cfg.get("forecast_days", 3))
+    deadline = Deadline.in_minutes(deadline_min)
+    client = ForecastClient()
+    print(f"wx-change-watch: {len(cities)} cities, "
+          f"deadline={deadline_min:.1f}m, guard={guard_min:.0f}m")
+    changes = detect_and_record(ledger, cities, client,
+                                  forecast_days=forecast_days,
+                                  deadline=deadline, verbose=True)
+    print(f"wx-change-watch: {len(changes)} city hash changes")
+    triggered: list[str] = []
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for ch in changes:
+        if not should_trigger_scan(ledger, ch["city"], now_iso,
+                                       guard_minutes=guard_min):
+            print(f"  {ch['city']}: trigger SKIPPED "
+                  f"(within {guard_min:.0f}m of prior scan)")
+            continue
+        mark_scan_at(ledger, ch["city"], now_iso)
+        triggered.append(ch["city"])
+        print(f"  {ch['city']}: trigger ARMED")
+    # Emit the CSV both to stdout (workflow parses) and $GITHUB_OUTPUT
+    # when available (preferred path; stdout grep is a fallback).
+    csv = ",".join(triggered)
+    print(f"TRIGGER_CITIES={csv}")
+    gh_out = os.environ.get("GITHUB_OUTPUT")
+    if gh_out:
+        try:
+            with open(gh_out, "a", encoding="utf-8") as f:
+                f.write(f"trigger_cities={csv}\n")
+                f.write(f"trigger_count={len(triggered)}\n")
+        except OSError as exc:
+            print(f"  (could not write GITHUB_OUTPUT: {exc})")
     return 0
 
 

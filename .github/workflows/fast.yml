@@ -14,6 +14,10 @@ on:
 
 permissions:
   contents: write
+  # `actions: write` is required so the wx-change-watch step can
+  # `gh workflow run cycle.yml` for cities whose forecast hash flipped.
+  # Without it `gh` falls back to a 403 and the dispatch is a no-op.
+  actions: write
 
 concurrency:
   group: polymarketbot-state
@@ -22,7 +26,11 @@ concurrency:
 jobs:
   fast:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    # 6 minutes covers follow + sharpline-fill-cycle + wx-change-watch +
+    # the dispatch loop. The change-watch step has its own internal
+    # deadline (watch_deadline_minutes, default 2.5) so it exits cleanly
+    # even when Open-Meteo is slow.
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,13 +67,41 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # Both commands are idempotent: cursor-tracked / nothing-to-do
-          # if nothing changed. Any single failure does NOT block the
-          # other (`|| true` swallows non-zero exits). LP-Sim moved to
-          # cycle.yml because it requires a full Polymarket book scan
-          # that doesn't fit fast.yml's 4-minute budget.
+          # All three commands are idempotent: cursor-tracked / nothing-
+          # to-do if nothing changed. Any single failure does NOT block
+          # the others (`|| true` swallows non-zero exits). LP-Sim moved
+          # to cycle.yml because it requires a full Polymarket book scan
+          # that doesn't fit fast.yml's 6-minute budget.
           python main.py follow || true
           python main.py sharpline-fill-cycle || true
+
+      - name: Forecast-change watcher
+        id: wx_change_watch
+        env:
+          PYTHONUNBUFFERED: "1"
+        # Emits two GH outputs:
+        #   trigger_cities  CSV of cities whose hash flipped AND cleared
+        #                   the per-city 1/hr guard
+        #   trigger_count   integer length of trigger_cities (for `if:`)
+        run: |
+          python main.py wx-change-watch || true
+
+      - name: Dispatch cycle for changed cities
+        if: steps.wx_change_watch.outputs.trigger_count != '' && steps.wx_change_watch.outputs.trigger_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Fan out one workflow_dispatch per armed city. cycle.yml accepts
+        # a `tag` input which we use for traceability ("which forecast
+        # change triggered this run?"); the cycle itself still scans the
+        # full universe -- relevant_markets in WeatherStrategy filters
+        # to the configured city set.
+        run: |
+          IFS=',' read -ra CITIES <<< "${{ steps.wx_change_watch.outputs.trigger_cities }}"
+          for city in "${CITIES[@]}"; do
+            [ -z "$city" ] && continue
+            echo "::notice::dispatching cycle for forecast-change city=$city"
+            gh workflow run cycle.yml -f tag="forecast-change:$city" || true
+          done
 
       - name: Guard ledger.db size (must be <= 50 MB)
         run: |

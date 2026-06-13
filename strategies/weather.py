@@ -603,6 +603,21 @@ class WeatherStrategy(Strategy):
                 adaptive_audit["calibration_n"] = adapt_calibration.n
                 adaptive_audit["calibration_status"] = adapt_calibration.status
 
+        # Forecast-change freshness: wall-clock minutes since the
+        # lightweight forecast hash for this city last flipped. Pulled
+        # from the cv_state kv populated by `wx-change-watch` in fast.yml.
+        # NULL when the watcher hasn't recorded a change for this city
+        # yet (e.g. cold start or pre-watcher data).
+        mins_since_change = None
+        if self._adaptive_ledger is not None:
+            try:
+                from foundation.forecast_change import (
+                    minutes_since_forecast_change)
+                mins_since_change = minutes_since_forecast_change(
+                    self._adaptive_ledger, city.city)
+            except Exception:
+                mins_since_change = None
+
         return Estimate(
             p_final=p_final,
             confidence=confidence,
@@ -640,6 +655,9 @@ class WeatherStrategy(Strategy):
                 # Adaptive weights audit (v2.1). None when the kill switch
                 # is off or ledger isn't attached.
                 "adaptive": adaptive_audit,
+                # Forecast-change freshness (v2.4). NULL when no flip has
+                # been recorded for this city.
+                "minutes_since_forecast_change": mins_since_change,
             },
         )
 

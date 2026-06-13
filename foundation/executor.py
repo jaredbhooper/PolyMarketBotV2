@@ -378,6 +378,16 @@ class Executor:
                 decision.reason = (f"strategy {decision.strategy} has no "
                                     f"capital for ${fill.stake:.2f}")
                 return decision
+        # Forecast-change freshness: weather.estimate() injects
+        # `minutes_since_forecast_change` into estimate.metadata when the
+        # ledger is attached. Generic for any strategy that surfaces it
+        # the same way; None for everything else.
+        mins_since = None
+        try:
+            md = (decision.estimate.metadata or {})
+            mins_since = md.get("minutes_since_forecast_change")
+        except AttributeError:
+            mins_since = None
         trade_id = self.ledger.record_trade(
             market_id=decision.market_row_id,
             strategy=decision.strategy,
@@ -388,6 +398,7 @@ class Executor:
             p_model_at_entry=decision.p_model,
             edge_at_entry=float(decision.edge or 0.0),   # POST-fill edge
             levels_consumed=fill.levels_consumed,
+            minutes_since_forecast_change=mins_since,
         )
         decision.decision = "FILLED"
         decision.reason = (
