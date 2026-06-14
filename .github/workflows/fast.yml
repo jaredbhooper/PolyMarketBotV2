@@ -34,6 +34,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # `ref: main` (not the default github.sha) makes the checkout
+          # atomic with the polymarketbot-state concurrency group: when
+          # this job acquires the lock it fetches the LIVE main tip,
+          # not the SHA from when the job was queued. Without this, a
+          # job queued behind a long-running peer would check out the
+          # stale queue-time SHA, then commit on a stale base, then
+          # rebase-conflict on ledger.db at push time -- which silently
+          # drops graded data when the Commit step masks the failure.
+          ref: main
           fetch-depth: 1
 
       - uses: actions/setup-python@v5
@@ -115,17 +124,40 @@ jobs:
           fi
 
       - name: Commit ledger
+        # ledger.db is a single binary SQLite file written by all three
+        # workflows. Binary files have no merge strategy: every conflict
+        # silently destroys one side's writes. So this step is
+        # fast-forward-only -- ANY divergence between local and origin
+        # is a workflow-integrity bug (concurrency group escape, stale
+        # checkout base, etc) and must fail loudly. No `|| true` masks.
         run: |
+          set -euo pipefail
           git config user.name "polymarketbot"
           git config user.email "bot@users.noreply.github.com"
-          git add ledger.db || true
+          git add ledger.db
           if git diff --cached --quiet; then
             echo "no db changes to commit"
             exit 0
           fi
           git commit -m "fast $(date -u +%Y-%m-%dT%H:%MZ)"
-          git pull --rebase origin main || true
+          if ! git pull --ff-only origin main; then
+            echo "::error::origin/main moved since checkout -- another"
+            echo "::error::writer escaped the polymarketbot-state group."
+            echo "::error::Failing loudly to avoid dropping graded data."
+            exit 1
+          fi
           git push origin HEAD:main
+          # Post-push verification: re-fetch and assert our commit landed.
+          git fetch origin main
+          local_sha=$(git rev-parse HEAD)
+          origin_sha=$(git rev-parse origin/main)
+          if [ "$local_sha" != "$origin_sha" ]; then
+            echo "::error::post-push verification failed:"
+            echo "::error::  local HEAD:  $local_sha"
+            echo "::error::  origin/main: $origin_sha"
+            exit 1
+          fi
+          echo "push verified: $local_sha is on origin/main"
 
       - name: Save cache.db
         if: always()
