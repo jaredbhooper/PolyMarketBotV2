@@ -877,6 +877,49 @@ class Ledger:
             out["cache_bytes"] = os.path.getsize(self.cache_path)
         return out
 
+    def prune_ledger(self, signals_keep_days: int = 7,
+                     arb_multi_keep_days: int = 7) -> dict[str, int]:
+        """Drop unbounded log rows from the committed ledger.
+
+        Two tables grow without bound across cycles:
+          - `signals`: one row per strategy x relevant market per cycle.
+            The grader's wx-verification backfill + the master report
+            only ever read `latest_signal(market_id, strategy)` -- older
+            rows are dead history. Pruning by ts keeps the latest per
+            market because we drop strictly older days.
+          - `arb_multi`: one row per walked bucket-arb event per cycle.
+            ~99% of rows are `status='observed_below_threshold'` (no
+            position was ever opened) -- the recent-distribution log
+            for these is ALREADY in cache.arb_gaps. We only prune the
+            non-position statuses (observed_below_threshold + unfillable_leg)
+            so any real OPEN/CLOSED position record is preserved
+            regardless of age.
+
+        Both retentions default to 7 days -- enough for any verifier or
+        recent-distribution view, while keeping the committed ledger.db
+        well under GitHub's per-file limits.
+        """
+        from datetime import timedelta as _td
+        cutoff_signals = (datetime.now(timezone.utc).date()
+                          - _td(days=int(signals_keep_days))).isoformat()
+        cutoff_arb = (datetime.now(timezone.utc).date()
+                      - _td(days=int(arb_multi_keep_days))).isoformat()
+        out: dict[str, int] = {}
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM signals WHERE substr(ts,1,10) < ?",
+                (cutoff_signals,))
+            out["signals_deleted"] = cur.rowcount
+            # Only prune non-position rows. status 'open'/'closed'/'VOID'
+            # / etc are real bucket-arb positions and stay forever.
+            cur = c.execute(
+                "DELETE FROM arb_multi "
+                " WHERE substr(ts,1,10) < ? "
+                "   AND status IN ('observed_below_threshold','unfillable_leg')",
+                (cutoff_arb,))
+            out["arb_multi_deleted"] = cur.rowcount
+        return out
+
     def prune_cache(self, snapshots_keep_days: int = 7,
                      gaps_keep_days: int = 7) -> dict[str, int]:
         """Drop cache rows older than the retention window. Daily.yml

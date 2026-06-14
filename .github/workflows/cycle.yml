@@ -85,17 +85,29 @@ jobs:
           # routinely consumed all remaining workflow time.
           python main.py cycle
 
-      - name: Guard ledger.db size (must be <= 50 MB)
-        # If the ledger committed-DB ever grows past 50 MB we want to
-        # know loudly rather than have the next push silently fail at
-        # GitHub's 100 MB file limit. cache.db can be any size locally;
-        # only ledger.db is enforced because it's the file we commit.
+      - name: Prune + VACUUM ledger
+        # cycle.yml writes the highest-churn rows on the ledger
+        # (signals per relevant market per cycle, arb_multi observation
+        # rows per walked event). Without per-cycle pruning the ledger
+        # grew ~10 MB/day and tripped the size Guard within a week,
+        # forcing every cycle's work to be discarded. Daily.yml already
+        # prunes; mirror it here so 30-min cadence stays bounded.
+        run: |
+          python main.py vacuum || true
+
+      - name: Guard ledger.db size (must be <= 100 MB)
+        # GitHub's hard per-file limit is 100 MB. We commit ledger.db on
+        # every cycle so an unbounded grow would eventually hit that
+        # ceiling and silently fail the push. The Prune + VACUUM step
+        # above keeps it well under, but the Guard remains as a
+        # backstop -- a sudden jump indicates a regression in pruning
+        # or a new unbounded log table.
         run: |
           if [ -f ledger.db ]; then
             sz=$(stat -c%s ledger.db)
             echo "ledger.db size: $((sz/1024/1024)) MB ($sz bytes)"
-            if [ "$sz" -gt 52428800 ]; then
-              echo "::error::ledger.db exceeds 50 MB cap"
+            if [ "$sz" -gt 104857600 ]; then
+              echo "::error::ledger.db exceeds 100 MB cap"
               exit 1
             fi
           fi

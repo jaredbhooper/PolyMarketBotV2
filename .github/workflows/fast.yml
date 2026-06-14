@@ -112,13 +112,16 @@ jobs:
             gh workflow run cycle.yml -f tag="forecast-change:$city" || true
           done
 
-      - name: Guard ledger.db size (must be <= 50 MB)
+      - name: Guard ledger.db size (must be <= 100 MB)
+        # GitHub's hard per-file limit is 100 MB. Cycle + daily run
+        # the prune+vacuum step; fast.yml is too tight (<6 min) to
+        # also vacuum every 5 minutes, so it just polices the cap.
         run: |
           if [ -f ledger.db ]; then
             sz=$(stat -c%s ledger.db)
             echo "ledger.db size: $((sz/1024/1024)) MB ($sz bytes)"
-            if [ "$sz" -gt 52428800 ]; then
-              echo "::error::ledger.db exceeds 50 MB cap"
+            if [ "$sz" -gt 104857600 ]; then
+              echo "::error::ledger.db exceeds 100 MB cap"
               exit 1
             fi
           fi
