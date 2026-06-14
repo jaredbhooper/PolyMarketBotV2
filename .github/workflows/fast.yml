@@ -128,11 +128,22 @@ jobs:
 
       - name: Commit ledger
         # ledger.db is a single binary SQLite file written by all three
-        # workflows. Binary files have no merge strategy: every conflict
-        # silently destroys one side's writes. So this step is
-        # fast-forward-only -- ANY divergence between local and origin
-        # is a workflow-integrity bug (concurrency group escape, stale
-        # checkout base, etc) and must fail loudly. No `|| true` masks.
+        # workflows. Binary files have no merge strategy: a true
+        # conflict silently destroys one side's writes. But not every
+        # remote divergence IS a binary conflict -- a code-only push
+        # (yaml/py edits that don't touch ledger.db) can rebase
+        # cleanly. So:
+        #
+        #   - try `git pull --rebase`: succeeds for code-only divergence
+        #   - if rebase fails OR leaves any unresolved file: abort and
+        #     exit 1 loudly (true binary conflict; another writer
+        #     edited ledger.db between our checkout and our push)
+        #   - post-push verification: re-fetch and assert our commit
+        #     is on origin, else exit 1
+        #
+        # No `|| true` masks on any of these. Previous data-loss
+        # incidents were 100% from `git pull --rebase ... || true`
+        # silently dropping settled work.
         run: |
           set -euo pipefail
           git config user.name "polymarketbot"
@@ -143,14 +154,22 @@ jobs:
             exit 0
           fi
           git commit -m "fast $(date -u +%Y-%m-%dT%H:%MZ)"
-          if ! git pull --ff-only origin main; then
-            echo "::error::origin/main moved since checkout -- another"
-            echo "::error::writer escaped the polymarketbot-state group."
-            echo "::error::Failing loudly to avoid dropping graded data."
+          git fetch origin main
+          if ! git rebase origin/main; then
+            git rebase --abort 2>/dev/null || true
+            echo "::error::rebase failed -- likely binary conflict on"
+            echo "::error::ledger.db. Another writer edited ledger.db"
+            echo "::error::between our checkout and this push. Failing"
+            echo "::error::loudly to avoid silently dropping data."
+            exit 1
+          fi
+          if git ls-files -u | grep -q .; then
+            git rebase --abort 2>/dev/null || true
+            echo "::error::unresolved files after rebase:"
+            git ls-files -u
             exit 1
           fi
           git push origin HEAD:main
-          # Post-push verification: re-fetch and assert our commit landed.
           git fetch origin main
           local_sha=$(git rev-parse HEAD)
           origin_sha=$(git rev-parse origin/main)

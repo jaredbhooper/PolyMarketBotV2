@@ -113,8 +113,8 @@ jobs:
           fi
 
       - name: Commit ledger
-        # Fast-forward-only; binary ledger.db has no merge strategy.
-        # See fast.yml's Commit step for the full rationale + design.
+        # Rebase-with-conflict-guard; see fast.yml's Commit step for
+        # the full rationale + design.
         run: |
           set -euo pipefail
           git config user.name "polymarketbot"
@@ -125,10 +125,19 @@ jobs:
             exit 0
           fi
           git commit -m "cycle $(date -u +%Y-%m-%dT%H:%MZ)"
-          if ! git pull --ff-only origin main; then
-            echo "::error::origin/main moved since checkout -- another"
-            echo "::error::writer escaped the polymarketbot-state group."
-            echo "::error::Failing loudly to avoid dropping cycle data."
+          git fetch origin main
+          if ! git rebase origin/main; then
+            git rebase --abort 2>/dev/null || true
+            echo "::error::rebase failed -- likely binary conflict on"
+            echo "::error::ledger.db. Another writer edited ledger.db"
+            echo "::error::between our checkout and this push. Failing"
+            echo "::error::loudly to avoid silently dropping data."
+            exit 1
+          fi
+          if git ls-files -u | grep -q .; then
+            git rebase --abort 2>/dev/null || true
+            echo "::error::unresolved files after rebase:"
+            git ls-files -u
             exit 1
           fi
           git push origin HEAD:main
