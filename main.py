@@ -884,12 +884,12 @@ def main(argv: list[str] | None = None) -> int:
         ledger = ledger_from_cfg(cfg)
         keep = (cfg.get("retention") or {})
         pruned_l = ledger.prune_ledger(
-            signals_keep_days=int(keep.get("signals_keep_days", 7)),
-            arb_multi_keep_days=int(keep.get("arb_multi_keep_days", 7)),
+            arb_multi_keep_days=int(keep.get("arb_multi_keep_days", 2)),
         )
         pruned_c = ledger.prune_cache(
             snapshots_keep_days=int(keep.get("snapshots_keep_days", 7)),
             gaps_keep_days=int(keep.get("gaps_keep_days", 7)),
+            signals_keep_days=int(keep.get("signals_keep_days", 2)),
         )
         sizes = ledger.vacuum()
         print(f"  pruned ledger: {pruned_l}")

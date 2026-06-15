@@ -137,29 +137,114 @@ def minutes_since_forecast_change(ledger, city: str,
     return minutes_between(now_iso, get_change_at(ledger, city))
 
 
+# ---------------------------------------------------------------- proximity ranking
+def representative_max_c(payload: dict) -> float | None:
+    """Pick a single representative max-temp value from the lightweight
+    summary -- the highest hourly per-family-mean across the next 24h,
+    preferring GFS (largest population, smoothest signal). The payload
+    is quantized to a 0.5-degree grid for hash stability, so values
+    here are snapped (use representative_max_c_raw for the unquantized
+    continuous version that distance-to-boundary needs).
+    """
+    families = (payload or {}).get("families") or {}
+    for fam in ("gfs", "ifs", "aifs", "icon"):
+        series = families.get(fam) or []
+        next24 = [v for v in series[:24] if v is not None]
+        if next24:
+            return float(max(next24))
+    return None
+
+
+def representative_max_c_raw(fc) -> float | None:
+    """Same idea as `representative_max_c` but reads the RAW ensemble
+    values (before the 0.5-degree quantization used for hash stability).
+    The dispatch-ranking distance-to-bucket-boundary calculation needs
+    continuous values -- if we read off the quantized payload, every
+    distance is either exactly 0 or exactly 0.5, and the proximity
+    ranking degenerates into a stable-sort over source order.
+    """
+    by_fam: dict[str, list[list]] = {}
+    for k, series in fc.members.items():
+        by_fam.setdefault(family_of(k), []).append(series)
+    for fam in ("gfs", "ifs", "aifs", "icon"):
+        keys = by_fam.get(fam) or []
+        if not keys:
+            continue
+        n_hours = min(min(len(s) for s in keys), 24)
+        per_hour_means: list[float] = []
+        for h in range(n_hours):
+            vals = [s[h] for s in keys if s[h] is not None]
+            if vals:
+                per_hour_means.append(sum(vals) / len(vals))
+        if per_hour_means:
+            return float(max(per_hour_means))
+    return None
+
+
+def distance_to_bucket_boundary(temp_c: float | None) -> float:
+    """Distance (in degrees C, 0..0.5) from `temp_c` to the nearest
+    integer-rounded bucket boundary. Polymarket weather markets bucket
+    by integer degree, so the boundary between bucket X and X+1 sits
+    at X+0.5. A forecast at 14.4 (distance 0.1) is much more
+    likely to flip YES->NO on a model update than one at 14.0
+    (distance 0.5, dead-center).
+
+    None inputs yield 0.5 (treated as deprioritized / max distance).
+    """
+    if temp_c is None:
+        return 0.5
+    return 0.5 - abs(temp_c - round(temp_c))
+
+
 # ---------------------------------------------------------------- watcher
+# An Open-Meteo model rotation (e.g. GFS 06z run finishing) flips EVERY
+# city's hash at once -- it's not per-city forecast change, it's a
+# global model-version swap. Dispatching a separate scan for every
+# changed city in that situation wastes Actions minutes and starves
+# scheduled cycles of their concurrency window. When more than this
+# fraction of configured cities flip in a single watch, treat it as a
+# rotation: re-seed every city's hash silently (no change_at writes,
+# no dispatch) and let the next watch establish a true per-city signal.
+ROTATION_THRESHOLD_FRACTION = 0.5
+# Hard cap on per-watch dispatches. Even when rotation isn't detected
+# (e.g. 40% flip), dispatching dozens of cycles in one watch starves
+# the concurrency group of any other work. Three is enough to cover
+# the most edge-sensitive cities; the rest can wait for the next watch.
+MAX_DISPATCHES_PER_WATCH = 3
+
+
 def detect_and_record(ledger, cities, client: ForecastClient,
                       forecast_days: int = 3,
                       deadline=None,
                       verbose: bool = False,
-                      throttle_seconds: float = 0.5) -> list[dict]:
-    """Fetch ensemble per city, hash the lightweight summary, compare
-    against the stored hash. Records a CHANGE for every city whose hash
-    flipped since the last watch. The first observation for a city is
-    seeded silently (no change event) so we don't paper-trigger on
-    cold-start.
+                      throttle_seconds: float = 0.5,
+                      rotation_threshold_fraction: float = ROTATION_THRESHOLD_FRACTION,
+                      max_dispatches: int = MAX_DISPATCHES_PER_WATCH,
+                      ) -> list[dict]:
+    """Two-pass watcher with global-rotation guard.
 
-    `throttle_seconds` sleeps between cities to stay under the Open-Meteo
-    free-tier 600-req/min cap. Serial 47-city calls without throttle
-    burst at ~25 req/s and trip an HTTP 429 ~12 cities in; 0.5s spacing
-    fits the budget while still completing in ~24s.
+    Pass 1: fetch per-city ensemble, hash the lightweight summary, build
+            a candidate change list. NOTHING is written to the ledger
+            yet (no change_at timestamps, no hash updates).
 
-    Returns the list of recorded changes:
-      [{"city", "old_hash", "new_hash", "change_ts"}, ...]
+    Decision: if `len(candidates) > rotation_threshold_fraction * len(cities)`,
+              this looks like an Open-Meteo model rotation rather than
+              real per-city forecast movement. Re-seed every candidate
+              city's hash silently (write new_hash, NO change_at), log
+              "ROTATION DETECTED", and return [] so the dispatch step
+              fires zero workflows.
+
+    Pass 2: otherwise, record change_at for each candidate, rank by
+            distance-to-bucket-boundary (smaller is more market-relevant),
+            cap at `max_dispatches`, and return the truncated list.
     """
     from foundation.deadline import Deadline
     deadline = Deadline.coerce(deadline)
-    changes: list[dict] = []
+    # Pass 1: collect candidates. Seeds (new cities) are still written
+    # immediately because they don't dispatch and we don't want to lose
+    # the baseline.
+    candidates: list[dict] = []
+    examined = 0
     for i, c in enumerate(cities):
         if deadline.expired():
             if verbose:
@@ -175,23 +260,62 @@ def detect_and_record(ledger, cities, client: ForecastClient,
             if verbose:
                 print(f"  {c.city}: ensemble fetch failed: {e}")
             continue
-        new_hash = compute_hash(summary_payload(fc))
+        examined += 1
+        payload = summary_payload(fc)
+        new_hash = compute_hash(payload)
         old_hash = get_hash(ledger, c.city)
-        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
         if old_hash is None:
             store_hash_only(ledger, c.city, new_hash)
             if verbose:
                 print(f"  {c.city}: seed {new_hash[:10]}")
             continue
-        if old_hash != new_hash:
-            store_change(ledger, c.city, new_hash, now_iso)
-            changes.append({"city": c.city, "old_hash": old_hash,
-                            "new_hash": new_hash, "change_ts": now_iso})
+        if old_hash == new_hash:
             if verbose:
-                print(f"  {c.city}: HASH CHANGE "
-                      f"{old_hash[:10]} -> {new_hash[:10]}")
-        elif verbose:
-            print(f"  {c.city}: stable {new_hash[:10]}")
+                print(f"  {c.city}: stable {new_hash[:10]}")
+            continue
+        rep_c = representative_max_c_raw(fc)
+        dist = distance_to_bucket_boundary(rep_c)
+        candidates.append({
+            "city": c.city,
+            "old_hash": old_hash,
+            "new_hash": new_hash,
+            "rep_max_c": rep_c,
+            "distance_to_boundary": dist,
+        })
+        if verbose:
+            print(f"  {c.city}: HASH CHANGE "
+                  f"{old_hash[:10]} -> {new_hash[:10]} "
+                  f"(max~{rep_c}C, d={dist:.2f})")
+
+    # Rotation guard. examined excludes cities we couldn't fetch.
+    if examined > 0 and len(candidates) > rotation_threshold_fraction * examined:
+        if verbose:
+            print(f"  ROTATION DETECTED: {len(candidates)}/{examined} "
+                  f"cities flipped (> {rotation_threshold_fraction*100:.0f}%). "
+                  f"Re-seeding silently, dispatching ZERO.")
+        # Re-seed every candidate's hash WITHOUT recording change_at.
+        # store_hash_only writes only forecast_hash:<city>, leaving
+        # forecast_change_at untouched -- so minutes_since_forecast_change
+        # for downstream consumers continues to reflect the LAST real
+        # per-city change, not this rotation.
+        for cand in candidates:
+            store_hash_only(ledger, cand["city"], cand["new_hash"])
+        return []
+
+    # Pass 2: this is real per-city change. Record change_at, rank, cap.
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    changes: list[dict] = []
+    for cand in candidates:
+        store_change(ledger, cand["city"], cand["new_hash"], now_iso)
+        cand["change_ts"] = now_iso
+        changes.append(cand)
+    # Rank by proximity to bucket boundary (smaller = more sensitive).
+    changes.sort(key=lambda d: d["distance_to_boundary"])
+    if len(changes) > max_dispatches:
+        if verbose:
+            print(f"  dispatch cap: {len(changes)} candidates -> "
+                  f"keeping top {max_dispatches} by bucket proximity")
+        changes = changes[:max_dispatches]
     return changes
 
 

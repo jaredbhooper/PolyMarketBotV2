@@ -174,11 +174,17 @@ def test_real_movement_emits_change():
         # First call seeds 20.0.
         client_a = _FakeClient({(1.0, 2.0): _trivial_forecast(20.0)})
         cities = [_C("nyc", 1.0, 2.0)]
-        detect_and_record(ledger, cities, client_a)
+        # rotation_threshold_fraction=1.01 disables the storm guard for
+        # this single-city test (a 1/1 flip would otherwise read as a
+        # global rotation event and yield zero changes -- which is the
+        # right call in production but not what this test is pinning).
+        detect_and_record(ledger, cities, client_a,
+                          rotation_threshold_fraction=1.01)
         h_seed = get_hash(ledger, "nyc")
         # Second call sees 23.0 (a real model update).
         client_b = _FakeClient({(1.0, 2.0): _trivial_forecast(23.0)})
-        changes = detect_and_record(ledger, cities, client_b)
+        changes = detect_and_record(ledger, cities, client_b,
+                                     rotation_threshold_fraction=1.01)
         assert len(changes) == 1
         assert changes[0]["city"] == "nyc"
         assert changes[0]["old_hash"] == h_seed

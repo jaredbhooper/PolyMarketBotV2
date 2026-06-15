@@ -41,16 +41,13 @@ CREATE TABLE IF NOT EXISTS markets (
   created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS signals (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  market_id INTEGER NOT NULL,
-  strategy TEXT NOT NULL,
-  ts TEXT NOT NULL,
-  p_final REAL NOT NULL,
-  confidence REAL NOT NULL,
-  metadata_json TEXT,
-  FOREIGN KEY(market_id) REFERENCES markets(id)
-);
+-- `signals` lives in cache.db (see CACHE_SCHEMA). It's a high-churn
+-- log written every cycle per relevant market per strategy; only the
+-- latest row per (market_id, strategy) is ever read (by the wx
+-- verifier backfill in foundation/grader.py). The historical
+-- per-cycle write history is NOT part of the committed experiment
+-- record -- it's derived state. Keeping it in cache.db lets the
+-- committed ledger.db stay small and bounded.
 
 CREATE TABLE IF NOT EXISTS paper_trades (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -168,7 +165,7 @@ CREATE TABLE IF NOT EXISTS cv_legs (
   FOREIGN KEY(position_id) REFERENCES cv_positions(id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market_id, strategy, ts);
+-- idx_signals_market lives in CACHE_SCHEMA alongside the table.
 CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_positions_status ON arb_positions(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_legs_position ON arb_legs(position_id);
@@ -413,7 +410,7 @@ CREATE TABLE IF NOT EXISTS copied_trades (
   ts_opened TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_signals_market ON signals(market_id, strategy, ts);
+-- idx_signals_market lives in CACHE_SCHEMA alongside the table.
 CREATE INDEX IF NOT EXISTS idx_trades_status ON paper_trades(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_positions_status ON arb_positions(status, strategy);
 CREATE INDEX IF NOT EXISTS idx_arb_legs_position ON arb_legs(position_id);
@@ -536,6 +533,24 @@ CREATE TABLE IF NOT EXISTS snapshots (
   no_ask REAL, no_bid REAL,
   book_depth_usd REAL
 );
+
+-- High-churn per-cycle estimate log. Moved here from LEDGER_SCHEMA
+-- after the table grew to 56% of committed ledger.db. Only the
+-- latest signal per (market_id, strategy) is read (by the wx
+-- verifier backfill) -- historical rows are derived state and don't
+-- need to travel with the committed experiment record. Pruned by
+-- prune_cache to signals_keep_days (default 2).
+CREATE TABLE IF NOT EXISTS signals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  market_id INTEGER NOT NULL,
+  strategy TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  p_final REAL NOT NULL,
+  confidence REAL NOT NULL,
+  metadata_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_signals_market
+    ON signals(market_id, strategy, ts);
 
 CREATE TABLE IF NOT EXISTS arb_gaps (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -740,6 +755,17 @@ class Ledger:
             # don't block startup -- the experiment record is preserved
             # in cache.db until a future run resolves the issue.
             pass
+        # Cross-DB step: signals table moved from ledger.db -> cache.db
+        # (v2.5). At 30k rows / 44 MB it was 56% of the committed
+        # ledger and pushing it past the 100 MB Guard cap. Idempotent:
+        # no-op once the table is gone from ledger.db.
+        try:
+            self._migrate_signals_to_cache()
+        except sqlite3.OperationalError:
+            # Don't block startup; the read/write paths use cache.signals
+            # so degraded mode just loses the historical rows that didn't
+            # migrate. A future run with the bug fixed will pick them up.
+            pass
 
     @staticmethod
     def _migrate(c: sqlite3.Connection) -> None:
@@ -834,6 +860,32 @@ class Ledger:
             c.execute("DROP TABLE IF EXISTS cache.cv_probe_positions")
         return copied
 
+    def _migrate_signals_to_cache(self) -> int:
+        """Idempotent: copy ledger.signals -> cache.signals once, then
+        drop the ledger-resident copy. Steady state: ledger has no
+        signals table, returns 0.
+
+        The cache.signals table is created by CACHE_SCHEMA. INSERT OR
+        IGNORE protects against partial earlier migrations.
+        """
+        with self._conn() as c:
+            has_main_table = bool(c.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='signals' LIMIT 1"
+            ).fetchone())
+            if not has_main_table:
+                return 0
+            cur = c.execute(
+                "INSERT OR IGNORE INTO cache.signals "
+                "  (id, market_id, strategy, ts, p_final, "
+                "   confidence, metadata_json) "
+                "SELECT id, market_id, strategy, ts, p_final, "
+                "       confidence, metadata_json FROM signals"
+            )
+            copied = cur.rowcount or 0
+            c.execute("DROP TABLE IF EXISTS signals")
+            return copied
+
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.ledger_path)
@@ -877,39 +929,26 @@ class Ledger:
             out["cache_bytes"] = os.path.getsize(self.cache_path)
         return out
 
-    def prune_ledger(self, signals_keep_days: int = 7,
-                     arb_multi_keep_days: int = 7) -> dict[str, int]:
+    def prune_ledger(self, arb_multi_keep_days: int = 2) -> dict[str, int]:
         """Drop unbounded log rows from the committed ledger.
 
-        Two tables grow without bound across cycles:
-          - `signals`: one row per strategy x relevant market per cycle.
-            The grader's wx-verification backfill + the master report
-            only ever read `latest_signal(market_id, strategy)` -- older
-            rows are dead history. Pruning by ts keeps the latest per
-            market because we drop strictly older days.
-          - `arb_multi`: one row per walked bucket-arb event per cycle.
-            ~99% of rows are `status='observed_below_threshold'` (no
-            position was ever opened) -- the recent-distribution log
-            for these is ALREADY in cache.arb_gaps. We only prune the
-            non-position statuses (observed_below_threshold + unfillable_leg)
-            so any real OPEN/CLOSED position record is preserved
-            regardless of age.
+        After the v2.5 signals-to-cache move, the only ledger-resident
+        log table is `arb_multi`: one row per walked bucket-arb event
+        per cycle. ~99% of rows are `status='observed_below_threshold'`
+        (no position was ever opened) -- the recent-distribution log
+        for these is ALREADY in cache.arb_gaps. We only prune the
+        non-position statuses (observed_below_threshold + unfillable_leg)
+        so any real OPEN/CLOSED position record is preserved regardless
+        of age.
 
-        Both retentions default to 7 days -- enough for any verifier or
-        recent-distribution view, while keeping the committed ledger.db
-        well under GitHub's per-file limits.
+        Default retention 2 days -- tightened from 7 to keep ledger.db
+        structurally bounded after the size outage.
         """
         from datetime import timedelta as _td
-        cutoff_signals = (datetime.now(timezone.utc).date()
-                          - _td(days=int(signals_keep_days))).isoformat()
         cutoff_arb = (datetime.now(timezone.utc).date()
                       - _td(days=int(arb_multi_keep_days))).isoformat()
         out: dict[str, int] = {}
         with self._conn() as c:
-            cur = c.execute(
-                "DELETE FROM signals WHERE substr(ts,1,10) < ?",
-                (cutoff_signals,))
-            out["signals_deleted"] = cur.rowcount
             # Only prune non-position rows. status 'open'/'closed'/'VOID'
             # / etc are real bucket-arb positions and stay forever.
             cur = c.execute(
@@ -921,10 +960,13 @@ class Ledger:
         return out
 
     def prune_cache(self, snapshots_keep_days: int = 7,
-                     gaps_keep_days: int = 7) -> dict[str, int]:
+                     gaps_keep_days: int = 7,
+                     signals_keep_days: int = 2) -> dict[str, int]:
         """Drop cache rows older than the retention window. Daily.yml
         runs this before VACUUM to keep cache.db from growing without
-        bound across workflow runs."""
+        bound across workflow runs. `signals` joined cache.db in v2.5;
+        its 2-day retention is aggressive because only the latest
+        signal per (market_id, strategy) is ever read."""
         out: dict[str, int] = {}
         cutoff_ts_iso = (datetime.now(timezone.utc)
                           .replace(microsecond=0)
@@ -936,6 +978,10 @@ class Ledger:
         cut_day_gaps = (datetime.fromisoformat(cutoff_ts_iso)
                           - __import__("datetime").timedelta(days=int(gaps_keep_days))
                         ).date().isoformat()
+        cut_day_signals = (datetime.fromisoformat(cutoff_ts_iso)
+                            - __import__("datetime").timedelta(
+                                days=int(signals_keep_days))
+                          ).date().isoformat()
         with self._conn() as c:
             cur = c.execute(
                 "DELETE FROM cache.snapshots WHERE substr(ts,1,10) < ?",
@@ -949,6 +995,10 @@ class Ledger:
                 "DELETE FROM cache.cv_gaps WHERE substr(ts,1,10) < ?",
                 (cut_day_gaps,))
             out["cv_gaps_deleted"] = cur.rowcount
+            cur = c.execute(
+                "DELETE FROM cache.signals WHERE substr(ts,1,10) < ?",
+                (cut_day_signals,))
+            out["signals_deleted"] = cur.rowcount
         return out
 
     # --- markets ----------------------------------------------------------
@@ -999,7 +1049,7 @@ class Ledger:
                       confidence: float, metadata: dict | None) -> int:
         with self._conn() as c:
             cur = c.execute(
-                """INSERT INTO signals (market_id, strategy, ts, p_final,
+                """INSERT INTO cache.signals (market_id, strategy, ts, p_final,
                     confidence, metadata_json) VALUES (?, ?, ?, ?, ?, ?)""",
                 (market_id, strategy, utcnow_iso(), p_final, confidence,
                  json.dumps(metadata or {})),
@@ -1973,7 +2023,7 @@ class Ledger:
                         ) -> sqlite3.Row | None:
         with self._conn() as c:
             return c.execute(
-                """SELECT * FROM signals WHERE market_id=? AND strategy=?
+                """SELECT * FROM cache.signals WHERE market_id=? AND strategy=?
                    ORDER BY id DESC LIMIT 1""",
                 (int(market_row_id), strategy)).fetchone()
 
