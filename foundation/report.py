@@ -708,10 +708,22 @@ def print_weather_v2_shadow(cfg: dict, ledger: Ledger) -> None:
     xb = float(overall["chal_brier"] or 0.0)
     ce = float(overall["champ_expectancy"] or 0.0)
     xe = float(overall["chal_expectancy"] or 0.0)
+    ct = float(overall["champ_total_pnl"] or 0.0)
+    xt = float(overall["chal_total_pnl"] or 0.0)
     print(f"  {'-'*14} {'-'*4} {'-'*4} {'-'*11} {'-'*10} {'-'*9} {'-'*9} "
           f"{'-'*9} {'-'*9}")
     print(f"  {'OVERALL':<14s} {n_overall:>4d} {' ':>4s} {cb:>11.4f} "
-          f"{xb:>10.4f} ${ce:>+7.2f} ${xe:>+7.2f}")
+          f"{xb:>10.4f} ${ce:>+7.2f} ${xe:>+7.2f} ${ct:>+7.2f} ${xt:>+7.2f}")
+    # Net pnl summary line (paired with the Brier line above so the
+    # operator can read calibration + cumulative-dollar side-by-side
+    # without scanning every per-city row).
+    champ_n_t = int(overall["champ_n_trades"] or 0)
+    chal_n_t = int(overall["chal_n_trades"] or 0)
+    delta = xt - ct
+    print(f"  net pnl on settled shadow trades: "
+          f"champ ${ct:+.2f} ({champ_n_t} would-trade) | "
+          f"chal ${xt:+.2f} ({chal_n_t} would-trade) | "
+          f"delta {('+' if delta >= 0 else '')}{delta:.2f}")
 
     # Promotion verdict.
     min_n = int(v2cfg.get("promotion_min_n", 75))

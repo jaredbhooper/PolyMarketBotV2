@@ -1702,6 +1702,23 @@ class Ledger:
                  utcnow_iso(), int(shadow_id)),
             )
 
+    def update_shadow_pnl(self, shadow_id: int,
+                          champ_pnl: float | None,
+                          chal_pnl: float | None) -> None:
+        """Update just the pnl columns on a SETTLED shadow trade.
+        Used by the idempotent backfill in grader.py to reconcile
+        existing rows whose pnl was 0 because the original close path
+        didn't compute it. Does NOT touch status / outcome / closed_at."""
+        with self._conn() as c:
+            c.execute(
+                """UPDATE shadow_trades
+                      SET champ_pnl=?, chal_pnl=?
+                    WHERE id=?""",
+                (None if champ_pnl is None else float(champ_pnl),
+                 None if chal_pnl is None else float(chal_pnl),
+                 int(shadow_id)),
+            )
+
     def shadow_stats_by_city(self) -> list[sqlite3.Row]:
         """Per-city aggregate of settled shadow trades. Champion vs
         challenger Brier + expectancy (avg pnl per shadowed market).
@@ -1741,7 +1758,13 @@ class Ledger:
                           AVG((chal_p - CASE WHEN outcome='YES' THEN 1.0 ELSE 0.0 END)
                               *(chal_p - CASE WHEN outcome='YES' THEN 1.0 ELSE 0.0 END)) AS chal_brier,
                           AVG(COALESCE(champ_pnl, 0.0)) AS champ_expectancy,
-                          AVG(COALESCE(chal_pnl, 0.0)) AS chal_expectancy
+                          AVG(COALESCE(chal_pnl, 0.0)) AS chal_expectancy,
+                          SUM(COALESCE(champ_pnl, 0.0)) AS champ_total_pnl,
+                          SUM(COALESCE(chal_pnl, 0.0)) AS chal_total_pnl,
+                          SUM(CASE WHEN champ_side IS NOT NULL
+                                    AND champ_side != 'NONE' THEN 1 ELSE 0 END) AS champ_n_trades,
+                          SUM(CASE WHEN chal_side IS NOT NULL
+                                    AND chal_side != 'NONE' THEN 1 ELSE 0 END) AS chal_n_trades
                      FROM shadow_trades
                     WHERE status='SETTLED' AND outcome IN ('YES','NO')"""
             ).fetchone()

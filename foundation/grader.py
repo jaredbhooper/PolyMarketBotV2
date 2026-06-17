@@ -942,33 +942,96 @@ def grade_cv_probe_positions(cfg: dict, ledger: Ledger, today,
     return settled, skipped
 
 
+def _shadow_side_pnl(side: str | None, price_filled, stake, shares,
+                     outcome: str) -> float:
+    """Same binary-market payout shape the champion paper_trades use
+    (see `_settle_trade_pnl` above). Reused for both champ_pnl and
+    chal_pnl on every shadow_trades row.
+
+        winning side: shares - stake   (== shares * (1 - price_filled))
+        losing side:  -stake
+        no position:  0.0
+        VOID outcome: 0.0
+
+    Deterministic in the row's own fields -- safe to call repeatedly.
+    """
+    if not side or side == "NONE" or stake is None or shares is None:
+        return 0.0
+    if outcome == "VOID":
+        return 0.0
+    if outcome not in ("YES", "NO"):
+        return 0.0
+    if side == outcome:
+        return float(shares) - float(stake)
+    return -float(stake)
+
+
+def backfill_shadow_trade_pnl(ledger: Ledger, verbose: bool = True) -> int:
+    """Recompute (champ_pnl, chal_pnl) for every SETTLED shadow_trades
+    row directly from the row's own fields (side / price_filled /
+    stake / shares / outcome). Updates only the rows where the
+    recomputed value differs from what's stored -- so re-running this
+    on an already-correct ledger updates zero rows (idempotency proof).
+
+    Called at the start of grade_shadow_trades so older rows that were
+    settled before _shadow_side_pnl existed get reconciled on every
+    grade. Independently callable for manual diagnostics.
+    """
+    import sqlite3 as _sqlite
+    updated = 0
+    with _sqlite.connect(ledger.ledger_path) as c:
+        c.row_factory = _sqlite.Row
+        rows = list(c.execute(
+            "SELECT * FROM shadow_trades WHERE status='SETTLED'"))
+
+    def _differs(a, b) -> bool:
+        if a is None and b is None:
+            return False
+        if a is None or b is None:
+            return True
+        return abs(float(a) - float(b)) > 1e-9
+
+    for row in rows:
+        outcome = row["outcome"]
+        if outcome is None:
+            continue
+        new_champ = _shadow_side_pnl(
+            row["champ_side"], row["champ_price_filled"],
+            row["champ_stake"], row["champ_shares"], outcome)
+        new_chal = _shadow_side_pnl(
+            row["chal_side"], row["chal_price_filled"],
+            row["chal_stake"], row["chal_shares"], outcome)
+        if _differs(row["champ_pnl"], new_champ) or _differs(row["chal_pnl"], new_chal):
+            ledger.update_shadow_pnl(int(row["id"]), new_champ, new_chal)
+            updated += 1
+    if verbose:
+        print(f"  shadow pnl backfill: {updated} row(s) updated "
+              f"(of {len(rows)} settled)")
+    return updated
+
+
 def grade_shadow_trades(cfg: dict, ledger: Ledger, today,
                             verbose: bool = True) -> tuple[int, int]:
     """Settle every OPEN shadow_trades row whose market has a final
     settlement outcome. v2.3 WeatherModel head-to-head book.
 
-    For each side (champion / challenger):
-      - If the row has no side at all (NONE / null), pnl stays at 0 --
-        the model declined to trade. Brier is still computed at report
-        time from champ_p / chal_p.
-      - Otherwise apply the same _settle_trade_pnl shape: a winning
-        side returns shares - stake; a losing side returns -stake.
+    For each side (champion / challenger) the pnl is computed via
+    `_shadow_side_pnl`, which mirrors the champion paper_trades payout
+    shape exactly. Before settling new rows we run an idempotent
+    backfill pass over already-SETTLED rows so any historical row
+    written before the pnl path existed gets reconciled here.
     """
+    # Idempotent backfill: reconcile any SETTLED rows whose pnl is
+    # stale (typically pnl=0 from before _shadow_side_pnl was the
+    # canonical formula). Recompute deterministically from the row's
+    # own fields; rows already at the correct value are not updated.
+    backfill_shadow_trade_pnl(ledger, verbose=verbose)
+
     settled = 0
     skipped = 0
     open_rows = ledger.list_open_shadow_trades()
     if verbose:
         print(f"Grader: {len(open_rows)} open shadow_trades to evaluate.")
-
-    def _side_pnl(side: str | None, price_filled, stake, shares,
-                    outcome: str) -> float | None:
-        if not side or side == "NONE" or stake is None or shares is None:
-            return 0.0
-        if outcome not in ("YES", "NO"):
-            return None
-        if side == outcome:
-            return float(shares) - float(stake)
-        return -float(stake)
 
     for row in open_rows:
         market_id = int(row["market_id"])
@@ -980,12 +1043,12 @@ def grade_shadow_trades(cfg: dict, ledger: Ledger, today,
         if outcome not in ("YES", "NO"):
             skipped += 1
             continue
-        champ_pnl = _side_pnl(row["champ_side"], row["champ_price_filled"],
-                                row["champ_stake"], row["champ_shares"],
-                                outcome)
-        chal_pnl = _side_pnl(row["chal_side"], row["chal_price_filled"],
-                               row["chal_stake"], row["chal_shares"],
-                               outcome)
+        champ_pnl = _shadow_side_pnl(
+            row["champ_side"], row["champ_price_filled"],
+            row["champ_stake"], row["champ_shares"], outcome)
+        chal_pnl = _shadow_side_pnl(
+            row["chal_side"], row["chal_price_filled"],
+            row["chal_stake"], row["chal_shares"], outcome)
         ledger.close_shadow_trade(int(row["id"]), outcome, champ_pnl, chal_pnl)
         settled += 1
     return settled, skipped
