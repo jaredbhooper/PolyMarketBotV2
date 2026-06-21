@@ -1012,14 +1012,37 @@ def backfill_shadow_trade_pnl(ledger: Ledger, verbose: bool = True) -> int:
 
 def grade_shadow_trades(cfg: dict, ledger: Ledger, today,
                             verbose: bool = True) -> tuple[int, int]:
-    """Settle every OPEN shadow_trades row whose market has a final
-    settlement outcome. v2.3 WeatherModel head-to-head book.
+    """Settle every OPEN shadow_trades row whose market has resolved.
+
+    Two settlement paths (in order):
+
+      1) FAST PATH: market already has a row in `settlements` (the live
+         paper book traded the same market and the grader's main loop
+         wrote a settlement). Use that outcome directly.
+
+      2) SELF-RESOLVE PATH: no live settlement exists. This is the
+         common case -- the live paper book is capped at ~15 open
+         positions, so the vast majority of shadow-scored markets
+         never enter the paper book, never get a settlement row, and
+         under the old code they would remain OPEN forever. If the
+         market's resolve_date is in the past UTC, we call the
+         weather strategy's `resolve()` directly to determine the
+         outcome.
+
+         The self-resolve path is SHADOW-ONLY: it does NOT call
+         record_settlement (would write to the live settlements
+         table) and does NOT touch paper_trades. The live champion
+         book is unaffected -- this is paper-only telemetry.
 
     For each side (champion / challenger) the pnl is computed via
     `_shadow_side_pnl`, which mirrors the champion paper_trades payout
-    shape exactly. Before settling new rows we run an idempotent
-    backfill pass over already-SETTLED rows so any historical row
-    written before the pnl path existed gets reconciled here.
+    shape exactly. Side-taken rows with NULL stake/shares book $0 P&L
+    (no fill data on which to compute) and are flagged in verbose
+    output rather than crashing.
+
+    Idempotent: close_shadow_trade flips status to SETTLED; re-runs
+    only see still-OPEN rows. backfill_shadow_trade_pnl reconciles any
+    historical SETTLED rows whose stored pnl is stale.
     """
     # Idempotent backfill: reconcile any SETTLED rows whose pnl is
     # stale (typically pnl=0 from before _shadow_side_pnl was the
@@ -1027,30 +1050,105 @@ def grade_shadow_trades(cfg: dict, ledger: Ledger, today,
     # own fields; rows already at the correct value are not updated.
     backfill_shadow_trade_pnl(ledger, verbose=verbose)
 
+    # Lazy-load the weather strategy once for the self-resolve path.
+    # If weather isn't an active strategy in this config we silently
+    # skip self-resolve -- callers without it just get the fast-path
+    # behavior (settle only when a live settlement already exists).
+    strategies = _load_strategies(cfg)
+    weather = strategies.get("weather")
+
     settled = 0
     skipped = 0
+    self_resolved = 0
+    null_stake_settled = 0
     open_rows = ledger.list_open_shadow_trades()
     if verbose:
         print(f"Grader: {len(open_rows)} open shadow_trades to evaluate.")
 
     for row in open_rows:
         market_id = int(row["market_id"])
+        outcome: str | None = None
+
+        # --- Path 1: fast path via live settlements table ----------
         settlement = ledger.get_settlement(market_id)
-        if not settlement:
-            skipped += 1
-            continue
-        outcome = settlement["outcome"]
-        if outcome not in ("YES", "NO"):
-            skipped += 1
-            continue
+        if settlement:
+            outcome = settlement["outcome"]
+            if outcome not in ("YES", "NO"):
+                skipped += 1
+                continue
+        else:
+            # --- Path 2: self-resolve via strategy.resolve() -------
+            rd = row["resolve_date"]
+            try:
+                r_date = datetime.fromisoformat(
+                    (rd or "").split("T")[0]).date()
+            except (ValueError, AttributeError, TypeError):
+                r_date = None
+            if r_date is None or r_date > today:
+                # Future-dated; not eligible yet.
+                skipped += 1
+                continue
+            if weather is None:
+                # Weather not loaded -> can't self-resolve.
+                skipped += 1
+                continue
+            market_row = ledger.get_market(market_id)
+            if not market_row:
+                skipped += 1
+                continue
+            market = _row_to_market(market_row)
+            try:
+                resolved = weather.resolve(
+                    market, datetime.now(timezone.utc).isoformat())
+            except Exception as exc:
+                if verbose:
+                    print(f"  shadow self-resolve failed for market "
+                          f"{market_id}: {exc}")
+                skipped += 1
+                continue
+            if resolved is None:
+                # Local day still in progress, or both WU + OM missing.
+                # Defer; next grade pass will retry.
+                skipped += 1
+                continue
+            outcome = resolved.get("outcome")
+            if outcome not in ("YES", "NO"):
+                skipped += 1
+                continue
+            self_resolved += 1
+            # IMPORTANT: do NOT call ledger.record_settlement here.
+            # Shadow settlement is self-contained -- writing to
+            # `settlements` would make this market look paper-traded
+            # to anything else that reads that table.
+
+        # --- Compute + write pnls -----------------------------------
+        champ_side = row["champ_side"]
+        chal_side  = row["chal_side"]
+        champ_taken = (champ_side not in (None, "NONE"))
+        chal_taken  = (chal_side  not in (None, "NONE"))
+        # Side-taken-but-no-stake: book $0 (handled inside _shadow_side_pnl)
+        # but count separately so the operator can see how many sides
+        # were recorded without fill data.
+        if (champ_taken and not row["champ_stake"]) \
+                or (chal_taken and not row["chal_stake"]):
+            null_stake_settled += 1
         champ_pnl = _shadow_side_pnl(
-            row["champ_side"], row["champ_price_filled"],
+            champ_side, row["champ_price_filled"],
             row["champ_stake"], row["champ_shares"], outcome)
         chal_pnl = _shadow_side_pnl(
-            row["chal_side"], row["chal_price_filled"],
+            chal_side, row["chal_price_filled"],
             row["chal_stake"], row["chal_shares"], outcome)
-        ledger.close_shadow_trade(int(row["id"]), outcome, champ_pnl, chal_pnl)
+        ledger.close_shadow_trade(int(row["id"]), outcome,
+                                    champ_pnl, chal_pnl)
         settled += 1
+
+    if verbose:
+        if self_resolved:
+            print(f"  shadow self-resolved: {self_resolved} "
+                  f"(markets not in live paper book)")
+        if null_stake_settled:
+            print(f"  shadow side-taken-without-stake: "
+                  f"{null_stake_settled} (booked $0 pnl, flagged)")
     return settled, skipped
 
 
